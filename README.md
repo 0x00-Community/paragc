@@ -155,14 +155,15 @@ workloads, every configuration and how to read them: **[benches/benchmark.md](be
 
 | | paragc | cppgc | gc-arena | dumpster | gc |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Pause, 1M live + 1M dead, 1 thread | 20.7 | 43.3 | **16.2** | 17.0 | 90.0 |
-| Pause, 16 threads | **3.9** | 44.4 | – | – | – |
+| Pause, 1M live + 1M dead, 1 thread | 25.7 | 45.0 | **15.8** | 16.4 | 87.6 |
+| Pause, 16 threads | **4.3** | 43.4 | – | – | – |
 | Pause, concurrent marking + sweeping, 1 thread | **0.03** | – | – | – | – |
-| GCBench, 1 thread | **70.1** | 120.4 | 116.9 | 112.1 | 290.1 |
-| GCBench, 4 threads | **61.1** | 97.2 | – | – | – |
-| Many mutators, 16 threads | **10.1** | – | – | 240.8 | – |
+| GCBench, 1 thread | **51.3** | 119.2 | 115.3 | 102.2 | 281.7 |
+| GCBench, 4 threads | **55.4** | 95.3 | – | – | – |
+| Many mutators, 16 threads | **9.2** | – | – | 334.3 | – |
 
-Serially gc-arena and dumpster pause shorter; with threads, and in throughput, paragc leads. cppgc's forced full
+Serially gc-arena and dumpster pause shorter (paragc's full collection also rebuilds reference counts); with threads,
+and in throughput, paragc leads. cppgc's forced full
 collection marks on one thread even with every parallel flag on, and pays an FFI call per allocation and edge here.
 
 ## 🗺️ Roadmap

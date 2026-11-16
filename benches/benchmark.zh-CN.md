@@ -12,10 +12,10 @@ paragc 与 [cppgc](https://chromium.googlesource.com/v8/v8/+/main/include/cppgc/
 | --- | --- |
 | 机器 | Intel Core Ultra 7 356H，16 核（每核 1 线程），Linux 7.0 |
 | Rust | 1.98.1，release |
-| paragc | 提交 `d063d29` |
+| paragc | 0.2.0（提交 `5c4c5c5`） |
 | cppgc | V8 15.2.124.1，经 rusty_v8（`v8` crate 152.2.0） |
 | 其他 | gc-arena 0.7.0、gc 0.5.1、dumpster 2.1.0 |
-| 方法 | 每个配置在新进程里跑 5 次取最快；1 分钟负载低于 2.5 才开始（开始 2.2、结束 2.4） |
+| 方法 | 每个配置在新进程里跑 5 次取最快；1 分钟负载低于 2.5 才开始（开始 0.5、结束 0.8） |
 | CPU 一栏 | 计时区间内整个进程（全部线程）的 CPU 时间；CPU ÷ 墙钟 就是实际有几个线程在干活 |
 
 ## 工作负载
@@ -33,7 +33,7 @@ paragc 与 [cppgc](https://chromium.googlesource.com/v8/v8/+/main/include/cppgc/
 
 | | 串行 | 并行 | `gcbench` 里怎么回收 |
 | --- | --- | --- | --- |
-| **paragc** | `Heap::new(1)` | `Heap::new(n)`：n − 1 个常驻回收线程 | 每棵树后 `collect_if_needed` |
+| **paragc** | `Heap::new(1)` | `Heap::new(n)`：n − 1 个常驻回收线程 | 每棵树后 `collect_if_needed`：年轻回收 + 引用计数，每 16 次一次完整回收 |
 | **cppgc** | 挂在 isolate 上（Blink 的用法），单线程平台 + `--single-threaded`；完整回收用 `request_garbage_collection_for_testing(Full)` | 默认平台，n 个工作线程 | V8 自己调度 |
 | **cppgc，选项全开** | 同上 | 同上，再加 `--parallel-marking --concurrent-marking --cppheap-concurrent-marking --cppheap-incremental-marking --concurrent-marking-max-worker-num=n` | V8 自己调度 |
 | **cppgc，不挂 isolate** | 不挂 isolate，`collect_garbage_for_testing` | 同上 | 照 paragc 的触发策略手动回收 |
@@ -49,47 +49,48 @@ paragc 与 [cppgc](https://chromium.googlesource.com/v8/v8/+/main/include/cppgc/
 
 | | 1 线程 | 4 线程 | 16 线程 |
 | --- | ---: | ---: | ---: |
-| **paragc** | 20.7 | 7.8 (3.9) | **3.9** (13.5) |
-| paragc，并发标记 | 6.7 | 2.4 (2.7) | 1.5 (12.6) |
-| paragc，并发清扫 | 13.9 | 5.3 (3.9) | 2.4 (12.3) |
-| **paragc，并发标记 + 并发清扫** | **0.03** | **0.03** | **0.06** |
-| cppgc，挂 isolate | 43.3 | 44.2 (1.0) | 44.4 (1.0) |
-| cppgc，并行 / 并发选项全开 | 44.6 | 44.4 (1.0) | 43.8 (1.0) |
-| cppgc，不挂 isolate | 43.2 | 42.7 (1.0) | 44.1 (1.0) |
-| gc-arena | 16.2 | – | – |
-| dumpster | 17.0 | – | – |
-| gc（rust-gc） | 90.0 | – | – |
+| **paragc** | 25.7 | 9.3 (3.8) | **4.3** (13.7) |
+| paragc，并发标记 | 6.6 | 2.4 (3.3) | 1.5 (13.7) |
+| paragc，并发清扫 | 19.2 | 6.7 (4.0) | 3.1 (12.2) |
+| **paragc，并发标记 + 并发清扫** | **0.03** | **0.04** | **0.07** |
+| cppgc，挂 isolate | 45.0 | 44.7 (1.0) | 43.4 (1.0) |
+| cppgc，并行 / 并发选项全开 | 43.5 | 43.7 (1.0) | 43.0 (1.0) |
+| cppgc，不挂 isolate | 42.5 | 42.7 (1.0) | 42.5 (1.0) |
+| gc-arena | 15.8 | – | – |
+| dumpster | 16.4 | – | – |
+| gc（rust-gc） | 87.6 | – | – |
 
 ### GCBench：总耗时
 
 | | 1 线程 | 4 线程 | 16 线程 |
 | --- | ---: | ---: | ---: |
-| **paragc** | **70.1** | **61.1** (1.5) | 70.3 (3.1) |
-| cppgc，挂 isolate | 120.4 | 97.2 (1.3) | 102.0 (1.3) |
-| cppgc，并行 / 并发选项全开 | 117.5 | 91.4 (1.3) | 102.5 (1.4) |
-| cppgc，不挂 isolate | 173.4 | 168.7 (1.0) | 166.0 (1.0) |
-| gc-arena | 116.9 | – | – |
-| dumpster | 112.1 | – | – |
-| gc（rust-gc） | 290.1 | – | – |
+| **paragc** | **51.3** | **55.4** (1.3) | **64.3** (2.2) |
+| cppgc，挂 isolate | 119.2 | 95.3 (1.3) | 100.4 (1.3) |
+| cppgc，并行 / 并发选项全开 | 117.4 | 94.9 (1.3) | 99.4 (1.3) |
+| cppgc，不挂 isolate | 173.2 | 171.7 (1.0) | 173.0 (1.0) |
+| gc-arena | 115.3 | – | – |
+| dumpster | 102.2 | – | – |
+| gc（rust-gc） | 281.7 | – | – |
 
 ### 多 mutator：总耗时
 
 | | 1 线程 | 4 线程 | 16 线程 |
 | --- | ---: | ---: | ---: |
-| **paragc** | **40.8** | **13.9** (3.7) | **10.1** (9.8) |
-| dumpster（`sync`） | 118.9 | 217.3 (3.7) | 240.8 (7.8) |
+| **paragc** | **35.7** | **9.8** (3.7) | **9.2** (8.0) |
+| dumpster（`sync`） | 116.4 | 296.2 (3.9) | 334.3 (13.2) |
 
 cppgc、gc-arena、rust-gc 一个堆只能一个线程用，这一项没有它们。
 
 ## 怎么读
 
-- **串行停顿 gc-arena、dumpster 更快**：这个 200 万节点的堆回收一次，它们 16–17 ms，paragc 单线程 20.7 ms。paragc 从 4 线程起领先（7.8 ms），16 线程 3.9 ms。
-- **吞吐 paragc 串行也领先**：单线程 GCBench 70.1 ms，dumpster、gc-arena、cppgc 是 112–120 ms；多 mutator 40.8 ms 对 dumpster 118.9 ms，
-  而且 dumpster 线程越多越慢（引用计数跨线程共享），paragc 越来越快。
-- **GCBench 过了 4 线程不再变快**：它每次回收都小，叫醒 16 个工人得不偿失（16 线程用了 3.1 倍的 CPU，结果反而慢）。
-- **并发标记 + 并发清扫把活移出了停顿**：单线程 20.7 ms 变成 0.03 ms；标记和清扫照样要做，在线程池上、在顺手扫块的 mutator 里。
+- **吞吐：年轻回收 + 引用计数**：单线程 GCBench 51.3 ms，dumpster、gc-arena、cppgc 是 102–119 ms——`collect_if_needed` 平时做年轻回收，
+  只追新对象，老垃圾由引用计数在后台释放。多 mutator 35.7 ms 对 dumpster 116.4 ms，而且 dumpster 线程越多越慢（引用计数跨线程共享），paragc 越来越快。
+- **串行完整停顿 gc-arena、dumpster 更快**：这个 200 万节点的堆完整回收一次，它们约 16 ms，paragc 单线程 25.7 ms。其中一部分是重新计数：
+  停顿式完整回收现在每条边多一次原子 +1 来重建引用计数（引用计数之前是 20.7 ms）。paragc 从 4 线程起领先（9.3 ms），16 线程 4.3 ms。
+- **GCBench 加线程不变快**：年轻回收每次都小，叫醒更多工人得不偿失（16 线程用了 2.2 倍的 CPU，结果反而慢）。
+- **并发标记 + 并发清扫把活移出了停顿**：单线程 25.7 ms 变成 0.03 ms；标记和清扫照样要做，在线程池上、在顺手扫块的 mutator 里。
   这里标记期间没有 mutator 在跑，最后灰队列是空的，剩下的停顿是与块数成正比的簿记；有 mutator 在跑时还要加上清空写屏障攒下的灰对象。
-- **cppgc 的完整回收只用一个线程标记**：挂不挂 isolate、开不开 16 个工作线程和全部并行 / 并发标记选项，强制完整回收都是 CPU ÷ 墙钟 = 1.0、约 44 ms。
+- **cppgc 的完整回收只用一个线程标记**：挂不挂 isolate、开不开 16 个工作线程和全部并行 / 并发标记选项，强制完整回收都是 CPU ÷ 墙钟 = 1.0、约 43–45 ms。
   只有 V8 自己调度的增量回收里，后台标记用上了别的线程（GCBench 约 1.3）。要在 `pause` 里量它的并发周期得去驱动 V8 的增量 GC，这里没做。
 - **cppgc 要付 Rust ⇄ C++ 的边界开销**：经 rusty_v8 调用，每次分配、每个 `Member`、标记时每条边都是一次 FFI；挂 isolate 时 V8 自己那份
   （几乎空的）堆每次完整回收约多 1.3–1.5 ms。用 C++ 直接嵌入的数字会更低。
