@@ -888,3 +888,95 @@ fn evacuation_with_shared_children() {
     heap.collect();
     assert_eq!(drops.load(Ordering::Relaxed), usize::try_from(PARENTS * 2 + CHILDREN).expect("小"));
 }
+
+/// 年轻回收的精确账目：老节点（经过一次完整回收）挂在板子的 0 号、2 号槽；然后新建年轻节点，三种方式挂上：
+/// 直接挂到老板子的 1 号槽（老对象的槽 ⇒ 记忆集）、挂到 0 号槽链头老节点的 next（老对象的槽）、挂到另一个年轻节点底下（年轻 → 年轻）；
+/// 其余年轻节点扔掉。再从 2 号槽摘掉一些老节点（老垃圾）。年轻回收应恰好析构扔掉的年轻节点、不碰老垃圾，链上节点一个不少；
+/// 之后的完整回收再收掉老垃圾。
+#[test]
+fn young_collection_frees_only_young_garbage() {
+    const OLD: usize = if cfg!(miri) { 60 } else { 2_000 };
+    const YOUNG: usize = if cfg!(miri) { 120 } else { 20_000 };
+    const OLD_DISCARD: usize = OLD / 4;
+    let moves = Moves::default();
+    let mut heap = Heap::new(THREADS);
+    let board = board(&heap);
+    // 老节点：0 号、2 号槽各一条链，完整回收后都是老的
+    heap.mutate(|m| {
+        let b = m.get(&board);
+        for i in 0..OLD {
+            Moves::push(m, &b.cells[if i % 2 == 0 { 0 } else { 2 }], m.alloc(Link { next: Slot::default(), tag: moves.ledger.tag() }));
+        }
+    });
+    heap.collect();
+    // 年轻节点：每 4 个里 1 个挂到 1 号槽、1 个插到 0 号槽链头老节点之后、1 个插到 1 号槽链头（年轻）之后，1 个扔掉
+    let young_garbage = heap.mutate(|m| {
+        let b = m.get(&board);
+        let old_head = b.cells[0].get().expect("老链不空");
+        let mut garbage = 0;
+        for i in 0..YOUNG {
+            let x = m.alloc(Link { next: Slot::default(), tag: moves.ledger.tag() });
+            match i % 4 {
+                0 => Moves::push(m, &b.cells[1], x),
+                1 => {
+                    x.next.set(m, old_head.next.get());
+                    old_head.next.set(m, Some(x));
+                }
+                2 => {
+                    let host = b.cells[1].get().expect("刚挂过");
+                    x.next.set(m, host.next.get());
+                    host.next.set(m, Some(x));
+                }
+                _ => garbage += 1,
+            }
+        }
+        garbage
+    });
+    // 老垃圾：从 2 号槽（全是老节点）摘掉 OLD_DISCARD 个
+    heap.mutate(|m| {
+        let b = m.get(&board);
+        for _ in 0..OLD_DISCARD {
+            Moves::pop(m, &b.cells[2]).expect("老链够长");
+            moves.discarded.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let before = moves.ledger.dropped.load(Ordering::Relaxed);
+    heap.collect_young();
+    assert_eq!(heap.stats().young_collections, 1);
+    assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed) - before, young_garbage, "年轻回收析构的不是恰好扔掉的年轻节点");
+    assert_eq!(Moves::reachable(&heap, &board), OLD - OLD_DISCARD + (YOUNG - young_garbage), "年轻回收后链上丢了节点");
+    // 完整回收收掉老垃圾
+    heap.collect();
+    assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed) - before, young_garbage + OLD_DISCARD);
+    assert_eq!(Moves::reachable(&heap, &board), OLD - OLD_DISCARD + (YOUNG - young_garbage));
+    moves.discarded.fetch_add(young_garbage, Ordering::Relaxed);
+    moves.finish(heap, board);
+}
+
+/// 多个 mutator 不停地挪 / 新建 / 扔（挪动会把年轻节点挂到老节点的槽上 ⇒ 记忆集），每轮之后回收：
+/// 轮流做年轻回收、并发标记后用年轻回收收尾（等于完整回收）、完整回收。每轮：没有析构还挂着的节点、链上节点数恰好。
+#[test]
+fn young_collections_while_relinking() {
+    let moves = Moves::default();
+    let mut heap = Heap::new(THREADS);
+    let board = board(&heap);
+    for round in 0..MARK_ROUNDS * 2 {
+        match round % 3 {
+            0 => {
+                moves.round(&heap, &board, round, |_| ());
+                heap.collect_young();
+            }
+            1 => {
+                moves.round(&heap, &board, round, |h| assert!(h.mark_concurrently()));
+                heap.collect_young();
+            }
+            _ => {
+                moves.round(&heap, &board, round, |_| ());
+                heap.collect();
+            }
+        }
+        moves.check(&heap, &board, round);
+    }
+    assert!(heap.stats().young_collections > 0);
+    moves.finish(heap, board);
+}

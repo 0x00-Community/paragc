@@ -23,7 +23,7 @@ use j8lockfree::SegVec;
 use crate::block::Block;
 use crate::gc::Invariant;
 use crate::header::{HEADER, Header, MAX_EPOCH};
-use crate::layout::{BLOCK, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, LARGE, MIN_SPARE_BLOCKS, MIN_TRIGGER};
+use crate::layout::{BLOCK, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, LARGE, MIN_SPARE_BLOCKS, MIN_TRIGGER, YOUNG_PER_FULL};
 use crate::mark::Marking;
 use crate::roots::RootTable;
 use crate::sweep::{Large, Outcome, Sink, Sweeper};
@@ -43,6 +43,12 @@ pub struct Heap {
     gate: CachePadded<AtomicU64>,
     /// 灰队列：根与写屏障记下的旧值（并发标记跨越多次调用，所以放在堆里）
     grey: Injector<usize>,
+    /// 记忆集：上次回收后被写进年轻对象的槽的地址（年轻回收从这些槽出发；任何回收后清空）
+    remembered: Injector<usize>,
+    /// 上次完整回收后做了几次年轻回收
+    young_since_full: usize,
+    /// 一共做了几次年轻回收
+    young_collections: u64,
     /// 回收了几次（分配缓冲据此判断自己是否过期）
     collections: u64,
     /// 全部块
@@ -71,6 +77,8 @@ pub struct Stats {
     pub blocks: usize,
     pub large: usize,
     pub collections: u64,
+    /// 其中年轻回收几次
+    pub young_collections: u64,
     /// 上次回收疏散了几个块、搬了多少字节
     pub evacuated_blocks: usize,
     pub evacuated_bytes: usize,
@@ -92,6 +100,9 @@ impl Heap {
             marking: AtomicU32::new(0),
             gate: CachePadded::new(AtomicU64::new(0)),
             grey: Injector::new(),
+            remembered: Injector::new(),
+            young_since_full: 0,
+            young_collections: 0,
             collections: 0,
             blocks: SegVec::default(),
             available: Injector::new(),
@@ -271,18 +282,70 @@ impl Heap {
             blocks: self.blocks.len(),
             large: self.large.len(),
             collections: self.collections,
+            young_collections: self.young_collections,
             evacuated_blocks: self.evacuated.0,
             evacuated_bytes: self.evacuated.1,
         }
     }
 
-    /// 上次回收后新领用的够多了就回收；回收了返回 true。
+    /// 上次回收后新领用的够多了就回收：平时做年轻回收，每 [`YOUNG_PER_FULL`] 次年轻回收穿插一次完整回收
+    /// （年轻回收收不到死掉的老对象）。回收了返回 true。
     pub fn collect_if_needed(&mut self) -> bool {
         let due = *self.allocated.get_mut() >= self.sweeper.live().max(MIN_TRIGGER) * GROWTH;
         if due {
-            self.collect();
+            if self.young_since_full < YOUNG_PER_FULL {
+                self.collect_young();
+            } else {
+                self.collect();
+            }
         }
         due
+    }
+
+    /// 年轻回收：只追上次回收后分配的对象（标记纪元不是上次完成的那轮），从根与记忆集里的槽出发；碰到老对象就停。
+    /// 追到的年轻对象标成上次完成的纪元（晋升为老对象），然后只扫上次回收后被拿去分配过的块：没追到的年轻对象析构、
+    /// 行空出来。老对象一个不碰（死掉的老对象留给下一次完整回收）。返回时死掉的年轻对象都已析构。
+    ///
+    /// 有并发标记在进行时，改为把它收尾（完整回收）。
+    pub fn collect_young(&mut self) {
+        if *self.marking.get_mut() != 0 {
+            self.collect();
+            return;
+        }
+        self.sweep_concurrently();
+        // SAFETY: &mut self ⇒ 没有 mutator
+        let roots = unsafe { self.roots.settle() };
+        let epoch = self.epoch;
+        let remembered = Self::drain(&self.remembered);
+        Marking::seed(&self.grey, &roots, epoch);
+        Marking::seed_slots(&self.grey, &remembered, epoch);
+        let pool = self.pool.get_or_init(|| Pool::new(self.threads));
+        let workers = pool.sized(self.blocks.len() + self.large.len());
+        Marking::new(workers, epoch, &self.grey).run(pool);
+        // 只扫上次回收后拿去分配过的块（年轻对象只可能在这些块里）；没动过的老块原样放回
+        let (young, old): (Vec<Block>, Vec<Block>) = self.blocks.take().into_iter().partition(|b| b.live_since_sweep().is_none());
+        self.blocks.extend(old);
+        let large = self.large.take();
+        let spare = (*self.allocated.get_mut() / BLOCK).max(MIN_SPARE_BLOCKS);
+        self.sweeper.start(epoch, young, large, spare);
+        self.evacuated = (0, 0);
+        *self.allocated.get_mut() = 0;
+        self.collections += 1;
+        self.young_collections += 1;
+        self.young_since_full += 1;
+        self.sweep_concurrently();
+    }
+
+    /// 取空一个队列。
+    fn drain<T>(queue: &Injector<T>) -> Vec<T> {
+        let mut out = Vec::new();
+        loop {
+            match queue.steal() {
+                Steal::Success(v) => out.push(v),
+                Steal::Retry => {}
+                Steal::Empty => return out,
+            }
+        }
     }
 
     /// 完整回收：[`Heap::finish_marking`] 后立刻把清扫做完（返回时死对象都已析构）。
@@ -296,6 +359,9 @@ impl Heap {
     /// 或者某个线程调 [`Heap::sweep_concurrently`]）。停顿只有标记的收尾。
     pub fn finish_marking(&mut self) {
         self.sweep_concurrently();
+        // 完整标记会找到全部活对象，记忆集不再需要
+        drop(Self::drain(&self.remembered));
+        self.young_since_full = 0;
         // SAFETY: &mut self ⇒ 没有 mutator
         let roots = unsafe { self.roots.settle() };
         let marking = *self.marking.get_mut();
@@ -415,6 +481,9 @@ impl Tlab {
     }
 }
 
+/// 新对象的标记：不等于任何纪元（纪元从 1 开始）⇒ 年轻
+const YOUNG: u32 = 0;
+
 /// 握手字的最高位：要开始并发标记，新的 mutate 先等
 const REQUEST: u64 = 1 << 63;
 
@@ -464,12 +533,24 @@ impl<'gc> Mutator<'gc> {
         self.marking.is_some()
     }
 
-    /// 写屏障：槽里被覆盖掉的旧值（并发标记中才有事）。
-    pub(crate) fn overwritten(&self, old: *const Header) {
-        if let Some(epoch) = self.marking
-            && !old.is_null()
-        {
-            self.heap.remember(old, epoch.get());
+    /// 写屏障。并发标记中：被覆盖的旧值若还没标就标上、进灰队列（初始快照）。
+    /// 平时：写进去的是年轻对象（标记纪元不是上次完成的那轮）就记下槽的地址——老对象指向年轻对象的边只能这样产生，
+    /// 年轻回收从这些槽出发。（并发标记期间新对象都是黑的、收尾后全是老对象，不用记。）
+    pub(crate) fn written(&self, slot: *const AtomicPtr<u8>, old: Option<*const Header>, new: Option<*const Header>) {
+        match self.marking {
+            Some(epoch) => {
+                if let Some(old) = old {
+                    self.heap.remember(old, epoch.get());
+                }
+            }
+            None => {
+                // SAFETY: new 是刚写进槽的、活着的对象
+                if let Some(new) = new
+                    && !unsafe { &*new }.is_marked(self.heap.epoch)
+                {
+                    self.heap.remembered.push(slot.expose_provenance());
+                }
+            }
         }
     }
 
@@ -479,9 +560,9 @@ impl<'gc> Mutator<'gc> {
         let bytes = (HEADER + size_of::<T>()).next_multiple_of(GRANULE);
         let large = bytes > LARGE;
         let p = if large { self.heap.alloc_large(bytes) } else { self.alloc_small(bytes) };
-        // 平时：标成上次完成的纪元（并发清扫中不会被当成死的；下一轮标记用新纪元，不受影响）。
+        // 平时：年轻（标记 0 ≠ 上次完成的纪元；在交出去前就扫过的块或新块里，进行中的清扫碰不到它）。
         // 并发标记中：黑分配（直接标成本轮，连同它占的行）
-        let mark = self.marking.map_or(self.heap.epoch, NonZeroU32::get);
+        let mark = self.marking.map_or(YOUNG, NonZeroU32::get);
         if self.marking.is_some() && !large {
             Block::containing(p).mark_lines(p, bytes, mark);
         }

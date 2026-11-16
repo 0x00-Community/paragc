@@ -120,16 +120,18 @@ impl<'gc, T> Slot<'gc, T> {
     }
 
     pub fn swap(&self, m: &Mutator<'gc>, v: Option<Gc<'gc, T>>) -> Option<Gc<'gc, T>> {
-        let old = self.ptr.swap(Self::raw(v), Ordering::AcqRel);
-        Self::barrier(m, old);
+        let new = Self::raw(v);
+        let old = self.ptr.swap(new, Ordering::AcqRel);
+        self.barrier(m, old, new);
         Self::wrap(old)
     }
 
     /// 槽里是 `current` 才换成 `new`；失败时返回槽里的值。
     pub fn compare_exchange(&self, m: &Mutator<'gc>, current: Option<Gc<'gc, T>>, new: Option<Gc<'gc, T>>) -> Result<Option<Gc<'gc, T>>, Option<Gc<'gc, T>>> {
-        let done = self.ptr.compare_exchange(Self::raw(current), Self::raw(new), Ordering::AcqRel, Ordering::Acquire);
+        let new = Self::raw(new);
+        let done = self.ptr.compare_exchange(Self::raw(current), new, Ordering::AcqRel, Ordering::Acquire);
         if let Ok(old) = done {
-            Self::barrier(m, old);
+            self.barrier(m, old, new);
         }
         done.map(Self::wrap).map_err(Self::wrap)
     }
@@ -139,11 +141,10 @@ impl<'gc, T> Slot<'gc, T> {
         *self.ptr.get_mut() = Self::raw(v);
     }
 
-    /// 被覆盖的旧值交给写屏障。
-    fn barrier(m: &Mutator<'gc>, old: *mut T) {
-        if !old.is_null() {
-            m.overwritten(Header::of(old.cast()));
-        }
+    /// 写屏障：被覆盖的旧值（并发标记的初始快照）与写进去的新值（年轻对象 ⇒ 记下这个槽，年轻回收从它出发）。
+    fn barrier(&self, m: &Mutator<'gc>, old: *mut T, new: *mut T) {
+        let header = |p: *mut T| (!p.is_null()).then(|| Header::of(p.cast()));
+        m.written((&raw const self.ptr).cast(), header(old), header(new));
     }
 }
 
