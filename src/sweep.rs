@@ -78,7 +78,7 @@ impl<'a> Sweep<'a> {
     }
 
     /// SAFETY（调用方）：标记已经做完，没有 mutator。
-    pub(crate) unsafe fn run(&self, pool: &mut Pool, workers: usize) -> Swept {
+    pub(crate) unsafe fn run(&self, pool: &Pool, workers: usize) -> Swept {
         // SAFETY: 见上
         pool.run(workers, |_| unsafe { self.work() }).into_iter().fold(Swept::default(), Swept::merge)
     }

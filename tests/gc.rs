@@ -210,7 +210,7 @@ impl Ledger {
                 let guest = if value == ITEMS - 1 { guest.take() } else { None };
                 let item = m.alloc(Item { value, next: top, guest, ballast, tag: self.tag() });
                 if let Some(b) = ballast {
-                    b.owner.set(Some(item));
+                    b.owner.set(m, Some(item));
                 }
                 top = Some(item);
             }
@@ -373,7 +373,7 @@ fn deep_binary_tree() {
     assert_eq!(drops.load(Ordering::Relaxed), 0);
     assert_eq!(heap.mutate(|m| m.get(&root).count()), ALL);
     // 剪掉右子树：恰好 2^(DEPTH-1) − 1 个节点析构
-    heap.mutate(|m| m.get(&root).right.set(None));
+    heap.mutate(|m| m.get(&root).right.set(m, None));
     heap.collect();
     assert_eq!(drops.load(Ordering::Relaxed), HALF);
     assert_eq!(heap.mutate(|m| m.get(&root).count()), ALL - HALF);
@@ -403,7 +403,7 @@ fn deep_chain() {
         for _ in 1..LEN / 2 {
             cur = cur.left.get().expect("链够长");
         }
-        cur.left.set(None);
+        cur.left.set(m, None);
     });
     heap.collect();
     assert_eq!(drops.load(Ordering::Relaxed), LEN - LEN / 2);
@@ -551,7 +551,7 @@ fn crossed_deep_trees() {
         for t in 0..WORKERS {
             s.spawn(move || {
                 let h = (t + 2) % HEAPS;
-                heaps[h].mutate(|m| m.get(&trees[h]).left.set(None));
+                heaps[h].mutate(|m| m.get(&trees[h]).left.set(m, None));
             });
         }
     });

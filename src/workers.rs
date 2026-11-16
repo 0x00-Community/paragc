@@ -33,6 +33,8 @@ struct Shared {
     caller: UnsafeCell<Option<Thread>>,
     /// 本轮有工人 panic 了
     panicked: AtomicBool,
+    /// 正有一轮在跑（防重入：并发标记经 &Heap 调用）
+    busy: AtomicBool,
     stop: AtomicBool,
 }
 
@@ -108,6 +110,7 @@ impl Pool {
             job: UnsafeCell::new(core::ptr::null::<fn(usize)>() as Job),
             caller: UnsafeCell::new(None),
             panicked: AtomicBool::new(false),
+            busy: AtomicBool::new(false),
             stop: AtomicBool::new(false),
         });
         let max = u64::try_from(threads.get()).unwrap_or(ACTIVE_MASK).min(ACTIVE_MASK);
@@ -131,17 +134,18 @@ impl Pool {
     }
 
     /// `n` 个线程（含调用方，工号 0..n）各跑一次 `f(工号)`，按工号收集结果。
-    pub(crate) fn run<R: Send>(&mut self, n: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
+    pub(crate) fn run<R: Send>(&self, n: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
         let n = n.clamp(1, self.threads());
         if n == 1 {
             return vec![f(0)];
         }
+        let _busy = Busy::enter(&self.shared.busy);
         let slots: Vec<UnsafeCell<Option<R>>> = (0..n).map(|_| UnsafeCell::new(None)).collect();
         let slots = Slots(&slots);
         let job = |me: usize| slots.put(me, f(me));
         let job: &(dyn Fn(usize) + Sync) = &job;
         let shared = &*self.shared;
-        // SAFETY: 上一轮已全部做完（&mut self 保证 run 不重入），此刻没有工人读 job / caller；
+        // SAFETY: 上一轮已全部做完（Busy 保证 run 不重入），此刻没有工人读 job / caller；
         // 擦掉的生命周期由下面「等到全部做完才返回」保证
         #[expect(clippy::transmute_ptr_to_ptr, reason = "要擦掉 dyn 的生命周期，as 转换做不到")]
         unsafe {
@@ -170,6 +174,22 @@ impl Pool {
         }
         assert!(!shared.panicked.load(Ordering::Acquire), "回收线程 panic 了");
         slots.take()
+    }
+}
+
+/// 一轮的占用标记：同一时刻只能有一轮。
+struct Busy<'a>(&'a AtomicBool);
+
+impl<'a> Busy<'a> {
+    fn enter(flag: &'a AtomicBool) -> Self {
+        assert!(flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok(), "回收线程池同时只能跑一轮");
+        Self(flag)
+    }
+}
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 

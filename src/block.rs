@@ -98,9 +98,10 @@ impl Block {
     }
 
     /// 从第 `from` 行起的第一个空洞（一段连续空行），返回 `[起, 止)` 行号。
+    /// 空行 = 行标记早于上次完成的纪元 `epoch`：并发标记期间标记方会把活行写成更新的纪元，那些也不是空行。
     pub(crate) fn hole(self, from: usize, epoch: u32) -> Option<(usize, usize)> {
         let lines = &self.meta().lines;
-        let free = |i: usize| lines[i].load(Ordering::Relaxed) != epoch;
+        let free = |i: usize| lines[i].load(Ordering::Relaxed) < epoch;
         let start = (from..LINES).find(|&i| free(i))?;
         let end = (start..LINES).find(|&i| !free(i)).unwrap_or(LINES);
         Some((start, end))

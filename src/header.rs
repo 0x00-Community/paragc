@@ -27,13 +27,14 @@ pub(crate) const HEADER: usize = size_of::<Header>();
 const _: () = assert!(HEADER.is_multiple_of(GRANULE), "对象数据要按粒度对齐");
 
 impl Header {
-    pub(crate) fn new<T: Trace>(bytes: usize, large: bool) -> Self {
+    /// `mark`：初始标记纪元（并发标记期间分配的对象直接标成本轮，平时是 0）。
+    pub(crate) fn new<T: Trace>(bytes: usize, large: bool, mark: u32) -> Self {
         let granules = u32::try_from(bytes / GRANULE).expect("对象太大");
         assert!(granules & LARGE_BIT == 0, "对象太大");
         Self {
             trace: Self::trace_as::<T>,
             drop: needs_drop::<T>().then_some(Self::drop_as::<T> as unsafe fn(*mut u8)),
-            mark: AtomicU32::new(0),
+            mark: AtomicU32::new(mark),
             granules: granules | if large { LARGE_BIT } else { 0 },
         }
     }

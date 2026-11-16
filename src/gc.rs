@@ -6,6 +6,7 @@ use core::ops::Deref;
 use core::ptr::{NonNull, null_mut};
 use core::sync::atomic::{AtomicPtr, Ordering};
 
+use crate::Mutator;
 use crate::header::Header;
 
 /// 品牌：`'gc` 不变（invariant），`Gc` 逃不出 [`crate::Heap::mutate`] 的闭包。
@@ -75,6 +76,8 @@ impl<T: fmt::Debug> fmt::Debug for Gc<'_, T> {
 }
 
 /// 原子的可空指针槽：对象里要改的边放这里（`Trace` 要求 `Sync`，所以 `Cell<Gc>` 用不了）。
+///
+/// 写入要带 [`Mutator`]：并发标记期间被覆盖的旧值要经写屏障交给回收器（初始快照）。
 pub struct Slot<'gc, T> {
     ptr: AtomicPtr<T>,
     _brand: PhantomData<Gc<'gc, T>>,
@@ -112,20 +115,30 @@ impl<'gc, T> Slot<'gc, T> {
         Self::wrap(self.ptr.load(Ordering::Acquire))
     }
 
-    pub fn set(&self, v: Option<Gc<'gc, T>>) {
-        self.ptr.store(Self::raw(v), Ordering::Release);
+    pub fn set(&self, m: &Mutator<'gc>, v: Option<Gc<'gc, T>>) {
+        self.swap(m, v);
     }
 
-    pub fn swap(&self, v: Option<Gc<'gc, T>>) -> Option<Gc<'gc, T>> {
-        Self::wrap(self.ptr.swap(Self::raw(v), Ordering::AcqRel))
+    pub fn swap(&self, m: &Mutator<'gc>, v: Option<Gc<'gc, T>>) -> Option<Gc<'gc, T>> {
+        let old = self.ptr.swap(Self::raw(v), Ordering::AcqRel);
+        Self::barrier(m, old);
+        Self::wrap(old)
     }
 
     /// 槽里是 `current` 才换成 `new`；失败时返回槽里的值。
-    pub fn compare_exchange(&self, current: Option<Gc<'gc, T>>, new: Option<Gc<'gc, T>>) -> Result<Option<Gc<'gc, T>>, Option<Gc<'gc, T>>> {
-        self.ptr
-            .compare_exchange(Self::raw(current), Self::raw(new), Ordering::AcqRel, Ordering::Acquire)
-            .map(Self::wrap)
-            .map_err(Self::wrap)
+    pub fn compare_exchange(&self, m: &Mutator<'gc>, current: Option<Gc<'gc, T>>, new: Option<Gc<'gc, T>>) -> Result<Option<Gc<'gc, T>>, Option<Gc<'gc, T>>> {
+        let done = self.ptr.compare_exchange(Self::raw(current), Self::raw(new), Ordering::AcqRel, Ordering::Acquire);
+        if let Ok(old) = done {
+            Self::barrier(m, old);
+        }
+        done.map(Self::wrap).map_err(Self::wrap)
+    }
+
+    /// 被覆盖的旧值交给写屏障。
+    fn barrier(m: &Mutator<'gc>, old: *mut T) {
+        if !old.is_null() {
+            m.overwritten(Header::of(old.cast()));
+        }
     }
 }
 
