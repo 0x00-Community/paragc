@@ -44,6 +44,16 @@ Rust 的并行垃圾回收器。[English](README.md)
 
 逐条跑：`cargo test --test gc -- --exact <名字>`。
 
+Miri（Stacked / Tree Borrows 都要过，测试在 `cfg(miri)` 下自动缩规模）：
+
+```sh
+MIRIFLAGS="-Zmiri-permissive-provenance" cargo +nightly miri test --test gc -- --exact <名字>
+MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-tree-borrows" cargo +nightly miri test --test gc -- --exact <名字>
+```
+
+`eight_threads_eight_heaps_crossed`：8 线程 × 8 堆，跨堆持有根（链头挂着别的堆上的链）、跨线程检查与释放、
+全部堆并行回收的同时另一个线程释放根、大对象与节点成环；最后反复回收直到析构数 = 创建数。Miri 下缩成 4 × 4。
+
 ## 许可
 
 MIT
