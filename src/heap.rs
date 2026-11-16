@@ -15,7 +15,7 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsiz
 use std::alloc::{alloc, handle_alloc_error};
 use std::sync::{Arc, OnceLock};
 
-use crossbeam_deque::{Injector, Steal, Worker};
+use crossbeam_deque::{Injector, Steal};
 use crossbeam_utils::{Backoff, CachePadded};
 
 use j8lockfree::SegVec;
@@ -23,12 +23,12 @@ use j8lockfree::SegVec;
 use crate::block::Block;
 use crate::gc::{Invariant, RawSlot};
 use crate::header::{HEADER, Header, MAX_EPOCH};
-use crate::layout::{BLOCK, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, LARGE, MIN_SPARE_BLOCKS, MIN_TRIGGER, YOUNG_PER_FULL};
+use crate::layout::{BLOCK, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, LARGE, MIN_SPARE_BLOCKS, MIN_TRIGGER, YOUNG_PER_FULL, YOUNG_PER_FULL_RC};
 use crate::mark::Marking;
 use crate::roots::RootTable;
 use crate::sweep::{Large, Outcome, Sink, Sweeper};
 use crate::workers::Pool;
-use crate::trace::Tracer;
+use crate::release::Releaser;
 use crate::{Gc, Trace};
 
 pub struct Heap {
@@ -48,6 +48,10 @@ pub struct Heap {
     remembered: Injector<usize>,
     /// 引用计数登记：本轮被写过的、计数中的槽（每个槽每轮一次）
     rc_log: Injector<usize>,
+    /// 待处理的减量（年轻回收的停顿放进来，sweep_concurrently 在后台做）
+    decs: Injector<usize>,
+    /// 后台释放过对象的块（下一次停顿开头重算行）
+    dirty: Injector<Block>,
     /// 引用计数可信：停顿式完整回收重新计数后为真；并发标记开始后为假（黑分配的对象没计它们的边），直到下一次重新计数
     rc_valid: AtomicBool,
     /// 当前计数的奇偶（重新计数时翻转，旧计数一次作废）
@@ -111,6 +115,8 @@ impl Heap {
             grey: Injector::new(),
             remembered: Injector::new(),
             rc_log: Injector::new(),
+            decs: Injector::new(),
+            dirty: Injector::new(),
             rc_valid: AtomicBool::new(false),
             rc_parity: false,
             rc_roots: Vec::new(),
@@ -277,10 +283,14 @@ impl Heap {
         !self.sweeper.is_done()
     }
 
-    /// 并发清扫：借回收线程池把上一轮还没扫的块与大对象扫完（mutator 可以同时跑，也在顺手扫）；
-    /// 返回时上一轮的死对象都已析构。
+    /// 并发清扫：借回收线程池先把引用计数的减量做完（连锁释放），再把上一轮还没扫的块与大对象扫完
+    /// （mutator 可以同时跑，也在顺手扫）；返回时上一轮的死对象都已析构。
     pub fn sweep_concurrently(&self) {
-        self.sweeper.finish(self.pool(), self);
+        let pool = self.pool();
+        if !self.decs.is_empty() {
+            Releaser::new(&self.decs, &self.dirty, pool.threads(), self.epoch, self.rc_parity).run(pool);
+        }
+        self.sweeper.finish(pool, self);
     }
 
     fn alloc_large(&self, bytes: usize) -> *mut u8 {
@@ -305,12 +315,14 @@ impl Heap {
         }
     }
 
-    /// 上次回收后新领用的够多了就回收：平时做年轻回收，每 [`YOUNG_PER_FULL`] 次年轻回收穿插一次完整回收
-    /// （年轻回收收不到死掉的老对象）。回收了返回 true。
+    /// 上次回收后新领用的够多了就回收：平时做年轻回收（死掉的老对象由引用计数收），追踪式的完整回收只为收环、
+    /// 计数粘住的对象而少跑——计数可信时每 [`YOUNG_PER_FULL_RC`] 次年轻回收一次；计数不可信（并发标记之后）时
+    /// 每 [`YOUNG_PER_FULL`] 次一次，尽快重新计数。回收了返回 true。
     pub fn collect_if_needed(&mut self) -> bool {
         let due = *self.allocated.get_mut() >= self.sweeper.live().max(MIN_TRIGGER) * GROWTH;
         if due {
-            if self.young_since_full < YOUNG_PER_FULL {
+            let every = if *self.rc_valid.get_mut() { YOUNG_PER_FULL_RC } else { YOUNG_PER_FULL };
+            if self.young_since_full < every {
                 self.collect_young();
             } else {
                 self.collect();
@@ -325,11 +337,30 @@ impl Heap {
     ///
     /// 有并发标记在进行时，改为把它收尾（完整回收）。
     pub fn collect_young(&mut self) {
+        self.finish_young();
+        self.sweep_concurrently();
+    }
+
+    /// 年轻回收的停顿部分：标记、结算引用计数的增量；减量与清扫留给之后的 [`Heap::sweep_concurrently`]
+    /// （与 mutator 并发；mutator 要块时也会顺手扫）。
+    pub fn finish_young(&mut self) {
         if *self.marking.get_mut() != 0 {
-            self.collect();
+            self.finish_marking();
             return;
         }
         self.sweep_concurrently();
+        // 上一轮后台释放过对象的块：按还在的老对象重算行（年轻对象的行由下面的追踪标上，死掉的由清扫收）。
+        // 被拿去分配过的块里可能有还没扫的死年轻对象（起点位还在）：只重算行、不放回可用队列，交给年轻清扫分类
+        let epoch = self.epoch;
+        let mut dirty = Self::drain(&self.dirty);
+        dirty.sort_unstable_by_key(|b| b.line(0).addr());
+        dirty.dedup();
+        for b in dirty {
+            // SAFETY: 独占；块里起点位标着的对象都还没析构
+            if unsafe { b.recompute_lines(epoch) } && b.list() {
+                self.available.push(b);
+            }
+        }
         // SAFETY: &mut self ⇒ 没有 mutator
         let roots = unsafe { self.roots.settle() };
         let epoch = self.epoch;
@@ -367,13 +398,13 @@ impl Heap {
         let workers = pool.sized(self.blocks.len() + self.large.len());
         // 晋升的对象被扫描时，它的每条边 +1（年轻对象的边从晋升起才计数）
         Marking::new(workers, epoch, &self.grey).counting(counting.then_some(parity)).run(pool);
-        let dirty = if counting {
+        if counting {
             self.rc_roots = roots.iter().map(|r| r.expose_provenance()).collect();
-            // SAFETY: &mut self ⇒ 没有 mutator；增量都已加完
-            unsafe { Self::release(decs, epoch, parity) }
-        } else {
-            Vec::new()
-        };
+            // 增量都已加完；减量交给后台（sweep_concurrently）
+            for addr in decs {
+                self.decs.push(addr);
+            }
+        }
         // 只扫上次回收后拿去分配过的块（年轻对象只可能在这些块里）；没动过的老块原样放回
         let (young, old): (Vec<Block>, Vec<Block>) = self.blocks.take().into_iter().partition(|b| b.live_since_sweep().is_none());
         self.blocks.extend(old);
@@ -385,43 +416,6 @@ impl Heap {
         self.collections += 1;
         self.young_collections += 1;
         self.young_since_full += 1;
-        self.sweep_concurrently();
-        // 引用计数释放过对象的块：按剩下的对象重算行，空出了行就放回可用队列
-        for b in dirty {
-            // SAFETY: 独占；年轻的死对象已扫掉，块里剩下的都活着
-            if unsafe { b.recompute_lines(epoch) } && b.list() {
-                self.available.push(b);
-            }
-        }
-    }
-
-    /// 处理减量：减到 0 的老对象（块里的、没被搬走的）释放——它每条边的目标再减一（连锁），析构，清起点位。
-    /// 返回释放过对象的块（去重）。大对象、粘住的、年轻的不在这里释放（留给追踪 / 年轻清扫）。
-    /// SAFETY（调用方）：没有 mutator；这一轮的增量都已加完（否则会把还有引用的对象减到 0）。
-    unsafe fn release(mut work: Vec<usize>, epoch: u32, parity: bool) -> Vec<Block> {
-        let seed = Worker::new_lifo();
-        let mut dirty = Vec::new();
-        while let Some(addr) = work.pop() {
-            let header = core::ptr::with_exposed_provenance::<Header>(addr);
-            // SAFETY: 减量来自计入过的边，目标在计数归零前一直活着
-            let h = unsafe { &*header };
-            if !h.rc_dec(parity) || h.is_large() || !h.is_marked(epoch) {
-                continue;
-            }
-            let mut children = Vec::new();
-            let mut t = Tracer::releasing(&seed, &mut children);
-            // SAFETY: 对象还没析构；释放模式只读它的边
-            unsafe { Header::visit(header, &mut t) };
-            work.append(&mut children);
-            // SAFETY: 计数归零 ⇒ 没有计入的引用；没有 mutator、年轻的都已晋升或将被清扫 ⇒ 没人再用它
-            unsafe { Header::finalize(header) };
-            let block = Block::containing(header.cast());
-            block.clear_start(header.cast());
-            dirty.push(block);
-        }
-        dirty.sort_unstable_by_key(|b| b.line(0).addr());
-        dirty.dedup();
-        dirty
     }
 
     /// 取空一个队列。
@@ -447,6 +441,8 @@ impl Heap {
     /// 或者某个线程调 [`Heap::sweep_concurrently`]）。停顿只有标记的收尾。
     pub fn finish_marking(&mut self) {
         self.sweep_concurrently();
+        // 完整标记重新标行（被引用计数释放的对象的行早于新纪元，自然空出），脏块不用再重算
+        drop(Self::drain(&self.dirty));
         // 完整标记会找到全部活对象，记忆集不再需要
         drop(Self::drain(&self.remembered));
         self.young_since_full = 0;
