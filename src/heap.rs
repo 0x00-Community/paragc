@@ -23,7 +23,7 @@ use j8lockfree::SegVec;
 use crate::block::Block;
 use crate::gc::Invariant;
 use crate::header::{HEADER, Header};
-use crate::layout::{BLOCK, GRANULE, GROWTH, LARGE, MIN_SPARE_BLOCKS, MIN_TRIGGER, SPARE_DIVISOR};
+use crate::layout::{BLOCK, GRANULE, GROWTH, LARGE, MIN_SPARE_BLOCKS, MIN_TRIGGER};
 use crate::mark::Marking;
 use crate::roots::RootTable;
 use crate::sweep::{Large, Outcome, Sink, Sweeper};
@@ -147,14 +147,21 @@ impl Heap {
         // 上一轮按「纪元 ≠ 本轮」判死，必须在新一轮标记把活对象标成更新的纪元之前扫完
         self.sweep_concurrently();
         let epoch = self.epoch.checked_add(1).expect("纪元用完了");
-        if self.marking.compare_exchange(0, epoch, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        // 请求位兼作互斥：谁先挂上谁来开始；已经在标记就撤掉请求返回
+        if self.gate.fetch_or(REQUEST, Ordering::AcqRel) & REQUEST != 0 {
             return false;
         }
-        self.gate.fetch_or(REQUEST, Ordering::AcqRel);
+        if self.marking.load(Ordering::Acquire) != 0 {
+            self.gate.fetch_and(!REQUEST, Ordering::AcqRel);
+            return false;
+        }
         let backoff = Backoff::new();
         while self.gate.load(Ordering::Acquire) & !REQUEST != 0 {
             backoff.snooze();
         }
+        // 纪元必须在 mutate 里走空之后才发布：否则先进门、看见「在标记」的 mutator 会黑分配，
+        // 而更早进门、没有写屏障的 mutator 还能往这个黑对象底下挂东西，快照之后黑对象不再追踪 ⇒ 漏标
+        self.marking.store(epoch, Ordering::Release);
         // SAFETY: 请求挂着且 mutate 里没人 ⇒ 没有 mutator（根句柄的析构不受影响）
         let roots = unsafe { self.roots.settle() };
         Marking::seed(&self.grey, &roots, epoch);
@@ -268,7 +275,9 @@ impl Heap {
         let blocks = self.blocks.take();
         let large = self.large.take();
         while !matches!(self.available.steal(), Steal::Empty) {}
-        let spare = (blocks.len() / SPARE_DIVISOR).max(MIN_SPARE_BLOCKS);
+        // 留作备用的全空块：上一轮领用了多少块，下一轮大概还要这么多；多的还给系统。
+        // 留少了每轮都要新开块（清零 + 缺页），比如临时对象多的负载每轮几乎全空
+        let spare = (*self.allocated.get_mut() / BLOCK).max(MIN_SPARE_BLOCKS);
         self.sweeper.start(epoch, blocks, large, spare);
         self.epoch = epoch;
         *self.marking.get_mut() = 0;

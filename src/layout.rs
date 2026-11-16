@@ -24,6 +24,4 @@ pub(crate) const MIN_TRIGGER: usize = 4 * 1024 * 1024;
 pub(crate) const GROWTH: usize = 2;
 /// 回收后至少留着复用的全空块数
 pub(crate) const MIN_SPARE_BLOCKS: usize = 4;
-/// 回收后留着复用的全空块不超过总块数的 1 / 它，多的还给系统
-pub(crate) const SPARE_DIVISOR: usize = 4;
 
