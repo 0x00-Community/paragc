@@ -157,12 +157,12 @@ workloads, every configuration and how to read them: **[benches/benchmark.md](be
 
 | | paragc | cppgc | gc-arena | dumpster | gc |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Pause, 1M live + 1M dead, 1 thread | 25.7 | 45.0 | **15.8** | 16.4 | 87.6 |
-| Pause, 16 threads | **4.3** | 43.4 | – | – | – |
+| Pause, 1M live + 1M dead, 1 thread | 22.4 | 45.0 | **15.8** | 16.4 | 87.6 |
+| Pause, 16 threads | **4.2** | 43.4 | – | – | – |
 | Pause, concurrent marking + sweeping, 1 thread | **0.03** | – | – | – | – |
-| GCBench, 1 thread | **51.3** | 119.2 | 115.3 | 102.2 | 281.7 |
-| GCBench, 4 threads | **55.4** | 95.3 | – | – | – |
-| Many mutators, 16 threads | **9.2** | – | – | 334.3 | – |
+| GCBench, 1 thread | **53.7** | 119.2 | 115.3 | 102.2 | 281.7 |
+| GCBench, 4 threads | **59.1** | 95.3 | – | – | – |
+| Many mutators, 16 threads | **9.8** | – | – | 334.3 | – |
 
 Serially gc-arena and dumpster pause shorter (paragc's full collection also rebuilds reference counts); with threads,
 and in throughput, paragc leads. cppgc's forced full
