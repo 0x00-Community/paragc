@@ -1,5 +1,7 @@
 [workspace]
 members = [".", "macros"]
+# 对比基准依赖 V8 等大库，自成 workspace
+exclude = ["benches"]
 
 [workspace.package]
 version = "0.1.0"

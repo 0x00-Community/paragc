@@ -1,0 +1,10 @@
+[package]
+name = "bench-gc-arena"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bench-common.workspace = true
+gc-arena = "=0.7.0"
