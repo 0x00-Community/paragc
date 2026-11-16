@@ -130,6 +130,17 @@ impl Header {
         }
     }
 
+    /// 同 [`Header::rc_inc`]，但调用方保证此刻只有自己在改计数（单线程标记：mutator 不碰计数、减量队列为空）：
+    /// 用普通的读、算、写，不用带锁的原子读改写（重新计数时每条边一次，单线程省下的就是这个）。
+    pub(crate) fn rc_inc_exclusive(&self, parity: bool) {
+        let parity = if parity { PARITY_BIT } else { 0 };
+        let word = self.info.load(Ordering::Relaxed);
+        let rc = if word & PARITY_BIT == parity { (word & RC_MASK) >> RC_SHIFT } else { 0 };
+        if rc < RC_MAX {
+            self.info.store((word & !(RC_MASK | PARITY_BIT)) | parity | ((rc + 1) << RC_SHIFT), Ordering::Relaxed);
+        }
+    }
+
     /// 引用计数减一；减到 0 返回 true。粘住的、旧一代的、已经是 0 的都不变，返回 false。
     pub(crate) fn rc_dec(&self, parity: bool) -> bool {
         let parity = if parity { PARITY_BIT } else { 0 };

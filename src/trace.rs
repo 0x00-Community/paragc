@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicBool, AtomicI8, AtomicI16, AtomicI32, AtomicI64, 
 use core::time::Duration;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use crossbeam_deque::Worker;
+use crossbeam_deque::{Injector, Worker};
 
 use crate::block::Block;
 use crate::copy::Copier;
@@ -45,28 +45,45 @@ pub struct Tracer<'t> {
     count: Option<bool>,
     /// 释放模式（引用计数减到 0 的对象）：每条边的目标交给它 −1，不标记
     decs: Option<&'t mut Vec<usize>>,
+    /// 只有这一个线程在改计数（单线程标记）：+1 用普通读写
+    exclusive: bool,
+    /// 并发标记时的引用计数登记：重新计数的槽在读与改之间被 mutator 改写了，由这里补登记（见 [`Tracer::slot`]）
+    log: Option<&'t Injector<usize>>,
 }
 
 impl<'t> Tracer<'t> {
     pub(crate) fn new(work: &'t Worker<usize>, epoch: u32, copier: Option<&'t mut Copier>) -> Self {
-        Self { work, epoch, copier, count: None, decs: None }
+        Self { work, epoch, copier, count: None, decs: None, exclusive: false, log: None }
     }
 
     /// 计数模式：扫描时每条边给目标 +1（种子——根与记忆集——直接走 visit，不计）。
-    pub(crate) fn counting(mut self, parity: Option<bool>) -> Self {
+    /// `exclusive`：只有这一个线程在改计数。
+    pub(crate) fn counting(mut self, parity: Option<bool>, exclusive: bool) -> Self {
         self.count = parity;
+        self.exclusive = exclusive;
         self
     }
 
     /// 释放模式：访问一个死对象时把它每条边的目标（槽取上次计入的值）放进 `decs`。
     pub(crate) fn releasing(work: &'t Worker<usize>, decs: &'t mut Vec<usize>) -> Self {
-        Self { work, epoch: 0, copier: None, count: None, decs: Some(decs) }
+        Self { work, epoch: 0, copier: None, count: None, decs: Some(decs), exclusive: false, log: None }
+    }
+
+    /// 并发标记：给登记队列（见 [`Tracer::log`]）。
+    pub(crate) fn logging(mut self, log: Option<&'t Injector<usize>>) -> Self {
+        self.log = log;
+        self
     }
 
     fn inc(&self, header: *const Header) {
         if let Some(parity) = self.count {
             // SAFETY: header 是活对象
-            unsafe { &*header }.rc_inc(parity);
+            let h = unsafe { &*header };
+            if self.exclusive {
+                h.rc_inc_exclusive(parity);
+            } else {
+                h.rc_inc(parity);
+            }
         }
     }
 
@@ -109,7 +126,16 @@ impl<'t> Tracer<'t> {
             return;
         }
         if self.count.is_some() {
-            if let (Some(cur), _) = raw.recount() {
+            let (cur, _) = raw.recount();
+            // 并发标记：读出当前值与改「上次计入」之间 mutator 可能改写了槽；那时槽若还不计数（年轻对象的槽），
+            // 它不会登记 ⇒ 新值永远没人计。值变了就替它登记，收尾时按「新值 +1、计入的值 −1」结算（重复登记无害）
+            if let Some(log) = self.log
+                && raw.current() != cur
+                && raw.log()
+            {
+                log.push((&raw const *raw).expose_provenance());
+            }
+            if let Some(cur) = cur {
                 self.visit(cur, T::NO_EDGES);
                 self.inc(cur);
             }

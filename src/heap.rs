@@ -54,8 +54,10 @@ pub struct Heap {
     dirty: Injector<Block>,
     /// 引用计数可信：停顿式完整回收重新计数后为真；并发标记开始后为假（黑分配的对象没计它们的边），直到下一次重新计数
     rc_valid: AtomicBool,
-    /// 当前计数的奇偶（重新计数时翻转，旧计数一次作废）
-    rc_parity: bool,
+    /// 当前计数的奇偶（重新计数时翻转，旧计数一次作废；并发标记在握手时翻转）
+    rc_parity: AtomicBool,
+    /// 并发标记期间黑分配的对象（头地址）：它们不会被标记扫描，收尾时补算它们的边
+    black: Injector<usize>,
     /// 上一轮计入的根（延迟到这一轮 −1）
     rc_roots: Vec<usize>,
     /// 上次完整回收后做了几次年轻回收
@@ -118,7 +120,8 @@ impl Heap {
             decs: Injector::new(),
             dirty: Injector::new(),
             rc_valid: AtomicBool::new(false),
-            rc_parity: false,
+            rc_parity: AtomicBool::new(false),
+            black: Injector::new(),
             rc_roots: Vec::new(),
             young_since_full: 0,
             young_collections: 0,
@@ -167,8 +170,7 @@ impl Heap {
         tlab.adopt(self);
         // 并发标记只在没有 mutator 时开始、只在独占堆时结束，所以一次 mutate 里它不变
         let marking = NonZeroU32::new(self.marking.load(Ordering::Acquire));
-        let counting = self.rc_valid.load(Ordering::Acquire);
-        f(&Mutator { heap: self, tlab, marking, counting, _brand: PhantomData })
+        f(&Mutator { heap: self, tlab, marking, _brand: PhantomData })
     }
 
     fn pool(&self) -> &Pool {
@@ -199,15 +201,41 @@ impl Heap {
         // 纪元必须在 mutate 里走空之后才发布：否则先进门、看见「在标记」的 mutator 会黑分配，
         // 而更早进门、没有写屏障的 mutator 还能往这个黑对象底下挂东西，快照之后黑对象不再追踪 ⇒ 漏标
         self.marking.store(epoch, Ordering::Release);
-        // 黑分配的对象不会被扫描，它们的边不计数 ⇒ 从现在到下一次停顿式完整回收，引用计数不可信
+        // 引用计数顺带重新计数：翻转奇偶（旧计数作废），标记扫描时每条边 +1。到收尾补完（黑对象的边、标记期间
+        // 被改写的槽）之前计数不可信、不按计数释放
+        let parity = !self.rc_parity.fetch_xor(true, Ordering::AcqRel);
         self.rc_valid.store(false, Ordering::Release);
+        // 握手前的登记记的是旧奇偶下的「上次计入」：所在对象活着就会被扫描、改成计入当前值；死了的若留到收尾结算，
+        // 会拿旧值去减新一轮里别的边计上的数 ⇒ 丢掉（槽上残留的登记标志在扫描重新计入时清掉）
+        drop(Self::drain(&self.rc_log));
         // SAFETY: 请求挂着且 mutate 里没人 ⇒ 没有 mutator（根句柄的析构不受影响）
         let roots = unsafe { self.roots.settle() };
         Marking::seed(&self.grey, &roots, epoch);
         self.gate.fetch_and(!REQUEST, Ordering::AcqRel);
         let pool = self.pool();
-        Marking::new(pool.threads(), epoch, &self.grey).run(pool);
+        Marking::new(pool.threads(), epoch, &self.grey).counting(Some(parity)).logging(&self.rc_log).run(pool);
         true
+    }
+
+    /// 并发标记期间被改写过的槽：新值 +1、上次计入的值 −1（扫描可能在写之前或之后计过，两种情况结算后都对）。
+    /// 减量只留给本轮活着的对象（死的马上被清扫，碰不得），放进队列由后台处理。SAFETY 见调用处：独占堆。
+    fn settle_concurrent_log(&mut self, epoch: u32) {
+        let parity = *self.rc_parity.get_mut();
+        for addr in Self::drain(&self.rc_log) {
+            // SAFETY: 登记的槽在被写时所在对象可达；独占堆、清扫还没开始，内存都还在
+            let slot = unsafe { &*core::ptr::with_exposed_provenance::<RawSlot>(addr) };
+            let (cur, prev) = slot.recount();
+            if let Some(cur) = cur {
+                // SAFETY: 槽当前指向的对象还在（清扫没开始）
+                unsafe { &*cur }.rc_inc(parity);
+            }
+            // SAFETY: 同上
+            if let Some(prev) = prev
+                && unsafe { &*prev }.is_marked(epoch)
+            {
+                self.decs.push(prev.expose_provenance());
+            }
+        }
     }
 
     /// 下一轮的纪元。
@@ -288,7 +316,7 @@ impl Heap {
     pub fn sweep_concurrently(&self) {
         let pool = self.pool();
         if !self.decs.is_empty() {
-            Releaser::new(&self.decs, &self.dirty, pool.threads(), self.epoch, self.rc_parity).run(pool);
+            Releaser::new(&self.decs, &self.dirty, pool.threads(), self.epoch, self.rc_parity.load(Ordering::Acquire)).run(pool);
         }
         self.sweeper.finish(pool, self);
     }
@@ -367,7 +395,7 @@ impl Heap {
         let remembered = Self::drain(&self.remembered);
         // 引用计数（可信时）：当前的根 +1、登记过的槽按「新值 +1、上次计入的值 −1」结算，上一轮的根延迟到现在 −1
         let counting = *self.rc_valid.get_mut();
-        let parity = self.rc_parity;
+        let parity = *self.rc_parity.get_mut();
         let mut decs = Vec::new();
         if counting {
             for &root in &roots {
@@ -446,21 +474,17 @@ impl Heap {
         // 完整标记会找到全部活对象，记忆集不再需要
         drop(Self::drain(&self.remembered));
         self.young_since_full = 0;
-        // 引用计数：停顿式完整回收顺手重新计数（翻转奇偶 ⇒ 旧计数全部作废，扫描时每条边 +1，槽改成计入当前值）；
-        // 并发标记的收尾不重新计数，计数继续不可信。两种情况下这一轮的登记都作废
-        let recount = *self.marking.get_mut() == 0;
-        for addr in Self::drain(&self.rc_log) {
-            if !recount {
-                // SAFETY: 登记的槽在被写时所在对象可达，到这次回收前不会被释放
-                unsafe { &*core::ptr::with_exposed_provenance::<RawSlot>(addr) }.unlog();
-            }
+        // 引用计数顺带重新计数（旧计数作废，扫描时每条边 +1、槽改成计入当前值）：停顿式在这里翻转奇偶；
+        // 并发标记已在握手时翻转，扫描已经计了一部分，下面补黑对象的边、结算标记期间被改写的槽
+        let concurrent = *self.marking.get_mut() != 0;
+        if !concurrent {
+            // 标记前登记的槽：所在对象活着就会被扫描、计入当前值；死了不用管
+            drop(Self::drain(&self.rc_log));
+            let parity = self.rc_parity.get_mut();
+            *parity = !*parity;
         }
         self.rc_roots.clear();
-        if recount {
-            self.rc_parity = !self.rc_parity;
-        }
-        *self.rc_valid.get_mut() = recount;
-        let count = recount.then_some(self.rc_parity);
+        let count = Some(*self.rc_parity.get_mut());
         // SAFETY: &mut self ⇒ 没有 mutator
         let roots = unsafe { self.roots.settle() };
         let marking = *self.marking.get_mut();
@@ -474,6 +498,10 @@ impl Heap {
         }
         let targets = Injector::new();
         let evacuate = if marking == 0 { Self::pick_evacuation(&available, &targets) } else { 0 };
+        // 并发标记的黑对象：已标过、没扫描过，放进灰队列让收尾的标记扫描一遍（只为计数）
+        for addr in Self::drain(&self.black) {
+            self.grey.push(addr);
+        }
         let mark = Marking::new(workers, epoch, &self.grey).counting(count);
         let moved = AtomicUsize::new(0);
         if evacuate > 0 {
@@ -484,6 +512,10 @@ impl Heap {
             }
             mark.run(pool);
         }
+        if concurrent {
+            self.settle_concurrent_log(epoch);
+        }
+        *self.rc_valid.get_mut() = true;
         // 全部块交给清扫器（疏散时新开的块也已登记）；清扫好的可用块之后再一个个放回 available（它们本来就都在 blocks 里）
         let blocks = self.blocks.take();
         let large = self.large.take();
@@ -617,8 +649,6 @@ pub struct Mutator<'gc> {
     tlab: &'gc Tlab,
     /// 进 mutate 时正在并发标记的纪元：写屏障与黑分配用
     marking: Option<NonZeroU32>,
-    /// 进 mutate 时引用计数是否可信（可信才登记槽）
-    counting: bool,
     _brand: Invariant<'gc>,
 }
 
@@ -636,23 +666,22 @@ impl<'gc> Mutator<'gc> {
     /// 平时：写进去的是年轻对象（标记纪元不是上次完成的那轮）就记下槽的地址——老对象指向年轻对象的边只能这样产生，
     /// 年轻回收从这些槽出发。（并发标记期间新对象都是黑的、收尾后全是老对象，不用记。）
     ///
-    /// 引用计数可信时，槽本轮第一次被写还要登记（只有老对象里的槽会登记，年轻对象的槽不计数）。
+    /// 计数中的槽（老对象里的；年轻对象的槽不计数）本轮第一次被写还要登记，回收时结算。
     pub(crate) fn written(&self, slot: &RawSlot, old: Option<*const Header>, new: Option<*const Header>) {
+        let addr = (&raw const *slot).expose_provenance();
         if let Some(epoch) = self.marking {
             if let Some(old) = old {
                 self.heap.remember(old, epoch.get());
             }
-        } else {
-            let addr = (&raw const *slot).expose_provenance();
+        } else if let Some(new) = new
             // SAFETY: new 是刚写进槽的、活着的对象
-            if let Some(new) = new
-                && !unsafe { &*new }.is_marked(self.heap.epoch)
-            {
-                self.heap.remembered.push(addr);
-            }
-            if self.counting && slot.log() {
-                self.heap.rc_log.push(addr);
-            }
+            && !unsafe { &*new }.is_marked(self.heap.epoch)
+        {
+            self.heap.remembered.push(addr);
+        }
+        // 引用计数登记：平时与并发标记期间都要（标记期间被改写的槽在收尾时结算）
+        if slot.log() {
+            self.heap.rc_log.push(addr);
         }
     }
 
@@ -665,8 +694,12 @@ impl<'gc> Mutator<'gc> {
         // 平时：年轻（标记 0 ≠ 上次完成的纪元；在交出去前就扫过的块或新块里，进行中的清扫碰不到它）。
         // 并发标记中：黑分配（直接标成本轮，连同它占的行）
         let mark = self.marking.map_or(YOUNG, NonZeroU32::get);
-        if self.marking.is_some() && !large {
-            Block::containing(p).mark_lines(p, bytes, mark);
+        if self.marking.is_some() {
+            if !large {
+                Block::containing(p).mark_lines(p, bytes, mark);
+            }
+            // 黑对象不会被标记扫描：记下来，收尾时补算它的边（引用计数）
+            self.heap.black.push(p.expose_provenance());
         }
         // SAFETY: p 是 bytes 字节、按粒度对齐的新内存，归这次分配独有
         unsafe {
