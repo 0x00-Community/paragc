@@ -181,8 +181,12 @@ impl Pool {
 struct Busy<'a>(&'a AtomicBool);
 
 impl<'a> Busy<'a> {
+    /// 等到没有别的一轮在跑（并发标记与并发清扫可能从不同线程同时来）。
     fn enter(flag: &'a AtomicBool) -> Self {
-        assert!(flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok(), "回收线程池同时只能跑一轮");
+        let backoff = Backoff::new();
+        while flag.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            backoff.snooze();
+        }
         Self(flag)
     }
 }

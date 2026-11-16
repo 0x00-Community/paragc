@@ -613,6 +613,8 @@ struct Moves {
     discarded: AtomicUsize,
     /// 落在并发标记期间的 mutate 次数（确认真的和标记重叠了）
     overlapped: AtomicUsize,
+    /// 落在并发清扫期间的 mutate 次数
+    overlapped_sweep: AtomicUsize,
 }
 
 impl Moves {
@@ -675,37 +677,34 @@ impl Moves {
     }
 }
 
-/// 并发标记期间，多个 mutator 不停地把节点从一个槽摘下（只剩栈上引用）再挂到另一个槽、新建、扔掉；
-/// 另一个线程同时并发标记。每轮结束回收后：链上节点数 = 造的 − 扔的（初始快照没漏掉被挪动的节点）；
-/// 最后再完整回收一次：析构数恰好 = 扔掉的个数。
-#[test]
-fn concurrent_marking_while_relinking() {
-    let moves = Moves::default();
-    let mut heap = Heap::new(THREADS);
-    let board: Root<BoardB> = heap.mutate(|m| m.root(m.alloc(Board { cells: (0..CELLS).map(|_| Slot::default()).collect() })));
-    for round in 0..MARK_ROUNDS {
+impl Moves {
+    /// 一轮：MOVERS 个 mutator 不停地挪 / 新建 / 扔（每次 mutate 做 STEPS 步），做满 MUTATES 次后、并且直到
+    /// 后台的 `background` 做完才停；后台线程等 mutator 做了一阵才开始（保证二者重叠）。
+    fn round(&self, heap: &Heap, board: &Root<BoardB>, round: usize, background: impl FnOnce(&Heap) + Send) {
         let started = std::sync::atomic::AtomicBool::new(false);
-        let marked = std::sync::atomic::AtomicBool::new(false);
+        let done = std::sync::atomic::AtomicBool::new(false);
         std::thread::scope(|s| {
-            let (heap, board, moves, started, marked) = (&heap, &board, &moves, &started, &marked);
+            let (started, done) = (&started, &done);
             for t in 0..MOVERS {
                 s.spawn(move || {
                     let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ u64::try_from((round << 8) | t).expect("小"));
                     let mut tlab = paragc::Tlab::default();
-                    // 至少 MUTATES 次，并且一直做到并发标记结束（保证和标记重叠）
                     let mut i = 0;
-                    while i < MUTATES || !marked.load(Ordering::Acquire) {
+                    while i < MUTATES || !done.load(Ordering::Acquire) {
                         if i == MUTATES / 4 {
                             started.store(true, Ordering::Release);
                         }
                         i += 1;
                         heap.mutate_in(&mut tlab, |m| {
                             if m.is_marking() {
-                                moves.overlapped.fetch_add(1, Ordering::Relaxed);
+                                self.overlapped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            if heap.is_sweeping() {
+                                self.overlapped_sweep.fetch_add(1, Ordering::Relaxed);
                             }
                             let board = m.get(board);
                             for _ in 0..STEPS {
-                                moves.step(m, &board, t, &mut rng);
+                                self.step(m, &board, t, &mut rng);
                             }
                         });
                     }
@@ -715,21 +714,66 @@ fn concurrent_marking_while_relinking() {
                 while !started.load(Ordering::Acquire) {
                     std::thread::yield_now();
                 }
-                assert!(heap.mark_concurrently(), "这一轮还没有在标记");
-                marked.store(true, Ordering::Release);
+                background(heap);
+                done.store(true, Ordering::Release);
             });
         });
-        heap.collect();
-        let (dropped, discarded) = (moves.ledger.dropped.load(Ordering::Relaxed), moves.discarded.load(Ordering::Relaxed));
+    }
+
+    /// 每轮之后：没析构还挂在链上的节点，链上节点数恰好 = 造的 − 扔的。
+    fn check(&self, heap: &Heap, board: &Root<BoardB>, round: usize) {
+        let (dropped, discarded) = (self.ledger.dropped.load(Ordering::Relaxed), self.discarded.load(Ordering::Relaxed));
         assert!(dropped <= discarded, "第 {round} 轮析构了还挂在链上的节点：析构 {dropped} > 扔掉 {discarded}");
-        let live = moves.ledger.made.load(Ordering::Relaxed) - moves.discarded.load(Ordering::Relaxed);
-        assert_eq!(Moves::reachable(&heap, &board), live, "第 {round} 轮链上丢了节点");
+        let live = self.ledger.made.load(Ordering::Relaxed) - discarded;
+        assert_eq!(Self::reachable(heap, board), live, "第 {round} 轮链上丢了节点");
+    }
+
+    /// 收尾：再完整回收一次清掉浮动垃圾，析构数恰好 = 扔掉的；放掉板子后全部析构。
+    fn finish(&self, mut heap: Heap, board: Root<BoardB>) {
+        heap.collect();
+        assert_eq!(self.ledger.dropped.load(Ordering::Relaxed), self.discarded.load(Ordering::Relaxed));
+        drop(board);
+        heap.collect();
+        assert_eq!(self.ledger.dropped.load(Ordering::Relaxed), self.ledger.made.load(Ordering::Relaxed));
+    }
+}
+
+fn board(heap: &Heap) -> Root<BoardB> {
+    heap.mutate(|m| m.root(m.alloc(Board { cells: (0..CELLS).map(|_| Slot::default()).collect() })))
+}
+
+/// 并发标记期间，多个 mutator 不停地把节点从一个槽摘下（只剩栈上引用）再挂到另一个槽、新建、扔掉；
+/// 另一个线程同时并发标记。每轮结束回收后：链上节点数 = 造的 − 扔的（初始快照没漏掉被挪动的节点）；
+/// 最后再完整回收一次：析构数恰好 = 扔掉的个数。
+#[test]
+fn concurrent_marking_while_relinking() {
+    let moves = Moves::default();
+    let mut heap = Heap::new(THREADS);
+    let board = board(&heap);
+    for round in 0..MARK_ROUNDS {
+        moves.round(&heap, &board, round, |h| assert!(h.mark_concurrently(), "这一轮还没有在标记"));
+        heap.collect();
+        moves.check(&heap, &board, round);
     }
     assert!(moves.overlapped.load(Ordering::Relaxed) > 0, "mutate 一次也没落在并发标记期间");
-    // 浮动垃圾（标记开始后才扔的）这一轮清掉
-    heap.collect();
-    assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed), moves.discarded.load(Ordering::Relaxed));
-    drop(board);
-    heap.collect();
-    assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed), moves.ledger.made.load(Ordering::Relaxed));
+    moves.finish(heap, board);
+}
+
+/// 并发标记 → 标记收尾（停顿）→ 并发清扫：清扫期间 mutator 照常挪 / 新建 / 扔，要块时顺手扫（惰性清扫），
+/// 另一个线程同时 `sweep_concurrently`。每轮扫完后链上节点数恰好、没有析构还挂着的节点；最后析构数恰好。
+#[test]
+fn concurrent_sweeping_while_relinking() {
+    let moves = Moves::default();
+    let mut heap = Heap::new(THREADS);
+    let board = board(&heap);
+    for round in 0..MARK_ROUNDS {
+        moves.round(&heap, &board, round, |h| assert!(h.mark_concurrently(), "这一轮还没有在标记"));
+        heap.finish_marking();
+        moves.round(&heap, &board, round, Heap::sweep_concurrently);
+        assert!(!heap.is_sweeping());
+        moves.check(&heap, &board, round);
+    }
+    assert!(moves.overlapped.load(Ordering::Relaxed) > 0, "mutate 一次也没落在并发标记期间");
+    assert!(moves.overlapped_sweep.load(Ordering::Relaxed) > 0, "mutate 一次也没落在并发清扫期间");
+    moves.finish(heap, board);
 }

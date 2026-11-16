@@ -4,7 +4,7 @@
 # paragc
 
 ### A parallel garbage collector for Rust.
-**Immix-style mark-region heap, many mutator threads at once, concurrent and parallel marking, parallel sweeping. No locks.**
+**Immix-style mark-region heap, many mutator threads at once, concurrent and parallel marking and sweeping. No locks.**
 
 [![Rust](https://img.shields.io/badge/Rust-100%25-orange?style=for-the-badge&logo=rust)](https://www.rust-lang.org)
 [![Miri](https://img.shields.io/badge/Miri-clean-success?style=for-the-badge)](#-verification)
@@ -33,7 +33,8 @@ collection marks and sweeps on every core.
 | --- | --- |
 | 🧵 **Many mutators** | `Heap::mutate(&self)` runs on any number of threads at once. Each bump-allocates in its own buffer (`Tlab`) and claims whole blocks with one atomic operation. |
 | 🔒 **Exclusive by borrowing** | `Heap::collect(&mut self)` cannot overlap a `mutate`: the borrow checker is the stop-the-world, so there is no safepoint protocol and no lock. |
-| 🌊 **Concurrent marking** | `Heap::mark_concurrently(&self)` marks while mutators keep running (a snapshot-at-the-beginning barrier on `Slot` writes, new objects allocated black); the following `collect` only drains what the barrier logged and sweeps. Mutators wait only for a brief handshake at the start. |
+| 🌊 **Concurrent marking** | `Heap::mark_concurrently(&self)` marks while mutators keep running (a snapshot-at-the-beginning barrier on `Slot` writes, new objects allocated black). Mutators wait only for a brief handshake at the start. |
+| 🧹 **Concurrent sweeping** | `Heap::finish_marking(&mut self)` only finishes marking and hands the blocks to the sweeper; mutators sweep a block themselves when they need one (lazy sweeping) while `Heap::sweep_concurrently(&self)` sweeps the rest on the pool. With both, the pause is just draining the grey queue. |
 | 🏃 **Parallel collection** | A persistent pool per heap (threads park between collections). Marking: one crossbeam work-stealing deque per worker, stealing in batches. Sweeping, destructors included: blocks handed out in batches to the same workers. |
 | 🏷️ **Branded handles** | `Gc<'gc, T>` cannot escape the `mutate` closure. `Root<B>` handles carry no lifetime and can be stored anywhere and sent across threads. |
 | 📌 **Non-moving** | Objects never move, so pointers stay plain pointers and nothing needs forwarding. |
@@ -87,7 +88,8 @@ assert_eq!(sum, 999 * 1000 / 2);
 | Sweeping | Workers claim blocks in batches, walk the start bitmap, drop unmarked objects and classify each block as empty / recyclable / full. Spare empty blocks beyond a quarter of the heap go back to the system. |
 | Roots | Each `Root<B>` owns a slot in an append-only table; freed slot numbers are folded into a read-only array at collection time and claimed with an atomic cursor during `mutate`. |
 | Stale buffers | A buffer remembers (heap, collection count); after a collection it starts over, because its block was re-classified. |
-| Concurrent marking | Start: raise a request bit in the gate word (top bit; low bits count threads inside `mutate`), wait until no mutator is inside, mark the roots grey, drop the request. paragc does not scan stacks, so the snapshot has to be taken when no mutator holds an unrooted `Gc`. Then mark on the pool. During marking, a `Slot` write marks the value it overwrites and puts it in the heap's grey queue (snapshot at the beginning), new objects get the marking epoch and their lines marked (black). A line is free when its mark is older than the last finished epoch, so lines the marker has just stamped are never handed out. `collect` finishes: drain the grey queue in parallel, then sweep. |
+| Concurrent marking | Start: finish the previous sweep (it judges by "mark ≠ that epoch", so it must end before the next marking stamps live objects with a newer one), raise a request bit in the gate word (top bit; low bits count threads inside `mutate`), wait until no mutator is inside, mark the roots grey, drop the request. paragc does not scan stacks, so the snapshot has to be taken when no mutator holds an unrooted `Gc`. Then mark on the pool. During marking, a `Slot` write marks the value it overwrites and puts it in the heap's grey queue (snapshot at the beginning), new objects get the marking epoch and their lines marked (black). A line is free when its mark is older than the last finished epoch, so lines the marker has just stamped are never handed out. `finish_marking` drains the grey queue in parallel. |
+| Concurrent sweeping | `finish_marking` hands every block and large object to the sweeper and returns. Claiming is an atomic cursor, so each block is swept exactly once by whoever claims it, before it is handed out: a mutator that needs a block first takes a swept one, otherwise claims an unswept block and sweeps it on the spot; `sweep_concurrently` sweeps the rest on the pool and waits for blocks others are still sweeping. New objects carry the last finished epoch, so allocations during sweeping are never taken for dead. `collect` = `finish_marking` + `sweep_concurrently`. |
 
 Work-stealing deques and backoff come from [crossbeam](https://github.com/crossbeam-rs/crossbeam) (`crossbeam-deque`,
 `crossbeam-utils`); the append-only segmented vector and the block stock come from
@@ -116,12 +118,13 @@ Work-stealing deques and backoff come from [crossbeam](https://github.com/crossb
 | `eight_threads_eight_heaps_crossed` | 8 threads × 8 heaps: roots held across heaps, checked and released on other threads, released while all heaps collect in parallel, cycles through large objects |
 | `crossed_deep_trees` | 8 heaps, each with a deep chain and a 15-level tree whose leaves anchor into the next heap's chain; every cut matches the expected finalization count |
 | `concurrent_marking_while_relinking` | Mutators keep unlinking nodes (leaving them only on their stacks) and relinking them elsewhere, allocating and discarding, while another thread marks concurrently; after every cycle the reachable count is exact, and finalization equals the discards |
+| `concurrent_sweeping_while_relinking` | The same mutators across concurrent marking, the `finish_marking` pause and concurrent sweeping (they sweep blocks lazily while another thread runs `sweep_concurrently`); nothing still linked is ever finalized, counts stay exact |
 
 All of them also run under Miri with both Stacked Borrows and Tree Borrows (scaled down under `cfg(miri)`).
 `-Zmiri-ignore-leaks` is needed because crossbeam-epoch's global collector still holds deferred garbage at exit; at
 4 collector threads per heap Stacked Borrows also reports a violation inside crossbeam-epoch itself, so the tests use 2
-under Miri; `concurrent_marking_while_relinking` still hits that crossbeam-epoch violation under Stacked Borrows, and is
-clean under Tree Borrows:
+under Miri; the two concurrent tests still hit that crossbeam-epoch violation under Stacked Borrows, and are clean under
+Tree Borrows:
 
 ```sh
 cargo test --test gc -- --exact <name>
@@ -141,7 +144,9 @@ Intel Core Ultra 7 356H (16 cores), Linux 7.0, Rust 1.98, load average below 3 u
 | | 1 thread | 4 threads | 16 threads |
 | --- | ---: | ---: | ---: |
 | **paragc** | 22.3 | 7.6 (3.9) | **4.0** (13.5) |
-| **paragc, after concurrent marking** ¹ | 9.9 | 2.9 | **2.2** |
+| paragc, concurrent marking ¹ | 6.2 | 2.4 | 1.7 |
+| paragc, concurrent sweeping ¹ | 14.6 | 5.3 | 2.5 |
+| **paragc, concurrent marking + sweeping** ¹ | **0.03** | **0.04** | **0.05** |
 | cppgc, attached to an isolate | 45.0 | 44.4 (1.0) | 44.6 (1.0) |
 | cppgc, all parallel / concurrent marking flags | 44.7 | 43.3 (1.0) | 44.5 (1.0) |
 | cppgc, detached heap | 42.3 | 43.4 (1.0) | 43.7 (1.0) |
@@ -149,8 +154,10 @@ Intel Core Ultra 7 356H (16 cores), Linux 7.0, Rust 1.98, load average below 3 u
 | dumpster | 16.8 | – | – |
 | gc (rust-gc) | 89.7 | – | – |
 
-¹ `mark_concurrently` first (mutators would keep running meanwhile), then only the finishing `collect` is timed: what
-is left is draining the barrier's grey objects and sweeping. Measured at load average about 8.
+¹ Only the time mutators are stopped is measured: `mark_concurrently` runs first and is not timed; with concurrent
+sweeping only `finish_marking` is timed and `sweep_concurrently` runs afterwards. No mutator ran during marking here, so
+the grey queue was empty and the last pause is bookkeeping proportional to the number of blocks; with mutators running,
+draining what the barrier logged is added to it.
 
 **GCBench:** Boehm's benchmark (many short-lived trees plus one long-lived tree), each collector on its own schedule, total ms
 
@@ -177,8 +184,8 @@ Reading these honestly:
   and dumpster wins GCBench on one thread. paragc pulls ahead once it has threads.
 - **Pauses scale to 16 threads; GCBench does not.** The persistent pool brought the 16-thread pause from 9.4 ms to
   4.0 ms, but GCBench is still fastest at 4 threads: its collections are small, and waking 16 workers does not pay off.
-- **Concurrent marking takes marking out of the pause.** What remains is sweeping, which runs the destructors of a
-  million dead objects; concurrent sweeping is next on the roadmap.
+- **Concurrent marking and sweeping take both out of the pause.** The 20.9 ms single-thread pause becomes 0.03 ms;
+  the work still happens, on the pool and in mutators that sweep the blocks they take.
 - **cppgc marks the atomic pause on one thread.** With 16 worker threads and every parallel / concurrent marking flag
   on, a full collection still runs at CPU ÷ wall = 1.0; cppgc only uses other threads for background marking during
   incremental collections (GCBench, about 1.3). It is driven through rusty_v8, so every allocation, every `Member` and
@@ -189,11 +196,10 @@ Reading these honestly:
 
 ## 🗺️ Roadmap
 
-Done: parallel stop-the-world collection, a persistent pool, concurrent marking. Next:
+Done: parallel stop-the-world collection, a persistent pool, concurrent marking, concurrent and lazy sweeping. Next:
 
-1. Concurrent sweeping, so the pause after concurrent marking is only the grey-queue drain
-2. Opportunistic evacuation of sparse blocks (Immix defragmentation)
-3. Reference counting for young objects in the style of LXR: dead young objects free their lines at once, tracing
+1. Opportunistic evacuation of sparse blocks (Immix defragmentation)
+2. Reference counting for young objects in the style of LXR: dead young objects free their lines at once, tracing
    handles cycles and old objects
 
 ## 📜 License

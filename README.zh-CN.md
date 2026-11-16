@@ -4,7 +4,7 @@
 # paragc
 
 ### Rust 的并行垃圾回收器。
-**Immix 式标记-区域堆，多个 mutator 线程同时用，并发 + 并行标记，并行清扫。全程无锁。**
+**Immix 式标记-区域堆，多个 mutator 线程同时用，标记与清扫都并发 + 并行。全程无锁。**
 
 [![Rust](https://img.shields.io/badge/Rust-100%25-orange?style=for-the-badge&logo=rust)](https://www.rust-lang.org)
 [![Miri](https://img.shields.io/badge/Miri-clean-success?style=for-the-badge)](#-验证)
@@ -32,7 +32,8 @@ paragc 是**给多个线程共用一个堆的 Rust 程序用的追踪式垃圾�
 | --- | --- |
 | 🧵 **多个 mutator** | `Heap::mutate(&self)` 可以在任意多个线程上同时调用；各自在自己的分配缓冲（`Tlab`）里碰撞分配，整块领用只要一次原子操作。 |
 | 🔒 **借用即独占** | `Heap::collect(&mut self)` 不可能和 `mutate` 重叠：借用检查器就是「停住世界」，没有安全点协议，也没有锁。 |
-| 🌊 **并发标记** | `Heap::mark_concurrently(&self)` 在 mutator 照常跑的同时标记（`Slot` 写入走初始快照写屏障、新对象黑分配）；之后的 `collect` 只清空写屏障攒下的灰对象再清扫。mutator 只在开头短暂握手时等一下。 |
+| 🌊 **并发标记** | `Heap::mark_concurrently(&self)` 在 mutator 照常跑的同时标记（`Slot` 写入走初始快照写屏障、新对象黑分配）。mutator 只在开头短暂握手时等一下。 |
+| 🧹 **并发清扫** | `Heap::finish_marking(&mut self)` 只做标记收尾、把块交给清扫器；mutator 要块时顺手扫（惰性清扫），`Heap::sweep_concurrently(&self)` 在线程池上扫剩下的。两者都用上，停顿只剩清空灰队列。 |
 | 🏃 **并行回收** | 每个堆一个常驻线程池（两次回收之间线程挂起）。标记：每个工人一个 crossbeam 工作窃取双端队列、成批偷；清扫（含析构）：块按批分给同一批工人。 |
 | 🏷️ **带品牌的句柄** | `Gc<'gc, T>` 逃不出 `mutate` 的闭包；`Root<B>` 不带生命周期，可以存在任何地方、跨线程传。 |
 | 📌 **不移动** | 对象从不移动，指针就是普通指针，不需要转发。 |
@@ -76,7 +77,8 @@ heap.collect();
 | 清扫 | 工人按批领块：按起点位图逐个看对象，没标上本轮纪元的析构、清位；块分成 全空 / 有空行 / 满，多于总块数四分之一的空块还给系统 |
 | 根 | `Root<B>` 占根表一个槽；根表只追加，空槽号在回收时整理成只读数组、mutate 期间原子游标领取 |
 | 缓冲过期 | 缓冲记着（堆, 回收次数），回收过就重来（它的块已被重新分类） |
-| 并发标记 | 开头：握手字（最高位请求，低位是 mutate 里的线程数）挂上请求、等 mutate 里没人、把根标灰、撤请求——paragc 不扫栈，快照只能在没有 mutator 拿着未挂根的 `Gc` 时照；然后在线程池上标记。标记期间 `Slot` 写入把被覆盖的旧值标上并放进堆的灰队列（初始快照），新对象直接拿本轮纪元、连同行一起标上（黑分配）。空行 = 行标记早于上次完成的纪元，标记方刚写上新纪元的行不会被当成空行。收尾的 `collect`：并行清空灰队列，再清扫 |
+| 并发标记 | 开头：先把上一轮扫完（它按「纪元 ≠ 那一轮」判死，必须在新一轮把活对象标成更新纪元之前结束）；握手字（最高位请求，低位是 mutate 里的线程数）挂上请求、等 mutate 里没人、把根标灰、撤请求——paragc 不扫栈，快照只能在没有 mutator 拿着未挂根的 `Gc` 时照；然后在线程池上标记。标记期间 `Slot` 写入把被覆盖的旧值标上并放进堆的灰队列（初始快照），新对象直接拿本轮纪元、连同行一起标上（黑分配）。空行 = 行标记早于上次完成的纪元，标记方刚写上新纪元的行不会被当成空行。`finish_marking` 并行清空灰队列 |
+| 并发清扫 | `finish_marking` 把全部块与大对象交给清扫器就返回。领用是原子游标，每个块恰好被领到的那个线程扫一次、扫完才交出去：mutator 要块时先拿扫好的，没有就领一个没扫的当场扫；`sweep_concurrently` 在线程池上扫剩下的，并等别人手里领走的扫完。新对象带上次完成的纪元，清扫期间分配的不会被当成死的。`collect` = `finish_marking` + `sweep_concurrently` |
 
 工作窃取双端队列与退避来自 [crossbeam](https://github.com/crossbeam-rs/crossbeam)（`crossbeam-deque`、`crossbeam-utils`）；
 只追加分段向量与块库存来自 [j8lockfree](https://crates.io/crates/j8lockfree)。
@@ -102,10 +104,11 @@ heap.collect();
 | `eight_threads_eight_heaps_crossed` | 8 线程 × 8 堆：跨堆持有根、别的线程检查与释放、全部堆并行回收的同时释放根、经大对象成环 |
 | `crossed_deep_trees` | 8 堆各一条深链 + 一棵 15 层满二叉树，树叶锚在下一个堆的深链上；每次剪断后析构数都恰好等于理论值 |
 | `concurrent_marking_while_relinking` | mutator 不停地把节点从一个槽摘下（只剩栈上引用）再挂到别处、新建、扔掉，另一个线程同时并发标记；每轮后链上节点数恰好等于理论值，析构数恰好等于扔掉的个数 |
+| `concurrent_sweeping_while_relinking` | 同样的 mutator 贯穿并发标记、`finish_marking` 停顿与并发清扫（它们顺手扫块，另一个线程同时 `sweep_concurrently`）；从不析构还挂着的节点，计数恰好 |
 
 全部测试也在 Miri 下跑（Stacked Borrows 和 Tree Borrows，`cfg(miri)` 下自动缩规模）。要加 `-Zmiri-ignore-leaks`：
 crossbeam-epoch 的全局回收器退出时还拿着延迟释放的垃圾；每堆 4 个回收线程时 Stacked Borrows 还会在 crossbeam-epoch 内部报违例，
-所以 Miri 下测试用 2 个；`concurrent_marking_while_relinking` 在 Stacked Borrows 下仍会碰到 crossbeam-epoch 内部那处违例，Tree Borrows 下干净：
+所以 Miri 下测试用 2 个；两条并发测试在 Stacked Borrows 下仍会碰到 crossbeam-epoch 内部那处违例，Tree Borrows 下干净：
 
 ```sh
 cargo test --test gc -- --exact <名字>
@@ -124,7 +127,9 @@ CPU ÷ 墙钟 就是实际有几个线程在干活。Intel Core Ultra 7 356H（1
 | | 1 线程 | 4 线程 | 16 线程 |
 | --- | ---: | ---: | ---: |
 | **paragc** | 22.3 | 7.6 (3.9) | **4.0** (13.5) |
-| **paragc，先并发标记** ¹ | 9.9 | 2.9 | **2.2** |
+| paragc，并发标记 ¹ | 6.2 | 2.4 | 1.7 |
+| paragc，并发清扫 ¹ | 14.6 | 5.3 | 2.5 |
+| **paragc，并发标记 + 并发清扫** ¹ | **0.03** | **0.04** | **0.05** |
 | cppgc，挂 isolate | 45.0 | 44.4 (1.0) | 44.6 (1.0) |
 | cppgc，并行 / 并发标记选项全开 | 44.7 | 43.3 (1.0) | 44.5 (1.0) |
 | cppgc，不挂 isolate | 42.3 | 43.4 (1.0) | 43.7 (1.0) |
@@ -132,7 +137,7 @@ CPU ÷ 墙钟 就是实际有几个线程在干活。Intel Core Ultra 7 356H（1
 | dumpster | 16.8 | – | – |
 | gc（rust-gc） | 89.7 | – | – |
 
-¹ 先 `mark_concurrently`（这段时间 mutator 照常跑），只量收尾的 `collect`：剩下的是清空写屏障攒下的灰对象 + 清扫。负载约 8 时测。
+¹ 只量 mutator 被停住的时间：`mark_concurrently` 先跑、不计时；并发清扫时只量 `finish_marking`，`sweep_concurrently` 随后跑。这里标记期间没有 mutator，灰队列是空的，最后那个停顿只是与块数成正比的簿记；有 mutator 在跑时还要加上清空写屏障攒下的灰对象。
 
 **GCBench**：Boehm 的经典基准（大量临时树 + 一棵长寿树），各库按自己的节奏回收，总耗时 ms
 
@@ -158,7 +163,7 @@ CPU ÷ 墙钟 就是实际有几个线程在干活。Intel Core Ultra 7 356H（1
 - **单线程时 paragc 不是最快的**：停顿 gc-arena、dumpster 约 17 ms，paragc 22.3 ms；单线程 GCBench dumpster 最快。paragc 靠多线程领先。
 - **停顿能扩展到 16 线程，GCBench 不能**：常驻线程池把 16 线程停顿从 9.4 ms 降到 4.0 ms；但 GCBench 仍是 4 线程最快——它每次回收都小，
   叫醒 16 个工人不划算。
-- **并发标记把标记移出了停顿**：剩下的是清扫（析构一百万个死对象），并发清扫是路线的下一步。
+- **并发标记 + 并发清扫把两者都移出了停顿**：单线程 20.9 ms 的停顿变成 0.03 ms；活还是要干的，在线程池上、在顺手扫块的 mutator 里。
 - **cppgc 的原子停顿只用一个线程标记**：16 个工作线程、并行 / 并发标记选项全开，完整回收仍是 CPU ÷ 墙钟 = 1.0；只有增量回收里的
   后台标记用上别的线程（GCBench 约 1.3）。它经 rusty_v8 调用，每次分配、每个 `Member`、标记时每条边都过一次 Rust ⇄ C++；
   挂 isolate 时 V8 自己那份（几乎空的）堆每次完整回收约多 1.3–1.5 ms。
@@ -166,11 +171,10 @@ CPU ÷ 墙钟 就是实际有几个线程在干活。Intel Core Ultra 7 356H（1
 
 ## 🗺️ 路线
 
-已完成：并行暂停式回收、常驻线程池、并发标记。之后：
+已完成：并行暂停式回收、常驻线程池、并发标记、并发 + 惰性清扫。之后：
 
-1. 并发清扫：并发标记之后的停顿只剩清空灰队列
-2. 稀疏块的机会式疏散（Immix defrag）
-3. 年轻对象引用计数（LXR 式）：年轻对象死了立刻回收行，追踪只负责环与老对象
+1. 稀疏块的机会式疏散（Immix defrag）
+2. 年轻对象引用计数（LXR 式）：年轻对象死了立刻回收行，追踪只负责环与老对象
 
 ## 📜 许可
 

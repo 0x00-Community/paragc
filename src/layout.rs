@@ -17,8 +17,6 @@ pub(crate) const LARGE: usize = 8 * 1024;
 
 /// 回收线程数的估算：每个线程至少分到这么多个块 / 大对象才值得多开一个
 pub(crate) const UNITS_PER_WORKER: usize = 8;
-/// 清扫时一次领走的块数
-pub(crate) const SWEEP_CHUNK: usize = 4;
 
 /// 触发回收的下限：上次回收后新领用的字节数不到它就不回收
 pub(crate) const MIN_TRIGGER: usize = 4 * 1024 * 1024;

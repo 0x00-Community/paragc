@@ -52,10 +52,21 @@ pub enum Workload {
     AllocMt,
     /// 同 Pause，但先并发标记（不计时，那段时间 mutator 照常跑），只量收尾回收的停顿
     PauseConcurrent,
+    /// 同 Pause，标记仍在停顿里，清扫并发（不计时）：只量标记收尾的停顿
+    PauseSweepConcurrent,
+    /// 并发标记 + 并发清扫：只量标记收尾的停顿
+    PauseAllConcurrent,
 }
 
 impl Workload {
-    const NAMES: [(Self, &str); 4] = [(Self::Pause, "pause"), (Self::GcBench, "gcbench"), (Self::AllocMt, "alloc-mt"), (Self::PauseConcurrent, "pause-cm")];
+    const NAMES: [(Self, &str); 6] = [
+        (Self::Pause, "pause"),
+        (Self::GcBench, "gcbench"),
+        (Self::AllocMt, "alloc-mt"),
+        (Self::PauseConcurrent, "pause-cm"),
+        (Self::PauseSweepConcurrent, "pause-cs"),
+        (Self::PauseAllConcurrent, "pause-cms"),
+    ];
 
     fn name(self) -> &'static str {
         Self::NAMES.iter().find(|(w, _)| *w == self).map_or("?", |(_, n)| n)
@@ -66,7 +77,7 @@ impl FromStr for Workload {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, String> {
-        Self::NAMES.iter().find(|(_, n)| *n == s).map(|(w, _)| *w).ok_or_else(|| format!("未知工作负载 {s}（pause / gcbench / alloc-mt / pause-cm）"))
+        Self::NAMES.iter().find(|(_, n)| *n == s).map(|(w, _)| *w).ok_or_else(|| format!("未知工作负载 {s}（pause / gcbench / alloc-mt / pause-cm / pause-cs / pause-cms）"))
     }
 }
 
@@ -120,6 +131,12 @@ pub trait Bench {
     fn pause_concurrent(&self) -> Option<Took> {
         None
     }
+    fn pause_sweep_concurrent(&self) -> Option<Took> {
+        None
+    }
+    fn pause_all_concurrent(&self) -> Option<Took> {
+        None
+    }
 }
 
 /// 命令行：`<工作负载> <线程数>`。
@@ -131,7 +148,7 @@ pub struct Args {
 impl Args {
     pub fn parse() -> Self {
         let mut argv = std::env::args().skip(1);
-        let usage = "用法：bench-<名字> <pause|gcbench|alloc-mt|pause-cm> <线程数>";
+        let usage = "用法：bench-<名字> <pause|gcbench|alloc-mt|pause-cm|pause-cs|pause-cms> <线程数>";
         let workload = argv.next().expect(usage).parse().unwrap_or_else(|e: String| panic!("{e}"));
         let threads = argv.next().expect(usage).parse().expect("线程数是正整数");
         Self { workload, threads }
@@ -144,6 +161,8 @@ impl Args {
             Workload::GcBench => bench.gcbench(),
             Workload::AllocMt => bench.alloc_mt(),
             Workload::PauseConcurrent => bench.pause_concurrent(),
+            Workload::PauseSweepConcurrent => bench.pause_sweep_concurrent(),
+            Workload::PauseAllConcurrent => bench.pause_all_concurrent(),
         };
         match took {
             Some(t) => println!("{}\t{}\t{}\t{:.2}\t{:.2}", B::NAME, self.workload, self.threads, t.wall.as_secs_f64() * 1e3, t.cpu.as_secs_f64() * 1e3),

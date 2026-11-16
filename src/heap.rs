@@ -15,10 +15,10 @@ use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::alloc::{alloc, handle_alloc_error};
 use std::sync::{Arc, OnceLock};
 
-use crossbeam_deque::Injector;
+use crossbeam_deque::{Injector, Steal};
 use crossbeam_utils::{Backoff, CachePadded};
 
-use j8lockfree::{SegVec, Stock};
+use j8lockfree::SegVec;
 
 use crate::block::Block;
 use crate::gc::Invariant;
@@ -26,7 +26,7 @@ use crate::header::{HEADER, Header};
 use crate::layout::{BLOCK, GRANULE, GROWTH, LARGE, MIN_SPARE_BLOCKS, MIN_TRIGGER, SPARE_DIVISOR};
 use crate::mark::Marking;
 use crate::roots::RootTable;
-use crate::sweep::{Large, Sweep, Swept};
+use crate::sweep::{Large, Outcome, Sink, Sweeper};
 use crate::workers::Pool;
 use crate::{Gc, Trace};
 
@@ -47,16 +47,14 @@ pub struct Heap {
     collections: u64,
     /// 全部块
     blocks: SegVec<Block>,
-    /// 上次回收后还有空行的块
-    recyclable: Stock<Block>,
-    /// 全空的块
-    empty: Stock<Block>,
+    /// 清扫好、有空行的块（含全空的），分配缓冲先从这里领
+    available: Injector<Block>,
     large: SegVec<Large>,
+    /// 上一轮的清扫（与 mutator 并发进行）
+    sweeper: Sweeper,
     roots: Arc<RootTable>,
     /// 上次回收后新领用的字节数（按块 / 大对象计）
     allocated: AtomicUsize,
-    /// 上次回收后存活的字节数
-    live: usize,
     /// 给 [`Heap::mutate`] 复用的分配缓冲
     spare: AtomicPtr<Tlab>,
 }
@@ -91,12 +89,11 @@ impl Heap {
             grey: Injector::new(),
             collections: 0,
             blocks: SegVec::default(),
-            recyclable: Stock::default(),
-            empty: Stock::default(),
+            available: Injector::new(),
             large: SegVec::default(),
+            sweeper: Sweeper::default(),
             roots: Arc::default(),
             allocated: AtomicUsize::new(0),
-            live: 0,
             spare: AtomicPtr::new(null_mut()),
         }
     }
@@ -147,6 +144,8 @@ impl Heap {
     ///
     /// 不要在这个堆的 mutate 里调用（会一直等自己走空）。
     pub fn mark_concurrently(&self) -> bool {
+        // 上一轮按「纪元 ≠ 本轮」判死，必须在新一轮标记把活对象标成更新的纪元之前扫完
+        self.sweep_concurrently();
         let epoch = self.epoch.checked_add(1).expect("纪元用完了");
         if self.marking.compare_exchange(0, epoch, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return false;
@@ -178,14 +177,42 @@ impl Heap {
         }
     }
 
-    /// 领一个块给分配缓冲：先用有空行的，再用全空的，最后开新的。
+    /// 领一个块给分配缓冲：先拿清扫好的；没有就自己领一个没扫的当场扫（惰性清扫），能用就用；最后开新的。
     fn acquire(&self) -> Block {
         self.allocated.fetch_add(BLOCK, Ordering::Relaxed);
-        self.recyclable.claim_one().or_else(|| self.empty.claim_one()).unwrap_or_else(|| {
-            let b = Block::new();
-            self.blocks.push(b);
-            b
-        })
+        loop {
+            match self.available.steal() {
+                Steal::Success(b) => return b,
+                Steal::Retry => continue,
+                Steal::Empty => {}
+            }
+            match self.sweeper.sweep_next_block() {
+                Some(Outcome::Usable(b)) => {
+                    self.blocks.push(b);
+                    self.sweeper.finished();
+                    return b;
+                }
+                Some(other) => {
+                    self.block(other);
+                    self.sweeper.finished();
+                }
+                None => break,
+            }
+        }
+        let b = Block::new();
+        self.blocks.push(b);
+        b
+    }
+
+    /// 上一轮的清扫还没做完（mutator 要块时会顺手扫，或调 [`Heap::sweep_concurrently`]）。
+    pub fn is_sweeping(&self) -> bool {
+        !self.sweeper.is_done()
+    }
+
+    /// 并发清扫：借回收线程池把上一轮还没扫的块与大对象扫完（mutator 可以同时跑，也在顺手扫）；
+    /// 返回时上一轮的死对象都已析构。
+    pub fn sweep_concurrently(&self) {
+        self.sweeper.finish(self.pool(), self);
     }
 
     fn alloc_large(&self, bytes: usize) -> *mut u8 {
@@ -199,7 +226,7 @@ impl Heap {
 
     pub fn stats(&self) -> Stats {
         Stats {
-            live: self.live,
+            live: self.sweeper.live(),
             allocated: self.allocated.load(Ordering::Relaxed),
             blocks: self.blocks.len(),
             large: self.large.len(),
@@ -209,16 +236,24 @@ impl Heap {
 
     /// 上次回收后新领用的够多了就回收；回收了返回 true。
     pub fn collect_if_needed(&mut self) -> bool {
-        let due = *self.allocated.get_mut() >= self.live.max(MIN_TRIGGER) * GROWTH;
+        let due = *self.allocated.get_mut() >= self.sweeper.live().max(MIN_TRIGGER) * GROWTH;
         if due {
             self.collect();
         }
         due
     }
 
-    /// 回收。有并发标记在进行时：清空写屏障攒下的灰对象把它标完；否则从全部 [`crate::Root`] 出发并行标记。
-    /// 然后并行清扫（析构死对象、整理块）。
+    /// 完整回收：[`Heap::finish_marking`] 后立刻把清扫做完（返回时死对象都已析构）。
     pub fn collect(&mut self) {
+        self.finish_marking();
+        self.sweep_concurrently();
+    }
+
+    /// 标记收尾：有并发标记在进行就清空写屏障攒下的灰对象把它标完，否则从全部 [`crate::Root`] 出发并行标记；
+    /// 然后把全部块交给清扫器就返回——清扫在之后与 mutator 并发进行（mutator 要块时顺手扫，
+    /// 或者某个线程调 [`Heap::sweep_concurrently`]）。停顿只有标记的收尾。
+    pub fn finish_marking(&mut self) {
+        self.sweep_concurrently();
         // SAFETY: &mut self ⇒ 没有 mutator
         let roots = unsafe { self.roots.settle() };
         let marking = *self.marking.get_mut();
@@ -226,54 +261,55 @@ impl Heap {
         if marking == 0 {
             Marking::seed(&self.grey, &roots, epoch);
         }
+        let pool = self.pool.get_or_init(|| Pool::new(self.threads));
+        let workers = pool.sized(self.blocks.len() + self.large.len());
+        Marking::new(workers, epoch, &self.grey).run(pool);
+        // 全部块交给清扫器；清扫好的可用块之后再一个个放回 available（它们本来就都在 blocks 里）
         let blocks = self.blocks.take();
         let large = self.large.take();
-        let pool = self.pool.get_or_init(|| Pool::new(self.threads));
-        let workers = pool.sized(blocks.len() + large.len());
-        Marking::new(workers, epoch, &self.grey).run(pool);
-        // SAFETY: 标记完了，没有 mutator
-        let swept = unsafe { Sweep::new(&blocks, &large, epoch).run(pool, workers) };
+        while !matches!(self.available.steal(), Steal::Empty) {}
+        let spare = (blocks.len() / SPARE_DIVISOR).max(MIN_SPARE_BLOCKS);
+        self.sweeper.start(epoch, blocks, large, spare);
         self.epoch = epoch;
         *self.marking.get_mut() = 0;
-        self.rebuild(swept);
-    }
-
-    fn rebuild(&mut self, swept: Swept) {
-        let Swept { full, recyclable, mut empty, large, live } = swept;
-        let total = full.len() + recyclable.len() + empty.len();
-        let keep = (total / SPARE_DIVISOR).max(MIN_SPARE_BLOCKS).min(empty.len());
-        for b in empty.drain(keep..) {
-            // SAFETY: 全空的块里没有活对象，从此不再使用
-            unsafe { b.release() };
-        }
-        self.blocks.extend(full.iter().chain(&recyclable).chain(&empty).copied());
-        self.recyclable.clear();
-        self.recyclable.extend(recyclable);
-        self.empty.clear();
-        self.empty.extend(empty);
-        self.large.extend(large);
-        self.live = live;
         *self.allocated.get_mut() = 0;
         self.collections += 1;
     }
 }
 
+/// 清扫器扫完一项交回堆：块进全部块表，可用的再放进 available；活着的大对象回到大对象表。
+impl Sink for Heap {
+    fn block(&self, outcome: Outcome) {
+        match outcome {
+            Outcome::Usable(b) => {
+                self.blocks.push(b);
+                self.available.push(b);
+            }
+            Outcome::Full(b) => {
+                self.blocks.push(b);
+            }
+            Outcome::Released => {}
+        }
+    }
+
+    fn large(&self, survivor: Large) {
+        self.large.push(survivor);
+    }
+}
+
 impl Drop for Heap {
     fn drop(&mut self) {
-        // 不标记直接清扫：全部对象都析构（取一个比谁都新的纪元：并发标记中的也算死）
+        // 从没回收过就不为析构专门起线程
+        let pool = self.pool.take().unwrap_or_else(|| Pool::new(NonZeroUsize::MIN));
+        // 先把上一轮扫完，再用一个比谁都新的纪元（并发标记中的也算死）不标记直接扫一轮：全部析构，全空块不留备用全部还回去
+        self.sweeper.finish(&pool, self);
         let epoch = self.epoch.max(*self.marking.get_mut()).wrapping_add(1);
         let blocks = self.blocks.take();
         let large = self.large.take();
-        // 从没回收过就不为析构专门起线程
-        let pool = self.pool.take().unwrap_or_else(|| Pool::new(NonZeroUsize::MIN));
-        let workers = pool.sized(blocks.len() + large.len());
-        // SAFETY: 独占；这一轮谁都没标记，全部视为死
-        let swept = unsafe { Sweep::new(&blocks, &large, epoch).run(&pool, workers) };
-        for b in blocks {
-            // SAFETY: 对象都析构过了
-            unsafe { b.release() };
-        }
-        debug_assert!(swept.large.is_empty());
+        while !matches!(self.available.steal(), Steal::Empty) {}
+        self.sweeper.start(epoch, blocks, large, 0);
+        self.sweeper.finish(&pool, self);
+        debug_assert!(self.blocks.is_empty() && self.large.is_empty());
         let spare = *self.spare.get_mut();
         if !spare.is_null() {
             // SAFETY: Box::into_raw 来的
@@ -382,9 +418,10 @@ impl<'gc> Mutator<'gc> {
         let bytes = (HEADER + size_of::<T>()).next_multiple_of(GRANULE);
         let large = bytes > LARGE;
         let p = if large { self.heap.alloc_large(bytes) } else { self.alloc_small(bytes) };
+        // 平时：标成上次完成的纪元（并发清扫中不会被当成死的；下一轮标记用新纪元，不受影响）。
         // 并发标记中：黑分配（直接标成本轮，连同它占的行）
-        let mark = self.marking.map_or(0, NonZeroU32::get);
-        if mark != 0 && !large {
+        let mark = self.marking.map_or(self.heap.epoch, NonZeroU32::get);
+        if self.marking.is_some() && !large {
             Block::containing(p).mark_lines(p, bytes, mark);
         }
         // SAFETY: p 是 bytes 字节、按粒度对齐的新内存，归这次分配独有

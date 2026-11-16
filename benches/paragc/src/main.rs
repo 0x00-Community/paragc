@@ -27,6 +27,29 @@ impl Paragc {
         heap.mutate(|m| m.root(Self::tree(m, depth)))
     }
 
+    /// 一棵活树 + 一棵垃圾树，只量停住 mutator 的那段：
+    /// `concurrent_mark` 先并发标记（不计时）；`concurrent_sweep` 只量 `finish_marking`，清扫随后并发做（不计时）。
+    fn timed_pause(&self, concurrent_mark: bool, concurrent_sweep: bool) -> Took {
+        let mut heap = Heap::new(self.threads);
+        let live = Self::rooted(&heap, PAUSE_DEPTH);
+        heap.mutate(|m| {
+            Self::tree(m, PAUSE_DEPTH);
+        });
+        if concurrent_mark {
+            assert!(heap.mark_concurrently());
+        }
+        let start = Clock::start();
+        if concurrent_sweep {
+            heap.finish_marking();
+        } else {
+            heap.collect();
+        }
+        let took = start.stop();
+        heap.sweep_concurrently();
+        assert_eq!(Self::count(&heap, &live), Tree::size(PAUSE_DEPTH));
+        took
+    }
+
     fn count(heap: &Heap, root: &Root<NodeB>) -> usize {
         heap.mutate(|m| {
             let mut stack = vec![m.get(root)];
@@ -79,17 +102,15 @@ impl Bench for Paragc {
     }
 
     fn pause_concurrent(&self) -> Option<Took> {
-        let mut heap = Heap::new(self.threads);
-        let live = Self::rooted(&heap, PAUSE_DEPTH);
-        heap.mutate(|m| {
-            Self::tree(m, PAUSE_DEPTH);
-        });
-        assert!(heap.mark_concurrently());
-        let start = Clock::start();
-        heap.collect();
-        let took = start.stop();
-        assert_eq!(Self::count(&heap, &live), Tree::size(PAUSE_DEPTH));
-        Some(took)
+        Some(self.timed_pause(true, false))
+    }
+
+    fn pause_sweep_concurrent(&self) -> Option<Took> {
+        Some(self.timed_pause(false, true))
+    }
+
+    fn pause_all_concurrent(&self) -> Option<Took> {
+        Some(self.timed_pause(true, true))
     }
 
     fn alloc_mt(&self) -> Option<Took> {
