@@ -1007,24 +1007,24 @@ fn reference_counting_leaves_cycles_to_tracing() {
     let mut heap = Heap::new(THREADS);
     let root: Root<HoldersB> = heap.mutate(|m| m.root(m.alloc(Holders { head: Slot::default(), plain: Slot::default() })));
     heap.mutate(|m| {
-        let r = m.get(&root);
+        let holders = m.get(&root);
         for _ in 0..PAIRS {
-            let a = m.alloc(Link { next: Slot::default(), tag: moves.ledger.tag() });
-            let c = m.alloc(Link { next: Some(a).into(), tag: moves.ledger.tag() });
-            a.next.set(m, Some(c));
-            let h = m.alloc(Holder { ring: Some(a).into(), next: r.head.get().into(), tag: moves.ledger.tag() });
-            r.head.set(m, Some(h));
-            let p = m.alloc(Link { next: r.plain.get().into(), tag: moves.ledger.tag() });
-            r.plain.set(m, Some(p));
+            let first = m.alloc(Link { next: Slot::default(), tag: moves.ledger.tag() });
+            let second = m.alloc(Link { next: Some(first).into(), tag: moves.ledger.tag() });
+            first.next.set(m, Some(second));
+            let holder = m.alloc(Holder { ring: Some(first).into(), next: holders.head.get().into(), tag: moves.ledger.tag() });
+            holders.head.set(m, Some(holder));
+            let plain = m.alloc(Link { next: holders.plain.get().into(), tag: moves.ledger.tag() });
+            holders.plain.set(m, Some(plain));
         }
     });
     heap.collect();
     let before = moves.ledger.dropped.load(Ordering::Relaxed);
     assert_eq!(before, 0);
     heap.mutate(|m| {
-        let r = m.get(&root);
-        r.head.set(m, None);
-        r.plain.set(m, None);
+        let holders = m.get(&root);
+        holders.head.set(m, None);
+        holders.plain.set(m, None);
     });
     heap.collect_young();
     assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed) - before, PAIRS * 2, "引用计数应收掉持有者与普通节点，环留着");
