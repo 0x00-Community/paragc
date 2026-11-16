@@ -1078,3 +1078,40 @@ fn background_release_while_mutating() {
     moves.discarded.fetch_add(CHAIN, Ordering::Relaxed);
     moves.finish(heap, board);
 }
+
+/// 并发标记顺带重新计数：一轮并发标记（期间 mutator 挪 / 新建 / 扔，黑分配的节点把别的节点挂到自己底下）收尾后，
+/// 引用计数立刻可信——整条扔掉的老链在下一次年轻回收就按计数释放，不用等停顿式完整回收；之后几轮年轻回收里按计数释放
+/// 也不碰还挂着的节点（漏算黑对象的边或标记期间被改写的槽，这里会析构活节点）。
+#[test]
+fn concurrent_marking_recounts() {
+    const CHAIN: usize = if cfg!(miri) { 40 } else { 10_000 };
+    let moves = Moves::default();
+    // 老链单独记账（不在主板子上，不进 moves 的账）
+    let chain = Ledger::default();
+    let mut heap = Heap::new(THREADS);
+    let board = board(&heap);
+    let spare: Root<BoardB> = heap.mutate(|m| m.root(m.alloc(Board { cells: vec![Slot::default()] })));
+    heap.mutate(|m| {
+        let cell = &m.get(&spare).cells[0];
+        for _ in 0..CHAIN {
+            Moves::push(m, cell, m.alloc(Link { next: Slot::default(), tag: chain.tag() }));
+        }
+    });
+    // 一轮并发标记（不经过停顿式完整回收），收尾
+    moves.round(&heap, &board, 0, |h| assert!(h.mark_concurrently()));
+    heap.collect();
+    moves.check(&heap, &board, 0);
+    assert_eq!(chain.dropped.load(Ordering::Relaxed), 0);
+    // 计数应已可信：扔掉整条链，年轻回收按计数释放
+    heap.mutate(|m| m.get(&spare).cells[0].set(m, None));
+    heap.collect_young();
+    assert_eq!(chain.dropped.load(Ordering::Relaxed), CHAIN, "并发标记之后计数不可信：扔掉的链没在年轻回收里释放");
+    // 再几轮：mutator 挪动、年轻回收按计数释放，不碰还挂着的
+    for round in 1..=MARK_ROUNDS {
+        moves.round(&heap, &board, round, |_| ());
+        heap.collect_young();
+        moves.check(&heap, &board, round);
+    }
+    drop(spare);
+    moves.finish(heap, board);
+}

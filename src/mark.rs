@@ -35,6 +35,8 @@ pub(crate) struct Marking<'g> {
     roots: Option<&'g RootTable>,
     /// 计数模式：扫描的每条边给目标 +1（值是计数奇偶）
     count: Option<bool>,
+    /// 并发标记：引用计数登记队列（重新计数时被 mutator 改写的槽补登记）
+    log: Option<&'g Injector<usize>>,
 }
 
 // SAFETY: 每个工号的本地队列只被一个线程取走（工号互不相同）；其余是线程安全的
@@ -53,7 +55,14 @@ impl<'g> Marking<'g> {
             copiers: Vec::new(),
             roots: None,
             count: None,
+            log: None,
         }
+    }
+
+    /// 并发标记：给引用计数登记队列。
+    pub(crate) fn logging(mut self, log: &'g Injector<usize>) -> Self {
+        self.log = Some(log);
+        self
     }
 
     /// 计数模式（年轻回收的晋升、停顿式完整回收的重新计数）。
@@ -109,7 +118,8 @@ impl<'g> Marking<'g> {
         let local = unsafe { (*self.locals[me].get()).take() }.expect("每个工号只取一次本地队列");
         // SAFETY: 同上，复制缓冲也按工号取一次
         let mut copier = self.copiers.get(me).and_then(|c| unsafe { (*c.get()).take() });
-        let mut t = Tracer::new(&local, self.epoch, copier.as_mut()).counting(self.count);
+        // 只有一个工人时没有别人改计数（mutator 不碰计数，减量队列此时为空）
+        let mut t = Tracer::new(&local, self.epoch, copier.as_mut()).counting(self.count, self.locals.len() == 1).logging(self.log);
         if me == 0
             && let Some(roots) = self.roots
         {

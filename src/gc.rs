@@ -126,6 +126,11 @@ impl RawSlot {
         (Self::header(p), Self::from_counted(prev))
     }
 
+    /// 这个槽当前的值。
+    pub(crate) fn current(&self) -> Option<*const Header> {
+        Self::header(self.ptr.load(Ordering::Acquire))
+    }
+
     /// 上次计入的值（释放它所在的对象时 −1）。
     pub(crate) fn counted(&self) -> Option<*const Header> {
         Self::from_counted(self.counted.load(Ordering::Acquire))
