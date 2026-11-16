@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "derive"]
+members = [".", "macros"]
 
 [workspace.package]
 version = "0.1.0"
@@ -7,7 +7,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-paragc-derive = { version = "0.1.0", path = "derive" }
+paragc-macros = { version = "0.1.0", path = "macros" }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
@@ -31,7 +31,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-paragc-derive.workspace = true
+paragc-macros.workspace = true
 j8lockfree = "0.1.2"
 
 [lints]

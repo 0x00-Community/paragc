@@ -13,11 +13,11 @@ name = "paragc"
 version = "0.1.0"
 dependencies = [
  "j8lockfree",
- "paragc-derive",
+ "paragc-macros",
 ]
 
 [[package]]
-name = "paragc-derive"
+name = "paragc-macros"
 version = "0.1.0"
 dependencies = [
  "proc-macro2",
