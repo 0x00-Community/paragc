@@ -2,7 +2,7 @@
 
 [English](README.md) · **简体中文**
 
-[paragc](https://github.com/Jabberwocky238/paragc) 的过程宏。通过 `paragc` 使用（`paragc::Trace`），不要直接依赖。
+[paragc](https://github.com/0x00-Community/paragc) 的过程宏。通过 `paragc` 使用（`paragc::Trace`），不要直接依赖。
 
 - `#[derive(Trace)]`：逐个字段追踪（`trace`）与重定位（`relocate`，疏散回收时把边改成搬走后的新地址）；`NO_EDGES` 是全部字段
   `NO_EDGES` 的与。结构体、枚举都可以。
