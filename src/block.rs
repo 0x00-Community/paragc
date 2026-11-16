@@ -4,7 +4,7 @@
 //! - 起点位图每粒度一位：清扫时据此逐个找到对象，析构死掉的
 //! - 一个块在两次回收之间只归一个分配缓冲（[`crate::Tlab`]）所有，所以分配时写元数据没有竞争
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
 
 use crate::header::Header;
@@ -16,7 +16,14 @@ struct Meta {
     lines: [AtomicU32; LINES],
     /// 对象起点：每粒度一位
     starts: [AtomicU64; GRANULES / BITS],
+    /// 上次清扫时的存活字节数；交给分配缓冲（或刚开出来）后是 [`REUSED`]（不知道，不当疏散候选）
+    live: AtomicU32,
+    /// 这一轮要疏散：里面的活对象被追踪到时搬走
+    evacuate: AtomicBool,
 }
+
+/// [`Meta::live`]：块被重新拿去分配了，上次清扫的存活量不再作数
+const REUSED: u32 = u32::MAX;
 
 /// 清扫一个块的结果。
 pub(crate) enum State {
@@ -44,11 +51,32 @@ impl Block {
     /// 元数据之后第一个能放对象的行
     pub(crate) const FIRST_LINE: usize = size_of::<Meta>().div_ceil(LINE);
 
-    /// 新块：全零（行标记 0 ≠ 任何纪元，全部是空行）。
+    /// 新块：全零（行标记 0 早于任何纪元，全部是空行）。
     pub(crate) fn new() -> Self {
         // SAFETY: LAYOUT 大小非零
         let p = unsafe { alloc_zeroed(Self::LAYOUT) };
-        Self(NonNull::new(p.cast()).unwrap_or_else(|| handle_alloc_error(Self::LAYOUT)))
+        let b = Self(NonNull::new(p.cast()).unwrap_or_else(|| handle_alloc_error(Self::LAYOUT)));
+        b.reused();
+        b
+    }
+
+    /// 交给分配缓冲：上次清扫的存活量不再作数。
+    pub(crate) fn reused(self) {
+        self.meta().live.store(REUSED, Ordering::Relaxed);
+    }
+
+    /// 上次清扫后没再分配过时的存活字节数。
+    pub(crate) fn live_since_sweep(self) -> Option<usize> {
+        let live = self.meta().live.load(Ordering::Relaxed);
+        (live != REUSED).then_some(live as usize)
+    }
+
+    pub(crate) fn set_evacuate(self) {
+        self.meta().evacuate.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn is_evacuating(self) -> bool {
+        self.meta().evacuate.load(Ordering::Relaxed)
     }
 
     /// 还给系统。SAFETY（调用方）：块里没有活对象（死的已析构），之后不再使用。
@@ -107,7 +135,7 @@ impl Block {
         Some((start, end))
     }
 
-    /// 清扫：析构没标上本轮纪元的对象、清掉它们的起点位，返回块的状态与存活字节数。
+    /// 清扫：析构没标上本轮纪元的对象（搬走了的不析构）、清掉它们的起点位，返回块的状态与存活字节数。
     /// SAFETY（调用方）：标记已经做完，没有 mutator 在用这个块。
     pub(crate) unsafe fn sweep(self, epoch: u32) -> (State, usize) {
         let mut live = 0;
@@ -120,7 +148,10 @@ impl Block {
                 let header = self.base().wrapping_add((w * BITS + bit) * GRANULE).cast::<Header>().cast_const();
                 // SAFETY: 起点位标着的地方都是已初始化的对象
                 let h = unsafe { &*header };
-                if h.is_marked(epoch) {
+                if h.is_forwarded() {
+                    // 活着的是搬过去的新副本；旧的只清起点位
+                    dead |= 1 << bit;
+                } else if h.is_marked(epoch) {
                     live += h.bytes();
                 } else {
                     // SAFETY: 没标记 ⇒ 从根不可达，之后没人再用
@@ -139,6 +170,8 @@ impl Block {
             n if n == lines.len() => State::Full,
             _ => State::Recyclable,
         };
+        self.meta().live.store(u32::try_from(live).unwrap_or(REUSED - 1), Ordering::Relaxed);
+        self.meta().evacuate.store(false, Ordering::Relaxed);
         (state, live)
     }
 }

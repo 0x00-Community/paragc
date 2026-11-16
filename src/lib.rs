@@ -2,6 +2,7 @@
 extern crate self as paragc;
 
 mod block;
+mod copy;
 mod gc;
 mod header;
 mod heap;

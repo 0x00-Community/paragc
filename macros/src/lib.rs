@@ -1,4 +1,4 @@
-//! `#[derive(Trace)]`：逐个字段追踪；`NO_EDGES` 是全部字段的与。
+//! `#[derive(Trace)]`：逐个字段追踪（`trace`）与重定位（`relocate`，疏散回收时改写边）；`NO_EDGES` 是全部字段的与。
 //!
 //! 缺省还会检查类型没有实现 `Drop`（析构顺序不定，`Drop` 里可能碰到已经析构的对象）；
 //! 确实需要时写 `#[trace(unsafe_drop)]`，由你保证 `Drop` 里不碰任何 `Gc`。
@@ -86,7 +86,8 @@ impl Derive {
         let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
         let (arms, types) = self.arms_and_types()?;
-        let arms = arms.iter().map(|Arm { pattern, bindings }| quote!(#pattern => { #(::paragc::Trace::trace(#bindings, __t);)* }));
+        let trace_arms = arms.iter().map(|Arm { pattern, bindings }| quote!(#pattern => { #(::paragc::Trace::trace(#bindings, __t);)* }));
+        let relocate_arms = arms.iter().map(|Arm { pattern, bindings }| quote!(#pattern => { #(::paragc::Trace::relocate(#bindings, __t);)* }));
         let no_drop = if self.unsafe_drop()? {
             quote!()
         } else {
@@ -111,7 +112,17 @@ impl Derive {
                         return;
                     }
                     match self {
-                        #(#arms)*
+                        #(#trace_arms)*
+                    }
+                }
+
+                #[allow(unused_variables)]
+                fn relocate(&mut self, __t: &mut ::paragc::Tracer<'_>) {
+                    if <Self as ::paragc::Trace>::NO_EDGES {
+                        return;
+                    }
+                    match self {
+                        #(#relocate_arms)*
                     }
                 }
             }

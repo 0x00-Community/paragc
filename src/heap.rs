@@ -22,8 +22,8 @@ use j8lockfree::SegVec;
 
 use crate::block::Block;
 use crate::gc::Invariant;
-use crate::header::{HEADER, Header};
-use crate::layout::{BLOCK, GRANULE, GROWTH, LARGE, MIN_SPARE_BLOCKS, MIN_TRIGGER};
+use crate::header::{HEADER, Header, MAX_EPOCH};
+use crate::layout::{BLOCK, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, LARGE, MIN_SPARE_BLOCKS, MIN_TRIGGER};
 use crate::mark::Marking;
 use crate::roots::RootTable;
 use crate::sweep::{Large, Outcome, Sink, Sweeper};
@@ -55,6 +55,8 @@ pub struct Heap {
     roots: Arc<RootTable>,
     /// 上次回收后新领用的字节数（按块 / 大对象计）
     allocated: AtomicUsize,
+    /// 上次回收疏散的块数 / 字节数
+    evacuated: (usize, usize),
     /// 给 [`Heap::mutate`] 复用的分配缓冲
     spare: AtomicPtr<Tlab>,
 }
@@ -69,6 +71,9 @@ pub struct Stats {
     pub blocks: usize,
     pub large: usize,
     pub collections: u64,
+    /// 上次回收疏散了几个块、搬了多少字节
+    pub evacuated_blocks: usize,
+    pub evacuated_bytes: usize,
 }
 
 impl Default for Heap {
@@ -94,6 +99,7 @@ impl Heap {
             sweeper: Sweeper::default(),
             roots: Arc::default(),
             allocated: AtomicUsize::new(0),
+            evacuated: (0, 0),
             spare: AtomicPtr::new(null_mut()),
         }
     }
@@ -146,7 +152,7 @@ impl Heap {
     pub fn mark_concurrently(&self) -> bool {
         // 上一轮按「纪元 ≠ 本轮」判死，必须在新一轮标记把活对象标成更新的纪元之前扫完
         self.sweep_concurrently();
-        let epoch = self.epoch.checked_add(1).expect("纪元用完了");
+        let epoch = self.next_epoch();
         // 请求位兼作互斥：谁先挂上谁来开始；已经在标记就撤掉请求返回
         if self.gate.fetch_or(REQUEST, Ordering::AcqRel) & REQUEST != 0 {
             return false;
@@ -171,6 +177,29 @@ impl Heap {
         true
     }
 
+    /// 下一轮的纪元。
+    fn next_epoch(&self) -> u32 {
+        self.epoch.checked_add(1).filter(|&e| e <= MAX_EPOCH).expect("纪元用完了")
+    }
+
+    /// 从清扫后没再用过的可用块里挑疏散候选：存活不到 [`EVACUATE_LIVE`] 字节（且不是全空）的稀疏块，至多
+    /// [`EVACUATE_MAX`] 个；够 [`EVACUATE_MIN`] 个才疏散。其余块放进 `targets` 当搬入的目标。返回疏散的块数（0 = 不疏散）。
+    fn pick_evacuation(available: &[Block], targets: &Injector<Block>) -> usize {
+        let sparse = |b: &Block| b.live_since_sweep().is_some_and(|live| live > 0 && live < EVACUATE_LIVE);
+        let count = available.iter().filter(|b| sparse(b)).count().min(EVACUATE_MAX);
+        let evacuate = count >= EVACUATE_MIN;
+        let mut picked = 0;
+        for &b in available {
+            if evacuate && picked < count && sparse(&b) {
+                b.set_evacuate();
+                picked += 1;
+            } else {
+                targets.push(b);
+            }
+        }
+        picked
+    }
+
     /// 写屏障：并发标记中覆盖掉的旧值若还没标，就标上（连同它跨的行）并放进灰队列（保住初始快照）。
     /// 灰队列里的对象都已标过，取出来只追踪它的边，所以这里必须先标。
     pub(crate) fn remember(&self, old: *const Header, epoch: u32) {
@@ -189,12 +218,16 @@ impl Heap {
         self.allocated.fetch_add(BLOCK, Ordering::Relaxed);
         loop {
             match self.available.steal() {
-                Steal::Success(b) => return b,
+                Steal::Success(b) => {
+                    b.reused();
+                    return b;
+                }
                 Steal::Retry => continue,
                 Steal::Empty => {}
             }
             match self.sweeper.sweep_next_block() {
                 Some(Outcome::Usable(b)) => {
+                    b.reused();
                     self.blocks.push(b);
                     self.sweeper.finished();
                     return b;
@@ -238,6 +271,8 @@ impl Heap {
             blocks: self.blocks.len(),
             large: self.large.len(),
             collections: self.collections,
+            evacuated_blocks: self.evacuated.0,
+            evacuated_bytes: self.evacuated.1,
         }
     }
 
@@ -264,21 +299,38 @@ impl Heap {
         // SAFETY: &mut self ⇒ 没有 mutator
         let roots = unsafe { self.roots.settle() };
         let marking = *self.marking.get_mut();
-        let epoch = if marking == 0 { self.epoch.checked_add(1).expect("纪元用完了") } else { marking };
-        if marking == 0 {
-            Marking::seed(&self.grey, &roots, epoch);
-        }
+        let epoch = if marking == 0 { self.next_epoch() } else { marking };
         let pool = self.pool.get_or_init(|| Pool::new(self.threads));
         let workers = pool.sized(self.blocks.len() + self.large.len());
-        Marking::new(workers, epoch, &self.grey).run(pool);
-        // 全部块交给清扫器；清扫好的可用块之后再一个个放回 available（它们本来就都在 blocks 里）
+        // 清扫好、没再用过的可用块：不并发标记时从里面挑稀疏的疏散，其余当搬入的目标
+        let mut available = Vec::new();
+        loop {
+            match self.available.steal() {
+                Steal::Success(b) => available.push(b),
+                Steal::Retry => {}
+                Steal::Empty => break,
+            }
+        }
+        let targets = Injector::new();
+        let evacuate = if marking == 0 { Self::pick_evacuation(&available, &targets) } else { 0 };
+        let mark = Marking::new(workers, epoch, &self.grey);
+        let moved = AtomicUsize::new(0);
+        if evacuate > 0 {
+            mark.evacuating(&self.roots, &targets, &self.blocks, &moved, self.epoch).run(pool);
+        } else {
+            if marking == 0 {
+                Marking::seed(&self.grey, &roots, epoch);
+            }
+            mark.run(pool);
+        }
+        // 全部块交给清扫器（疏散时新开的块也已登记）；清扫好的可用块之后再一个个放回 available（它们本来就都在 blocks 里）
         let blocks = self.blocks.take();
         let large = self.large.take();
-        while !matches!(self.available.steal(), Steal::Empty) {}
         // 留作备用的全空块：上一轮领用了多少块，下一轮大概还要这么多；多的还给系统。
         // 留少了每轮都要新开块（清零 + 缺页），比如临时对象多的负载每轮几乎全空
         let spare = (*self.allocated.get_mut() / BLOCK).max(MIN_SPARE_BLOCKS);
         self.sweeper.start(epoch, blocks, large, spare);
+        self.evacuated = (evacuate, moved.into_inner());
         self.epoch = epoch;
         *self.marking.get_mut() = 0;
         *self.allocated.get_mut() = 0;

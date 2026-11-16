@@ -11,7 +11,7 @@
 [![Lock-free](https://img.shields.io/badge/locks-none-blue?style=for-the-badge)](#-怎么做的)
 [![License](https://img.shields.io/badge/License-MIT-brightgreen?style=for-the-badge)](#-许可)
 
-[![Heap](https://img.shields.io/badge/heap-mark--region%20%C2%B7%20non--moving-8A2BE2?style=flat-square)](#-怎么做的)
+[![Heap](https://img.shields.io/badge/heap-mark--region%20%C2%B7%20evacuating-8A2BE2?style=flat-square)](#-怎么做的)
 [![Mark](https://img.shields.io/badge/mark-parallel%20%C2%B7%20work%20stealing-262D3A?style=flat-square)](#-怎么做的)
 [![std](https://img.shields.io/badge/std-required-283272?style=flat-square)](#-规则)
 
@@ -36,7 +36,7 @@ paragc 是**给多个线程共用一个堆的 Rust 程序用的追踪式垃圾�
 | 🧹 **并发清扫** | `Heap::finish_marking(&mut self)` 只做标记收尾、把块交给清扫器；mutator 要块时顺手扫（惰性清扫），`Heap::sweep_concurrently(&self)` 在线程池上扫剩下的。两者都用上，停顿只剩清空灰队列。 |
 | 🏃 **并行回收** | 每个堆一个常驻线程池（两次回收之间线程挂起）。标记：每个工人一个 crossbeam 工作窃取双端队列、成批偷；清扫（含析构）：块按批分给同一批工人。 |
 | 🏷️ **带品牌的句柄** | `Gc<'gc, T>` 逃不出 `mutate` 的闭包；`Root<B>` 不带生命周期，可以存在任何地方、跨线程传。 |
-| 📌 **不移动** | 对象从不移动，指针就是普通指针，不需要转发。 |
+| 📦 **机会式疏散** | 暂停式回收在标记的同时把稀疏块里的活对象搬走（Immix defrag）：一遍里完成标记、复制、改写全部边。并发标记从不搬对象，所以 mutator 不需要读屏障。 |
 | 🛡️ **编译期检查** | `#[derive(Trace)]` 拒绝被追踪的类型实现 `Drop`；对象数据对齐超过 8 字节直接编译报错。 |
 
 ## 🚀 用法
@@ -79,6 +79,7 @@ heap.collect();
 | 缓冲过期 | 缓冲记着（堆, 回收次数），回收过就重来（它的块已被重新分类） |
 | 并发标记 | 开头：先把上一轮扫完（它按「纪元 ≠ 那一轮」判死，必须在新一轮把活对象标成更新纪元之前结束）；握手字（最高位请求，低位是 mutate 里的线程数）挂上请求、等 mutate 里没人、把根标灰、撤请求——paragc 不扫栈，快照只能在没有 mutator 拿着未挂根的 `Gc` 时照；然后在线程池上标记。标记期间 `Slot` 写入把被覆盖的旧值标上并放进堆的灰队列（初始快照），新对象直接拿本轮纪元、连同行一起标上（黑分配）。空行 = 行标记早于上次完成的纪元，标记方刚写上新纪元的行不会被当成空行。`finish_marking` 并行清空灰队列 |
 | 并发清扫 | `finish_marking` 把全部块与大对象交给清扫器就返回。领用是原子游标，每个块恰好被领到的那个线程扫一次、扫完才交出去：mutator 要块时先拿扫好的，没有就领一个没扫的当场扫；`sweep_concurrently` 在线程池上扫剩下的，并等别人手里领走的扫完。新对象带上次完成的纪元，清扫期间分配的不会被当成死的。`collect` = `finish_marking` + `sweep_concurrently` |
+| 疏散 | 只在暂停式 `finish_marking`（没有并发标记在进行）时做。候选：清扫后没再分配过、存活不到块的 1/4 的块，至少 4 个、至多 1024 个；其余扫好的块当搬入的目标。标记时第一个追到候选块里对象的工人认领它（标记字：复制中），抄进自己的复制缓冲（新副本标成本轮，带起点位与行标记），旧头里留下新地址；别人等它或直接取新地址。每条边经 `Trace::relocate` 改写；根表槽用 CAS 改，同时在别的线程析构的句柄不会被改回来。清扫时旧副本只清起点位、不析构 |
 
 工作窃取双端队列与退避来自 [crossbeam](https://github.com/crossbeam-rs/crossbeam)（`crossbeam-deque`、`crossbeam-utils`）；
 只追加分段向量与块库存来自 [j8lockfree](https://crates.io/crates/j8lockfree)。
@@ -87,6 +88,8 @@ heap.collect();
 
 - 堆里的类型实现 `Trace`（用 `#[derive(Trace)]`），而且必须 `Send + Sync`：对象可能在任何线程上被读、在回收线程上被追踪和析构。
   要改的边放 `Slot<'gc, T>`（原子指针），写入要带 `Mutator`（`slot.set(m, v)`），写屏障才知道是否在并发标记。
+- 暂停式回收会搬对象。`Gc` 只在一次 `mutate` 里有效，所以察觉不到，但 `Gc::as_ptr` 两次 `mutate` 之间可能不同。
+  手写有边的 `Trace` 还要实现 `relocate`（derive 会生成）。
 - 不要在同一个堆的 `mutate` 里调用 `mark_concurrently`：它会一直等自己走空。
 - 有 `Gc` 字段的类型不许实现 `Drop`：析构顺序不定，`Drop` 里可能碰到已经析构的对象。derive 会检查，`#[trace(unsafe_drop)]` 关掉检查。
 - 只有从 `Root` 可达的对象能活过回收。
@@ -105,6 +108,8 @@ heap.collect();
 | `crossed_deep_trees` | 8 堆各一条深链 + 一棵 15 层满二叉树，树叶锚在下一个堆的深链上；每次剪断后析构数都恰好等于理论值 |
 | `concurrent_marking_while_relinking` | mutator 不停地把节点从一个槽摘下（只剩栈上引用）再挂到别处、新建、扔掉，另一个线程同时并发标记；每轮后链上节点数恰好等于理论值，析构数恰好等于扔掉的个数 |
 | `concurrent_sweeping_while_relinking` | 同样的 mutator 贯穿并发标记、`finish_marking` 停顿与并发清扫（它们顺手扫块，另一个线程同时 `sweep_concurrently`）；从不析构还挂着的节点，计数恰好 |
+| `evacuation_compacts_sparse_blocks` | 只留 1/16：下一次回收疏散稀疏块；块数下降、值不变、地址变了、析构数恰好 |
+| `evacuation_with_shared_children` | 很多父节点共享少数子节点（一条 `Slot`、一条普通字段），多个工人争着认领同一个子节点；每个父节点的两条边都落到同一个新副本上，不会重复析构 |
 
 全部测试也在 Miri 下跑（Stacked Borrows 和 Tree Borrows，`cfg(miri)` 下自动缩规模）。要加 `-Zmiri-ignore-leaks`：
 crossbeam-epoch 的全局回收器退出时还拿着延迟释放的垃圾；每堆 4 个回收线程时 Stacked Borrows 还会在 crossbeam-epoch 内部报违例，
@@ -171,10 +176,9 @@ CPU ÷ 墙钟 就是实际有几个线程在干活。Intel Core Ultra 7 356H（1
 
 ## 🗺️ 路线
 
-已完成：并行暂停式回收、常驻线程池、并发标记、并发 + 惰性清扫。之后：
+已完成：并行暂停式回收、常驻线程池、并发标记、并发 + 惰性清扫、机会式疏散。之后：
 
-1. 稀疏块的机会式疏散（Immix defrag）
-2. 年轻对象引用计数（LXR 式）：年轻对象死了立刻回收行，追踪只负责环与老对象
+1. 年轻对象引用计数（LXR 式）：年轻对象死了立刻回收行，追踪只负责环与老对象
 
 ## 📜 许可
 

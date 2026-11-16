@@ -11,7 +11,7 @@
 [![Lock-free](https://img.shields.io/badge/locks-none-blue?style=for-the-badge)](#-how-it-works)
 [![License](https://img.shields.io/badge/License-MIT-brightgreen?style=for-the-badge)](#-license)
 
-[![Heap](https://img.shields.io/badge/heap-mark--region%20%C2%B7%20non--moving-8A2BE2?style=flat-square)](#-how-it-works)
+[![Heap](https://img.shields.io/badge/heap-mark--region%20%C2%B7%20evacuating-8A2BE2?style=flat-square)](#-how-it-works)
 [![Mark](https://img.shields.io/badge/mark-parallel%20%C2%B7%20work%20stealing-262D3A?style=flat-square)](#-how-it-works)
 [![std](https://img.shields.io/badge/std-required-283272?style=flat-square)](#-rules)
 
@@ -37,7 +37,7 @@ collection marks and sweeps on every core.
 | 🧹 **Concurrent sweeping** | `Heap::finish_marking(&mut self)` only finishes marking and hands the blocks to the sweeper; mutators sweep a block themselves when they need one (lazy sweeping) while `Heap::sweep_concurrently(&self)` sweeps the rest on the pool. With both, the pause is just draining the grey queue. |
 | 🏃 **Parallel collection** | A persistent pool per heap (threads park between collections). Marking: one crossbeam work-stealing deque per worker, stealing in batches. Sweeping, destructors included: blocks handed out in batches to the same workers. |
 | 🏷️ **Branded handles** | `Gc<'gc, T>` cannot escape the `mutate` closure. `Root<B>` handles carry no lifetime and can be stored anywhere and sent across threads. |
-| 📌 **Non-moving** | Objects never move, so pointers stay plain pointers and nothing needs forwarding. |
+| 📦 **Opportunistic evacuation** | A stop-the-world collection moves the live objects out of sparse blocks while it marks (Immix defragmentation): one pass marks, copies and rewrites every edge. Concurrent marking never moves anything, so mutators need no read barrier. |
 | 🛡️ **Checked at compile time** | `#[derive(Trace)]` rejects `Drop` on traced types, and object data aligned above 8 bytes is a compile error. |
 
 ## 🚀 Usage
@@ -90,6 +90,7 @@ assert_eq!(sum, 999 * 1000 / 2);
 | Stale buffers | A buffer remembers (heap, collection count); after a collection it starts over, because its block was re-classified. |
 | Concurrent marking | Start: finish the previous sweep (it judges by "mark ≠ that epoch", so it must end before the next marking stamps live objects with a newer one), raise a request bit in the gate word (top bit; low bits count threads inside `mutate`), wait until no mutator is inside, mark the roots grey, drop the request. paragc does not scan stacks, so the snapshot has to be taken when no mutator holds an unrooted `Gc`. Then mark on the pool. During marking, a `Slot` write marks the value it overwrites and puts it in the heap's grey queue (snapshot at the beginning), new objects get the marking epoch and their lines marked (black). A line is free when its mark is older than the last finished epoch, so lines the marker has just stamped are never handed out. `finish_marking` drains the grey queue in parallel. |
 | Concurrent sweeping | `finish_marking` hands every block and large object to the sweeper and returns. Claiming is an atomic cursor, so each block is swept exactly once by whoever claims it, before it is handed out: a mutator that needs a block first takes a swept one, otherwise claims an unswept block and sweeps it on the spot; `sweep_concurrently` sweeps the rest on the pool and waits for blocks others are still sweeping. New objects carry the last finished epoch, so allocations during sweeping are never taken for dead. `collect` = `finish_marking` + `sweep_concurrently`. |
+| Evacuation | Only in a stop-the-world `finish_marking` (no concurrent marking in progress). Candidates: blocks that have not been allocated into since they were swept and hold less than a quarter of a block of live data; at least 4, at most 1024. The other swept blocks become copy targets. While marking, the first worker to reach an object in a candidate block claims it (mark word: copying), copies it into its own copy buffer (the new copy is marked, with start bit and line marks) and leaves a forwarding address in the old header; others wait or take the new address. Every edge is rewritten through `Trace::relocate`; root slots with a CAS, so a handle dropped on another thread meanwhile stays dropped. Sweeping clears the old copies' start bits without running their destructors. |
 
 Work-stealing deques and backoff come from [crossbeam](https://github.com/crossbeam-rs/crossbeam) (`crossbeam-deque`,
 `crossbeam-utils`); the append-only segmented vector and the block stock come from
@@ -100,6 +101,9 @@ Work-stealing deques and backoff come from [crossbeam](https://github.com/crossb
 - Heap types implement `Trace` (use `#[derive(Trace)]`) and must be `Send + Sync`: objects are read from any thread
   and traced and dropped on collector threads. Mutable edges go in `Slot<'gc, T>` (an atomic pointer); writing one
   takes the `Mutator` (`slot.set(m, v)`), so the barrier can see concurrent marking.
+- Objects can move during a stop-the-world collection. A `Gc` is only valid inside one `mutate`, so this is invisible,
+  but `Gc::as_ptr` may differ from one `mutate` to the next. Hand-written `Trace` impls with edges must also implement
+  `relocate` (the derive does it).
 - Never call `mark_concurrently` from inside a `mutate` on the same heap: it would wait for itself to leave.
 - A type with `Gc` fields must not implement `Drop`: destructors run in no particular order, so a `Drop` could see
   objects that were already dropped. The derive checks this; `#[trace(unsafe_drop)]` opts out.
@@ -119,6 +123,8 @@ Work-stealing deques and backoff come from [crossbeam](https://github.com/crossb
 | `crossed_deep_trees` | 8 heaps, each with a deep chain and a 15-level tree whose leaves anchor into the next heap's chain; every cut matches the expected finalization count |
 | `concurrent_marking_while_relinking` | Mutators keep unlinking nodes (leaving them only on their stacks) and relinking them elsewhere, allocating and discarding, while another thread marks concurrently; after every cycle the reachable count is exact, and finalization equals the discards |
 | `concurrent_sweeping_while_relinking` | The same mutators across concurrent marking, the `finish_marking` pause and concurrent sweeping (they sweep blocks lazily while another thread runs `sweep_concurrently`); nothing still linked is ever finalized, counts stay exact |
+| `evacuation_compacts_sparse_blocks` | Keep 1 object in 16: the next collection evacuates the sparse blocks; fewer blocks, values intact, addresses changed, finalization exact |
+| `evacuation_with_shared_children` | Many parents share a few children (one `Slot` and one plain field each), so several workers race to claim the same child; both edges of every parent end up at the same new copy, nothing is finalized twice |
 
 All of them also run under Miri with both Stacked Borrows and Tree Borrows (scaled down under `cfg(miri)`).
 `-Zmiri-ignore-leaks` is needed because crossbeam-epoch's global collector still holds deferred garbage at exit; at
@@ -196,10 +202,10 @@ Reading these honestly:
 
 ## 🗺️ Roadmap
 
-Done: parallel stop-the-world collection, a persistent pool, concurrent marking, concurrent and lazy sweeping. Next:
+Done: parallel stop-the-world collection, a persistent pool, concurrent marking, concurrent and lazy sweeping,
+opportunistic evacuation. Next:
 
-1. Opportunistic evacuation of sparse blocks (Immix defragmentation)
-2. Reference counting for young objects in the style of LXR: dead young objects free their lines at once, tracing
+1. Reference counting for young objects in the style of LXR: dead young objects free their lines at once, tracing
    handles cycles and old objects
 
 ## 📜 License

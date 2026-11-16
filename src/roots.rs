@@ -74,6 +74,21 @@ impl RootTable {
         let _ = self.returned.push(i);
     }
 
+    /// 疏散回收：每个根交给 `f`（标记，必要时搬走），改成它返回的新地址。
+    /// 句柄可能同时在别的线程析构（槽被清空），所以用 CAS：清空了就不改回去。
+    pub(crate) fn relocate(&self, mut f: impl FnMut(*const Header) -> *const Header) {
+        for slot in self.slots.iter() {
+            let old = slot.load(Ordering::Acquire);
+            if old.is_null() {
+                continue;
+            }
+            let new = f(old.cast_const());
+            if !core::ptr::eq(old, new) {
+                let _ = slot.compare_exchange(old, new.cast_mut(), Ordering::AcqRel, Ordering::Acquire);
+            }
+        }
+    }
+
     /// 回收时：整理空槽，返回全部根。SAFETY（调用方）：没有 mutator（独占堆）。
     pub(crate) unsafe fn settle(&self) -> Vec<*const Header> {
         // SAFETY: 见上

@@ -22,6 +22,12 @@ pub(crate) const UNITS_PER_WORKER: usize = 8;
 pub(crate) const MIN_TRIGGER: usize = 4 * 1024 * 1024;
 /// 触发回收的倍数：新领用的字节数超过「上次存活字节 × 它」就回收
 pub(crate) const GROWTH: usize = 2;
+/// 疏散候选：上次清扫后存活不到这么多字节的块（块的 1/4）
+pub(crate) const EVACUATE_LIVE: usize = BLOCK / 4;
+/// 疏散候选至少这么多个才值得疏散
+pub(crate) const EVACUATE_MIN: usize = 4;
+/// 一次至多疏散这么多个块（限住这次停顿）
+pub(crate) const EVACUATE_MAX: usize = 1024;
 /// 回收后至少留着复用的全空块数
 pub(crate) const MIN_SPARE_BLOCKS: usize = 4;
 

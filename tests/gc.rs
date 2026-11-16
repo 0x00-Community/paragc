@@ -777,3 +777,114 @@ fn concurrent_sweeping_while_relinking() {
     assert!(moves.overlapped_sweep.load(Ordering::Relaxed) > 0, "mutate 一次也没落在并发清扫期间");
     moves.finish(heap, board);
 }
+
+/// 疏散测试的元素：只有值和析构计数（没有边）。
+#[derive(Trace)]
+struct Cell8 {
+    value: u64,
+    tag: Counted,
+}
+
+/// 根：留下来的元素。
+#[derive(Trace)]
+struct Keep<'gc> {
+    items: Vec<Gc<'gc, Cell8>>,
+}
+
+brand!(KeepB = for<'gc> Keep<'gc>);
+
+/// 分配大量元素、只留 1/16：第一次回收后各块只剩 ~6% 存活（稀疏），第二次回收应把它们疏散走：
+/// 块数下降、留下的元素值不变且地址变了、析构数恰好等于扔掉的个数。
+#[test]
+fn evacuation_compacts_sparse_blocks() {
+    const ITEMS: u64 = if cfg!(miri) { 4_000 } else { 64_000 };
+    const KEEP_EVERY: u64 = 16;
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut heap = Heap::new(THREADS);
+    let keep: Root<KeepB> = heap.mutate(|m| {
+        let mut items = Vec::new();
+        for value in 0..ITEMS {
+            let x = m.alloc(Cell8 { value, tag: Counted(drops.clone()) });
+            if value.is_multiple_of(KEEP_EVERY) {
+                items.push(x);
+            }
+        }
+        m.root(m.alloc(Keep { items }))
+    });
+    let kept = ITEMS / KEEP_EVERY;
+    let discarded = usize::try_from(ITEMS - kept).expect("小");
+    heap.collect();
+    assert_eq!(drops.load(Ordering::Relaxed), discarded);
+    let before_blocks = heap.stats().blocks;
+    let before: Vec<usize> = heap.mutate(|m| m.get(&keep).items.iter().map(|x| x.as_ptr().addr()).collect());
+    heap.collect();
+    let stats = heap.stats();
+    assert!(stats.evacuated_blocks > 0, "稀疏块没有被疏散：{stats:?}");
+    assert!(stats.blocks < before_blocks, "疏散后块数没降：{before_blocks} ⇒ {}", stats.blocks);
+    let after: Vec<(usize, u64)> = heap.mutate(|m| m.get(&keep).items.iter().map(|x| (x.as_ptr().addr(), x.value)).collect());
+    assert!(after.iter().enumerate().all(|(i, &(_, v))| v == u64::try_from(i).expect("小") * KEEP_EVERY), "搬过的元素值不对");
+    let moved = before.iter().zip(&after).filter(|(b, (a, _))| *b != a).count();
+    assert!(moved > 0, "没有元素换地址");
+    assert_eq!(drops.load(Ordering::Relaxed), discarded, "搬走的旧副本被析构了");
+    drop(keep);
+    heap.collect();
+    assert_eq!(drops.load(Ordering::Relaxed), usize::try_from(ITEMS).expect("小"));
+}
+
+/// 多父共享子节点：父节点各有两个指向共享子节点的槽。
+#[derive(Trace)]
+struct Parent<'gc> {
+    a: Slot<'gc, Cell8>,
+    b: Gc<'gc, Cell8>,
+    tag: Counted,
+}
+
+#[derive(Trace)]
+struct Family<'gc> {
+    parents: Vec<Gc<'gc, Parent<'gc>>>,
+}
+
+brand!(FamilyB = for<'gc> Family<'gc>);
+
+/// 很多父节点指向同一小撮子节点（槽与普通字段各一条），父与子都在稀疏块里：疏散时多个回收线程会同时追到同一个子节点、
+/// 争着认领复制。之后每个父节点的两条边必须指向同一个（新）子节点，值不变，子节点只被复制一次（不重复析构、不丢）。
+#[test]
+fn evacuation_with_shared_children() {
+    const PARENTS: u64 = if cfg!(miri) { 1_500 } else { 40_000 };
+    const CHILDREN: u64 = 64;
+    const KEEP_EVERY: u64 = 8;
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut heap = Heap::new(THREADS);
+    let family: Root<FamilyB> = heap.mutate(|m| {
+        let children: Vec<_> = (0..CHILDREN).map(|value| m.alloc(Cell8 { value, tag: Counted(drops.clone()) })).collect();
+        let mut parents = Vec::new();
+        for i in 0..PARENTS {
+            // 留下来的父节点（i 是 KEEP_EVERY 的倍数）依次指向第 0、1、2 … 个子节点，全部子节点都被引用
+            let c = children[usize::try_from((i / KEEP_EVERY) % CHILDREN).expect("小")];
+            let p = m.alloc(Parent { a: c.into(), b: c, tag: Counted(drops.clone()) });
+            // 垃圾穿插在中间，让块变稀疏
+            m.alloc(Cell8 { value: u64::MAX, tag: Counted(drops.clone()) });
+            if i.is_multiple_of(KEEP_EVERY) {
+                parents.push(p);
+            }
+        }
+        m.root(m.alloc(Family { parents }))
+    });
+    // 留下的父节点：i = 0, KEEP_EVERY, 2·KEEP_EVERY … 共 ⌈PARENTS / KEEP_EVERY⌉ 个
+    let garbage = usize::try_from(PARENTS * 2 - PARENTS.div_ceil(KEEP_EVERY)).expect("小");
+    heap.collect();
+    assert_eq!(drops.load(Ordering::Relaxed), garbage);
+    heap.collect();
+    assert!(heap.stats().evacuated_blocks > 0, "没有疏散：{:?}", heap.stats());
+    heap.mutate(|m| {
+        for (i, p) in m.get(&family).parents.iter().enumerate() {
+            let a = p.a.get().expect("槽不空");
+            assert!(Gc::ptr_eq(a, p.b), "同一个子节点的两条边指向不同地址");
+            assert_eq!(a.value, u64::try_from(i).expect("小") % CHILDREN);
+        }
+    });
+    assert_eq!(drops.load(Ordering::Relaxed), garbage, "疏散时多析构了");
+    drop(family);
+    heap.collect();
+    assert_eq!(drops.load(Ordering::Relaxed), usize::try_from(PARENTS * 2 + CHILDREN).expect("小"));
+}

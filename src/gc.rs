@@ -134,6 +134,11 @@ impl<'gc, T> Slot<'gc, T> {
         done.map(Self::wrap).map_err(Self::wrap)
     }
 
+    /// 独占时改写（疏散回收改成新地址）。
+    pub(crate) fn store_exclusive(&mut self, v: Option<Gc<'gc, T>>) {
+        *self.ptr.get_mut() = Self::raw(v);
+    }
+
     /// 被覆盖的旧值交给写屏障。
     fn barrier(m: &Mutator<'gc>, old: *mut T) {
         if !old.is_null() {
