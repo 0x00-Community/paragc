@@ -11,23 +11,24 @@ use core::cell::Cell;
 use core::marker::PhantomData;
 use core::num::{NonZeroU32, NonZeroUsize};
 use core::ptr::{NonNull, null_mut};
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::alloc::{alloc, handle_alloc_error};
 use std::sync::{Arc, OnceLock};
 
-use crossbeam_deque::{Injector, Steal};
+use crossbeam_deque::{Injector, Steal, Worker};
 use crossbeam_utils::{Backoff, CachePadded};
 
 use j8lockfree::SegVec;
 
 use crate::block::Block;
-use crate::gc::Invariant;
+use crate::gc::{Invariant, RawSlot};
 use crate::header::{HEADER, Header, MAX_EPOCH};
 use crate::layout::{BLOCK, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, LARGE, MIN_SPARE_BLOCKS, MIN_TRIGGER, YOUNG_PER_FULL};
 use crate::mark::Marking;
 use crate::roots::RootTable;
 use crate::sweep::{Large, Outcome, Sink, Sweeper};
 use crate::workers::Pool;
+use crate::trace::Tracer;
 use crate::{Gc, Trace};
 
 pub struct Heap {
@@ -45,6 +46,14 @@ pub struct Heap {
     grey: Injector<usize>,
     /// 记忆集：上次回收后被写进年轻对象的槽的地址（年轻回收从这些槽出发；任何回收后清空）
     remembered: Injector<usize>,
+    /// 引用计数登记：本轮被写过的、计数中的槽（每个槽每轮一次）
+    rc_log: Injector<usize>,
+    /// 引用计数可信：停顿式完整回收重新计数后为真；并发标记开始后为假（黑分配的对象没计它们的边），直到下一次重新计数
+    rc_valid: AtomicBool,
+    /// 当前计数的奇偶（重新计数时翻转，旧计数一次作废）
+    rc_parity: bool,
+    /// 上一轮计入的根（延迟到这一轮 −1）
+    rc_roots: Vec<usize>,
     /// 上次完整回收后做了几次年轻回收
     young_since_full: usize,
     /// 一共做了几次年轻回收
@@ -101,6 +110,10 @@ impl Heap {
             gate: CachePadded::new(AtomicU64::new(0)),
             grey: Injector::new(),
             remembered: Injector::new(),
+            rc_log: Injector::new(),
+            rc_valid: AtomicBool::new(false),
+            rc_parity: false,
+            rc_roots: Vec::new(),
             young_since_full: 0,
             young_collections: 0,
             collections: 0,
@@ -148,7 +161,8 @@ impl Heap {
         tlab.adopt(self);
         // 并发标记只在没有 mutator 时开始、只在独占堆时结束，所以一次 mutate 里它不变
         let marking = NonZeroU32::new(self.marking.load(Ordering::Acquire));
-        f(&Mutator { heap: self, tlab, marking, _brand: PhantomData })
+        let counting = self.rc_valid.load(Ordering::Acquire);
+        f(&Mutator { heap: self, tlab, marking, counting, _brand: PhantomData })
     }
 
     fn pool(&self) -> &Pool {
@@ -179,6 +193,8 @@ impl Heap {
         // 纪元必须在 mutate 里走空之后才发布：否则先进门、看见「在标记」的 mutator 会黑分配，
         // 而更早进门、没有写屏障的 mutator 还能往这个黑对象底下挂东西，快照之后黑对象不再追踪 ⇒ 漏标
         self.marking.store(epoch, Ordering::Release);
+        // 黑分配的对象不会被扫描，它们的边不计数 ⇒ 从现在到下一次停顿式完整回收，引用计数不可信
+        self.rc_valid.store(false, Ordering::Release);
         // SAFETY: 请求挂着且 mutate 里没人 ⇒ 没有 mutator（根句柄的析构不受影响）
         let roots = unsafe { self.roots.settle() };
         Marking::seed(&self.grey, &roots, epoch);
@@ -230,6 +246,7 @@ impl Heap {
         loop {
             match self.available.steal() {
                 Steal::Success(b) => {
+                    b.unlist();
                     b.reused();
                     return b;
                 }
@@ -317,11 +334,46 @@ impl Heap {
         let roots = unsafe { self.roots.settle() };
         let epoch = self.epoch;
         let remembered = Self::drain(&self.remembered);
+        // 引用计数（可信时）：当前的根 +1、登记过的槽按「新值 +1、上次计入的值 −1」结算，上一轮的根延迟到现在 −1
+        let counting = *self.rc_valid.get_mut();
+        let parity = self.rc_parity;
+        let mut decs = Vec::new();
+        if counting {
+            for &root in &roots {
+                // SAFETY: 根指向活对象
+                unsafe { &*root }.rc_inc(parity);
+            }
+            decs.append(&mut self.rc_roots);
+        } else {
+            self.rc_roots.clear();
+        }
+        for addr in Self::drain(&self.rc_log) {
+            // SAFETY: 登记的槽在被写时所在对象可达，到这次回收前不会被释放
+            let slot = unsafe { &*core::ptr::with_exposed_provenance::<RawSlot>(addr) };
+            if counting {
+                let (cur, prev) = slot.recount();
+                if let Some(cur) = cur {
+                    // SAFETY: 槽当前指向活对象
+                    unsafe { &*cur }.rc_inc(parity);
+                }
+                decs.extend(prev.map(<*const Header>::expose_provenance));
+            } else {
+                slot.unlog();
+            }
+        }
         Marking::seed(&self.grey, &roots, epoch);
         Marking::seed_slots(&self.grey, &remembered, epoch);
         let pool = self.pool.get_or_init(|| Pool::new(self.threads));
         let workers = pool.sized(self.blocks.len() + self.large.len());
-        Marking::new(workers, epoch, &self.grey).run(pool);
+        // 晋升的对象被扫描时，它的每条边 +1（年轻对象的边从晋升起才计数）
+        Marking::new(workers, epoch, &self.grey).counting(counting.then_some(parity)).run(pool);
+        let dirty = if counting {
+            self.rc_roots = roots.iter().map(|r| r.expose_provenance()).collect();
+            // SAFETY: &mut self ⇒ 没有 mutator；增量都已加完
+            unsafe { Self::release(decs, epoch, parity) }
+        } else {
+            Vec::new()
+        };
         // 只扫上次回收后拿去分配过的块（年轻对象只可能在这些块里）；没动过的老块原样放回
         let (young, old): (Vec<Block>, Vec<Block>) = self.blocks.take().into_iter().partition(|b| b.live_since_sweep().is_none());
         self.blocks.extend(old);
@@ -334,6 +386,42 @@ impl Heap {
         self.young_collections += 1;
         self.young_since_full += 1;
         self.sweep_concurrently();
+        // 引用计数释放过对象的块：按剩下的对象重算行，空出了行就放回可用队列
+        for b in dirty {
+            // SAFETY: 独占；年轻的死对象已扫掉，块里剩下的都活着
+            if unsafe { b.recompute_lines(epoch) } && b.list() {
+                self.available.push(b);
+            }
+        }
+    }
+
+    /// 处理减量：减到 0 的老对象（块里的、没被搬走的）释放——它每条边的目标再减一（连锁），析构，清起点位。
+    /// 返回释放过对象的块（去重）。大对象、粘住的、年轻的不在这里释放（留给追踪 / 年轻清扫）。
+    /// SAFETY（调用方）：没有 mutator；这一轮的增量都已加完（否则会把还有引用的对象减到 0）。
+    unsafe fn release(mut work: Vec<usize>, epoch: u32, parity: bool) -> Vec<Block> {
+        let seed = Worker::new_lifo();
+        let mut dirty = Vec::new();
+        while let Some(addr) = work.pop() {
+            let header = core::ptr::with_exposed_provenance::<Header>(addr);
+            // SAFETY: 减量来自计入过的边，目标在计数归零前一直活着
+            let h = unsafe { &*header };
+            if !h.rc_dec(parity) || h.is_large() || !h.is_marked(epoch) {
+                continue;
+            }
+            let mut children = Vec::new();
+            let mut t = Tracer::releasing(&seed, &mut children);
+            // SAFETY: 对象还没析构；释放模式只读它的边
+            unsafe { Header::visit(header, &mut t) };
+            work.append(&mut children);
+            // SAFETY: 计数归零 ⇒ 没有计入的引用；没有 mutator、年轻的都已晋升或将被清扫 ⇒ 没人再用它
+            unsafe { Header::finalize(header) };
+            let block = Block::containing(header.cast());
+            block.clear_start(header.cast());
+            dirty.push(block);
+        }
+        dirty.sort_unstable_by_key(|b| b.line(0).addr());
+        dirty.dedup();
+        dirty
     }
 
     /// 取空一个队列。
@@ -362,6 +450,21 @@ impl Heap {
         // 完整标记会找到全部活对象，记忆集不再需要
         drop(Self::drain(&self.remembered));
         self.young_since_full = 0;
+        // 引用计数：停顿式完整回收顺手重新计数（翻转奇偶 ⇒ 旧计数全部作废，扫描时每条边 +1，槽改成计入当前值）；
+        // 并发标记的收尾不重新计数，计数继续不可信。两种情况下这一轮的登记都作废
+        let recount = *self.marking.get_mut() == 0;
+        for addr in Self::drain(&self.rc_log) {
+            if !recount {
+                // SAFETY: 登记的槽在被写时所在对象可达，到这次回收前不会被释放
+                unsafe { &*core::ptr::with_exposed_provenance::<RawSlot>(addr) }.unlog();
+            }
+        }
+        self.rc_roots.clear();
+        if recount {
+            self.rc_parity = !self.rc_parity;
+        }
+        *self.rc_valid.get_mut() = recount;
+        let count = recount.then_some(self.rc_parity);
         // SAFETY: &mut self ⇒ 没有 mutator
         let roots = unsafe { self.roots.settle() };
         let marking = *self.marking.get_mut();
@@ -369,17 +472,13 @@ impl Heap {
         let pool = self.pool.get_or_init(|| Pool::new(self.threads));
         let workers = pool.sized(self.blocks.len() + self.large.len());
         // 清扫好、没再用过的可用块：不并发标记时从里面挑稀疏的疏散，其余当搬入的目标
-        let mut available = Vec::new();
-        loop {
-            match self.available.steal() {
-                Steal::Success(b) => available.push(b),
-                Steal::Retry => {}
-                Steal::Empty => break,
-            }
+        let available = Self::drain(&self.available);
+        for b in &available {
+            b.unlist();
         }
         let targets = Injector::new();
         let evacuate = if marking == 0 { Self::pick_evacuation(&available, &targets) } else { 0 };
-        let mark = Marking::new(workers, epoch, &self.grey);
+        let mark = Marking::new(workers, epoch, &self.grey).counting(count);
         let moved = AtomicUsize::new(0);
         if evacuate > 0 {
             mark.evacuating(&self.roots, &targets, &self.blocks, &moved, self.epoch).run(pool);
@@ -410,7 +509,9 @@ impl Sink for Heap {
         match outcome {
             Outcome::Usable(b) => {
                 self.blocks.push(b);
-                self.available.push(b);
+                if b.list() {
+                    self.available.push(b);
+                }
             }
             Outcome::Full(b) => {
                 self.blocks.push(b);
@@ -520,6 +621,8 @@ pub struct Mutator<'gc> {
     tlab: &'gc Tlab,
     /// 进 mutate 时正在并发标记的纪元：写屏障与黑分配用
     marking: Option<NonZeroU32>,
+    /// 进 mutate 时引用计数是否可信（可信才登记槽）
+    counting: bool,
     _brand: Invariant<'gc>,
 }
 
@@ -536,20 +639,23 @@ impl<'gc> Mutator<'gc> {
     /// 写屏障。并发标记中：被覆盖的旧值若还没标就标上、进灰队列（初始快照）。
     /// 平时：写进去的是年轻对象（标记纪元不是上次完成的那轮）就记下槽的地址——老对象指向年轻对象的边只能这样产生，
     /// 年轻回收从这些槽出发。（并发标记期间新对象都是黑的、收尾后全是老对象，不用记。）
-    pub(crate) fn written(&self, slot: *const AtomicPtr<u8>, old: Option<*const Header>, new: Option<*const Header>) {
-        match self.marking {
-            Some(epoch) => {
-                if let Some(old) = old {
-                    self.heap.remember(old, epoch.get());
-                }
+    ///
+    /// 引用计数可信时，槽本轮第一次被写还要登记（只有老对象里的槽会登记，年轻对象的槽不计数）。
+    pub(crate) fn written(&self, slot: &RawSlot, old: Option<*const Header>, new: Option<*const Header>) {
+        if let Some(epoch) = self.marking {
+            if let Some(old) = old {
+                self.heap.remember(old, epoch.get());
             }
-            None => {
-                // SAFETY: new 是刚写进槽的、活着的对象
-                if let Some(new) = new
-                    && !unsafe { &*new }.is_marked(self.heap.epoch)
-                {
-                    self.heap.remembered.push(slot.expose_provenance());
-                }
+        } else {
+            let addr = (&raw const *slot).expose_provenance();
+            // SAFETY: new 是刚写进槽的、活着的对象
+            if let Some(new) = new
+                && !unsafe { &*new }.is_marked(self.heap.epoch)
+            {
+                self.heap.remembered.push(addr);
+            }
+            if self.counting && slot.log() {
+                self.heap.rc_log.push(addr);
             }
         }
     }

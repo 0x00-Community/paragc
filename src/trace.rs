@@ -41,11 +41,33 @@ pub struct Tracer<'t> {
     epoch: u32,
     /// 疏散回收时的复制缓冲（有它 = 重定位模式）
     copier: Option<&'t mut Copier>,
+    /// 计数模式（晋升 / 重新计数）：扫描到的每条边给目标 +1，值是当前计数的奇偶
+    count: Option<bool>,
+    /// 释放模式（引用计数减到 0 的对象）：每条边的目标交给它 −1，不标记
+    decs: Option<&'t mut Vec<usize>>,
 }
 
 impl<'t> Tracer<'t> {
     pub(crate) fn new(work: &'t Worker<usize>, epoch: u32, copier: Option<&'t mut Copier>) -> Self {
-        Self { work, epoch, copier }
+        Self { work, epoch, copier, count: None, decs: None }
+    }
+
+    /// 计数模式：扫描时每条边给目标 +1（种子——根与记忆集——直接走 visit，不计）。
+    pub(crate) fn counting(mut self, parity: Option<bool>) -> Self {
+        self.count = parity;
+        self
+    }
+
+    /// 释放模式：访问一个死对象时把它每条边的目标（槽取上次计入的值）放进 `decs`。
+    pub(crate) fn releasing(work: &'t Worker<usize>, decs: &'t mut Vec<usize>) -> Self {
+        Self { work, epoch: 0, copier: None, count: None, decs: Some(decs) }
+    }
+
+    fn inc(&self, header: *const Header) {
+        if let Some(parity) = self.count {
+            // SAFETY: header 是活对象
+            unsafe { &*header }.rc_inc(parity);
+        }
     }
 
     /// 重定位模式（疏散回收）：取出来的对象走 `relocate` 而不是 `trace`。
@@ -55,16 +77,57 @@ impl<'t> Tracer<'t> {
 
     /// 一条边（只读：并发标记、不疏散的回收）。
     pub fn edge<T: Trace>(&mut self, gc: Gc<'_, T>) {
+        if let Some(decs) = self.decs.as_deref_mut() {
+            decs.push(gc.header().expose_provenance());
+            return;
+        }
         self.visit(gc.header(), T::NO_EDGES);
+        self.inc(gc.header());
     }
 
     /// 一条可改写的边（疏散回收）：对象被搬走了就改成新地址。
     pub fn relocate<T: Trace>(&mut self, gc: &mut Gc<'_, T>) {
+        *gc = self.forward_gc(*gc);
+        self.inc(gc.header());
+    }
+
+    /// 标记（必要时搬走）并返回对象现在的位置；不计数。
+    fn forward_gc<'gc, T: Trace>(&mut self, gc: Gc<'gc, T>) -> Gc<'gc, T> {
         let old = gc.header();
         let new = self.forward(old, T::NO_EDGES);
-        if !core::ptr::eq(old, new) {
-            // SAFETY: new 是同一个对象搬过去的新头，品牌与类型不变
-            *gc = unsafe { Gc::from_data(Header::data(new).cast()) };
+        // SAFETY: new 是同一个对象（或搬过去的新头），品牌与类型不变
+        if core::ptr::eq(old, new) { gc } else { unsafe { Gc::from_data(Header::data(new).cast()) } }
+    }
+
+    /// 一个槽（只读）：平时等于一条边；计数模式下改成计入当前值并 +1；释放模式下把上次计入的值交出去 −1。
+    pub(crate) fn slot<T: Trace>(&mut self, slot: &Slot<'_, T>) {
+        let raw = slot.raw_slot();
+        if let Some(decs) = self.decs.as_deref_mut() {
+            if let Some(h) = raw.counted() {
+                decs.push(h.expose_provenance());
+            }
+            return;
+        }
+        if self.count.is_some() {
+            if let (Some(cur), _) = raw.recount() {
+                self.visit(cur, T::NO_EDGES);
+                self.inc(cur);
+            }
+        } else if let Some(gc) = slot.get() {
+            self.visit(gc.header(), T::NO_EDGES);
+        }
+    }
+
+    /// 一个可改写的槽（疏散回收）：搬走了就改成新地址；计数模式下计入新值并 +1。
+    pub(crate) fn slot_mut<T: Trace>(&mut self, slot: &mut Slot<'_, T>) {
+        if let Some(gc) = slot.get() {
+            let new = self.forward_gc(gc);
+            slot.store_exclusive(Some(new));
+        }
+        if self.count.is_some()
+            && let (Some(cur), _) = slot.raw_slot().recount()
+        {
+            self.inc(cur);
         }
     }
 
@@ -131,16 +194,11 @@ unsafe impl<T: Trace> Trace for Gc<'_, T> {
 // SAFETY: 槽里的值就是一条边
 unsafe impl<T: Trace> Trace for Slot<'_, T> {
     fn trace(&self, t: &mut Tracer<'_>) {
-        if let Some(gc) = self.get() {
-            t.edge(gc);
-        }
+        t.slot(self);
     }
 
     fn relocate(&mut self, t: &mut Tracer<'_>) {
-        if let Some(mut gc) = self.get() {
-            t.relocate(&mut gc);
-            self.store_exclusive(Some(gc));
-        }
+        t.slot_mut(self);
     }
 }
 
