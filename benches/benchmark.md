@@ -12,10 +12,10 @@ behind Blink), [gc-arena](https://crates.io/crates/gc-arena), [gc](https://crate
 | --- | --- |
 | Machine | Intel Core Ultra 7 356H, 16 cores (1 thread per core), Linux 7.0 |
 | Rust | 1.98.1, release profile |
-| paragc | commit `d063d29` |
+| paragc | 0.2.0 (commit `5c4c5c5`) |
 | cppgc | V8 15.2.124.1 through rusty_v8 (`v8` crate 152.2.0) |
 | Others | gc-arena 0.7.0, gc 0.5.1, dumpster 2.1.0 |
-| Method | every configuration run 5 times in a fresh process, fastest kept; runs started only once the 1-minute load average was below 2.5 (2.2 at the start, 2.4 at the end) |
+| Method | every configuration run 5 times in a fresh process, fastest kept; runs started only once the 1-minute load average was below 2.5 (0.5 at the start, 0.8 at the end) |
 | CPU column | CPU time of the whole process (all threads) over the timed region; CPU ÷ wall is how many threads were actually working |
 
 ## Workloads
@@ -34,7 +34,7 @@ that the live tree still has exactly 2^depth − 1 nodes.
 
 | | Serial | Parallel | Collecting in `gcbench` |
 | --- | --- | --- | --- |
-| **paragc** | `Heap::new(1)` | `Heap::new(n)`: a persistent pool of n − 1 workers | `collect_if_needed` after every tree |
+| **paragc** | `Heap::new(1)` | `Heap::new(n)`: a persistent pool of n − 1 workers | `collect_if_needed` after every tree: young collections with reference counting, a full collection every 16 |
 | **cppgc** | heap attached to an isolate (how Blink uses it), single-threaded platform plus `--single-threaded`; full collections through `request_garbage_collection_for_testing(Full)` | default platform with n worker threads | V8's own scheduling |
 | **cppgc, all flags** | as above | as above, plus `--parallel-marking --concurrent-marking --cppheap-concurrent-marking --cppheap-incremental-marking --concurrent-marking-max-worker-num=n` | V8's own scheduling |
 | **cppgc, detached** | heap not attached to an isolate, `collect_garbage_for_testing` | as above | paragc's trigger policy, by hand |
@@ -50,53 +50,57 @@ Wall ms (CPU ÷ wall); best of 5.
 
 | | 1 thread | 4 threads | 16 threads |
 | --- | ---: | ---: | ---: |
-| **paragc** | 20.7 | 7.8 (3.9) | **3.9** (13.5) |
-| paragc, concurrent marking | 6.7 | 2.4 (2.7) | 1.5 (12.6) |
-| paragc, concurrent sweeping | 13.9 | 5.3 (3.9) | 2.4 (12.3) |
-| **paragc, concurrent marking + sweeping** | **0.03** | **0.03** | **0.06** |
-| cppgc, attached to an isolate | 43.3 | 44.2 (1.0) | 44.4 (1.0) |
-| cppgc, all parallel / concurrent flags | 44.6 | 44.4 (1.0) | 43.8 (1.0) |
-| cppgc, detached heap | 43.2 | 42.7 (1.0) | 44.1 (1.0) |
-| gc-arena | 16.2 | – | – |
-| dumpster | 17.0 | – | – |
-| gc (rust-gc) | 90.0 | – | – |
+| **paragc** | 25.7 | 9.3 (3.8) | **4.3** (13.7) |
+| paragc, concurrent marking | 6.6 | 2.4 (3.3) | 1.5 (13.7) |
+| paragc, concurrent sweeping | 19.2 | 6.7 (4.0) | 3.1 (12.2) |
+| **paragc, concurrent marking + sweeping** | **0.03** | **0.04** | **0.07** |
+| cppgc, attached to an isolate | 45.0 | 44.7 (1.0) | 43.4 (1.0) |
+| cppgc, all parallel / concurrent flags | 43.5 | 43.7 (1.0) | 43.0 (1.0) |
+| cppgc, detached heap | 42.5 | 42.7 (1.0) | 42.5 (1.0) |
+| gc-arena | 15.8 | – | – |
+| dumpster | 16.4 | – | – |
+| gc (rust-gc) | 87.6 | – | – |
 
 ### GCBench: total time
 
 | | 1 thread | 4 threads | 16 threads |
 | --- | ---: | ---: | ---: |
-| **paragc** | **70.1** | **61.1** (1.5) | 70.3 (3.1) |
-| cppgc, attached to an isolate | 120.4 | 97.2 (1.3) | 102.0 (1.3) |
-| cppgc, all parallel / concurrent flags | 117.5 | 91.4 (1.3) | 102.5 (1.4) |
-| cppgc, detached heap | 173.4 | 168.7 (1.0) | 166.0 (1.0) |
-| gc-arena | 116.9 | – | – |
-| dumpster | 112.1 | – | – |
-| gc (rust-gc) | 290.1 | – | – |
+| **paragc** | **51.3** | **55.4** (1.3) | **64.3** (2.2) |
+| cppgc, attached to an isolate | 119.2 | 95.3 (1.3) | 100.4 (1.3) |
+| cppgc, all parallel / concurrent flags | 117.4 | 94.9 (1.3) | 99.4 (1.3) |
+| cppgc, detached heap | 173.2 | 171.7 (1.0) | 173.0 (1.0) |
+| gc-arena | 115.3 | – | – |
+| dumpster | 102.2 | – | – |
+| gc (rust-gc) | 281.7 | – | – |
 
 ### Many mutators: total time
 
 | | 1 thread | 4 threads | 16 threads |
 | --- | ---: | ---: | ---: |
-| **paragc** | **40.8** | **13.9** (3.7) | **10.1** (9.8) |
-| dumpster (`sync`) | 118.9 | 217.3 (3.7) | 240.8 (7.8) |
+| **paragc** | **35.7** | **9.8** (3.7) | **9.2** (8.0) |
+| dumpster (`sync`) | 116.4 | 296.2 (3.9) | 334.3 (13.2) |
 
 cppgc, gc-arena and rust-gc allow one thread per heap, so they have no entry here.
 
 ## Reading the numbers
 
-- **Serial pauses: gc-arena and dumpster are faster.** One collection of the 2M-node heap takes 16–17 ms with them and
-  20.7 ms with paragc on one thread. paragc is ahead from 4 threads on (7.8 ms) and at 16 threads takes 3.9 ms.
-- **Throughput: paragc is ahead even serially.** On one thread GCBench takes 70.1 ms against 112–120 ms for dumpster,
-  gc-arena and cppgc; the many-mutator workload is 40.8 ms against dumpster's 118.9 ms, and dumpster gets slower as
-  threads are added (reference counts shared across threads) while paragc gets faster.
-- **GCBench does not scale past 4 threads.** Its collections are small; waking 16 workers costs more than it saves
-  (16 threads: 3.1× the CPU for a slower result).
-- **Concurrent marking and sweeping take the work out of the pause.** 20.7 ms becomes 0.03 ms on one thread: marking
+- **Throughput: young collections and reference counting.** GCBench on one thread takes 51.3 ms against 102–119 ms
+  for dumpster, gc-arena and cppgc: `collect_if_needed` runs young collections, which trace only new objects, and old
+  garbage is freed by reference counts in the background. The many-mutator workload is 35.7 ms against dumpster's
+  116.4 ms, and dumpster gets slower as threads are added (reference counts shared across threads) while paragc gets
+  faster.
+- **Serial full pauses: gc-arena and dumpster are faster.** One full collection of the 2M-node heap takes about 16 ms
+  with them and 25.7 ms with paragc on one thread. Part of that is the recount: a stop-the-world full collection now adds
+  one atomic increment per edge to rebuild the reference counts (it was 20.7 ms before reference counting). paragc is
+  ahead from 4 threads on (9.3 ms) and takes 4.3 ms on 16.
+- **GCBench does not get faster with threads.** Young collections are small; waking more workers costs more than it
+  saves (16 threads: 2.2× the CPU for a slower result).
+- **Concurrent marking and sweeping take the work out of the pause.** 25.7 ms becomes 0.03 ms on one thread: marking
   and sweeping still happen, on the pool and in mutators that sweep the blocks they take. In this benchmark no mutator
   runs during marking, so the grey queue is empty at the end and the remaining pause is bookkeeping proportional to the
   number of blocks; with mutators running, draining what the write barrier logged is added to it.
 - **cppgc marks a full collection on one thread.** Attached or detached, with or without 16 worker threads and every
-  parallel / concurrent marking flag, a forced full collection runs at CPU ÷ wall = 1.0 and takes about 44 ms. cppgc
+  parallel / concurrent marking flag, a forced full collection runs at CPU ÷ wall = 1.0 and takes about 43–45 ms. cppgc
   only uses other threads for background marking during the incremental collections V8 schedules itself (GCBench, about
   1.3). Measuring its concurrent cycle in `pause` would need driving V8's incremental GC, which this benchmark does not do.
 - **cppgc pays for the Rust ⇄ C++ boundary.** Through rusty_v8 every allocation, every `Member` and every traced edge is
