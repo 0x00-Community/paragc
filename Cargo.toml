@@ -5,6 +5,7 @@ members = [".", "macros"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/Jabberwocky238/paragc"
 
 [workspace.dependencies]
 paragc-macros = { version = "0.1.0", path = "macros" }
@@ -24,6 +25,7 @@ cast_ptr_alignment = "allow"
 name = "paragc"
 description = "A parallel mark-region (Immix-style blocks and lines) garbage collector for Rust: non-moving, lock-free allocation from many threads, parallel marking with work stealing and parallel sweeping"
 readme = "README.md"
+repository.workspace = true
 keywords = ["gc", "garbage-collector", "immix", "parallel"]
 categories = ["memory-management"]
 version.workspace = true
