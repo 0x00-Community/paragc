@@ -7,7 +7,7 @@
 //! 所有队列都空、也没人还在追踪（追踪中的工人没计入空闲），标记结束。偷到了就先减一再干活；
 //! 偷到还没来得及减一时别人可能先看到「全空闲」退出，但手里的活仍由偷到的人做完，结果不受影响。
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_utils::{Backoff, CachePadded};
@@ -67,6 +67,23 @@ impl<'g> Marking<'g> {
         let mut t = Tracer::new(&seed, epoch, None);
         for &root in roots {
             t.visit(root, false);
+        }
+        while let Some(item) = seed.pop() {
+            grey.push(item);
+        }
+    }
+
+    /// 年轻回收：记忆集里的槽（地址）当前指向的对象当作根（年轻的标上、进灰队列；老的碰到就停）。
+    pub(crate) fn seed_slots(grey: &Injector<usize>, slots: &[usize], epoch: u32) {
+        let seed = Worker::new_lifo();
+        let mut t = Tracer::new(&seed, epoch, None);
+        for &slot in slots {
+            let slot = core::ptr::with_exposed_provenance::<AtomicPtr<u8>>(slot);
+            // SAFETY: 槽在写入它的对象里；那个对象被写时可达，到这次回收前不会被释放（见 Mutator::written）
+            let p = unsafe { &*slot }.load(Ordering::Acquire);
+            if !p.is_null() {
+                t.visit(Header::of(p), false);
+            }
         }
         while let Some(item) = seed.pop() {
             grey.push(item);
