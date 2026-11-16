@@ -118,13 +118,66 @@ MIRIFLAGS="-Zmiri-permissive-provenance" cargo +nightly miri test --test gc -- -
 MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-tree-borrows" cargo +nightly miri test --test gc -- --exact <name>
 ```
 
+## 📊 Benchmarks
+
+`benches/` holds one crate per collector (`benches/paragc`, `benches/cppgc`, `benches/gc-arena`, `benches/rust-gc`,
+`benches/dumpster`) in a workspace of its own. `benches/run.sh` runs every configuration 5 times and keeps the fastest;
+the CPU column is the whole process (all threads), so CPU ÷ wall is how many threads were actually busy.
+Intel Core Ultra 7 356H (16 cores), Linux 7.0, Rust 1.98, load average below 3.
+
+**Pause:** one full collection with 2^20 − 1 live and 2^20 − 1 dead binary-tree nodes, wall ms (CPU ÷ wall)
+
+| | 1 thread | 4 threads | 16 threads |
+| --- | ---: | ---: | ---: |
+| **paragc** | 21.9 | 13.0 (3.9) | **9.4** (13.7) |
+| cppgc, attached to an isolate | 43.6 | 44.2 (1.0) | 44.9 (1.0) |
+| cppgc, all parallel / concurrent marking flags | 44.1 | 43.3 (1.0) | 44.2 (1.0) |
+| cppgc, detached heap | 43.5 | 43.7 (1.0) | 43.5 (1.0) |
+| gc-arena | 16.4 | – | – |
+| dumpster | 17.0 | – | – |
+| gc (rust-gc) | 90.2 | – | – |
+
+**GCBench:** Boehm's benchmark (many short-lived trees plus one long-lived tree), each collector on its own schedule, total ms
+
+| | 1 thread | 4 threads | 16 threads |
+| --- | ---: | ---: | ---: |
+| **paragc** | 116.2 | **67.8** (1.8) | 82.5 (4.0) |
+| cppgc, attached to an isolate | 114.9 | 92.2 (1.3) | 102.4 (1.3) |
+| cppgc, all parallel / concurrent marking flags | 114.4 | 97.3 (1.3) | 99.0 (1.4) |
+| cppgc, detached heap | 166.6 | 172.6 (1.0) | 174.6 (1.0) |
+| gc-arena | 117.6 | – | – |
+| dumpster | 103.2 | – | – |
+| gc (rust-gc) | 291.1 | – | – |
+
+**Many mutators:** 2048 depth-10 trees in total, split over N allocating threads, total ms
+
+| | 1 thread | 4 threads | 16 threads |
+| --- | ---: | ---: | ---: |
+| **paragc** | 70.9 | **16.3** (3.6) | 19.5 (8.4) |
+| dumpster (`sync`) | 116.0 | 264.7 (3.9) | 341.1 (12.9) |
+
+Reading these honestly:
+
+- **Single-threaded, paragc is not the fastest.** gc-arena and dumpster pause in 16–17 ms against paragc's 21.9 ms, and
+  dumpster wins GCBench on one thread. paragc pulls ahead once it has threads.
+- **paragc scales poorly past 4 threads.** The 9.4 ms pause at 16 threads burns 129 ms of CPU, and GCBench is slower
+  at 16 threads than at 4: workers are spawned for every collection and idle ones spin. Fixing this is first on the roadmap.
+- **cppgc marks the atomic pause on one thread.** With 16 worker threads and every parallel / concurrent marking flag
+  on, a full collection still runs at CPU ÷ wall = 1.0; cppgc only uses other threads for background marking during
+  incremental collections (GCBench, about 1.3). It is driven through rusty_v8, so every allocation, every `Member` and
+  every traced edge crosses Rust ⇄ C++; attached to an isolate, V8's own (nearly empty) heap adds about 1.3–1.5 ms per
+  full collection.
+- **dumpster is reference counting:** these trees have no cycles, so dead nodes are freed the moment their last
+  reference goes, and its "pause" is really the cost of dropping the tree.
+
 ## 🗺️ Roadmap
 
 0.1 is stop-the-world and non-moving. Next:
 
-1. Concurrent marking: a snapshot-at-the-beginning barrier on `Slot` writes, so mutators no longer wait for marking
-2. Opportunistic evacuation of sparse blocks (Immix defragmentation)
-3. Reference counting for young objects in the style of LXR: dead young objects free their lines at once, tracing
+1. A persistent worker pool with parked (not spinning) idle workers, so scaling holds past 4 threads
+2. Concurrent marking: a snapshot-at-the-beginning barrier on `Slot` writes, so mutators no longer wait for marking
+3. Opportunistic evacuation of sparse blocks (Immix defragmentation)
+4. Reference counting for young objects in the style of LXR: dead young objects free their lines at once, tracing
    handles cycles and old objects
 
 ## 📜 License
