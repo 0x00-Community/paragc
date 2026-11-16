@@ -1,8 +1,7 @@
 //! gc（rust-gc）：线程局部堆、按分配量自动回收，只有串行；线程数参数必须是 1。
 #![allow(non_local_definitions, reason = "gc 0.5 的 derive 宏生成的写法，不是本仓库的代码")]
-use std::time::{Duration, Instant};
 
-use bench_common::{Args, Bench, GcBench, LONG_LIVED_DEPTH, PAUSE_DEPTH, STRETCH_DEPTH, Tree};
+use bench_common::{Args, Bench, Clock, Took, GcBench, LONG_LIVED_DEPTH, PAUSE_DEPTH, STRETCH_DEPTH, Tree};
 use gc::{Finalize, Gc, Trace, force_collect};
 
 #[derive(Trace, Finalize)]
@@ -35,18 +34,18 @@ impl RustGc {
 impl Bench for RustGc {
     const NAME: &str = "rust-gc";
 
-    fn pause(&self) -> Option<Duration> {
+    fn pause(&self) -> Option<Took> {
         let live = Self::tree(PAUSE_DEPTH);
         drop(Self::tree(PAUSE_DEPTH));
-        let start = Instant::now();
+        let start = Clock::start();
         force_collect();
-        let took = start.elapsed();
+        let took = start.stop();
         assert_eq!(Self::count(&live), Tree::size(PAUSE_DEPTH));
         Some(took)
     }
 
-    fn gcbench(&self) -> Option<Duration> {
-        let start = Instant::now();
+    fn gcbench(&self) -> Option<Took> {
+        let start = Clock::start();
         drop(Self::tree(STRETCH_DEPTH));
         let long = Self::tree(LONG_LIVED_DEPTH);
         for (depth, iters) in GcBench::rounds() {
@@ -54,7 +53,7 @@ impl Bench for RustGc {
                 drop(Self::tree(depth));
             }
         }
-        let took = start.elapsed();
+        let took = start.stop();
         assert_eq!(Self::count(&long), Tree::size(LONG_LIVED_DEPTH));
         Some(took)
     }

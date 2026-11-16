@@ -2,9 +2,8 @@
 //! alloc-mt 用线程安全的 sync，线程数是 mutator 线程数。
 //! 树里没有环，死对象在最后一个引用析构时就释放了，pause 量的是「扔掉垃圾树 + collect」。
 use std::num::NonZeroUsize;
-use std::time::{Duration, Instant};
 
-use bench_common::{Args, Bench, GcBench, LONG_LIVED_DEPTH, MT_DEPTH, MT_ROUNDS, MT_TREES, PAUSE_DEPTH, STRETCH_DEPTH, Tree};
+use bench_common::{Args, Bench, Clock, Took, GcBench, LONG_LIVED_DEPTH, MT_DEPTH, MT_ROUNDS, MT_TREES, PAUSE_DEPTH, STRETCH_DEPTH, Tree};
 use dumpster::Trace;
 
 #[derive(Trace)]
@@ -62,25 +61,25 @@ impl Dumpster {
 impl Bench for Dumpster {
     const NAME: &str = "dumpster";
 
-    fn pause(&self) -> Option<Duration> {
+    fn pause(&self) -> Option<Took> {
         if self.threads.get() != 1 {
             return None;
         }
         let live = Self::tree(PAUSE_DEPTH);
         let garbage = Self::tree(PAUSE_DEPTH);
-        let start = Instant::now();
+        let start = Clock::start();
         drop(garbage);
         dumpster::unsync::collect();
-        let took = start.elapsed();
+        let took = start.stop();
         assert_eq!(Self::count(&live), Tree::size(PAUSE_DEPTH));
         Some(took)
     }
 
-    fn gcbench(&self) -> Option<Duration> {
+    fn gcbench(&self) -> Option<Took> {
         if self.threads.get() != 1 {
             return None;
         }
-        let start = Instant::now();
+        let start = Clock::start();
         drop(Self::tree(STRETCH_DEPTH));
         let long = Self::tree(LONG_LIVED_DEPTH);
         for (depth, iters) in GcBench::rounds() {
@@ -88,15 +87,15 @@ impl Bench for Dumpster {
                 drop(Self::tree(depth));
             }
         }
-        let took = start.elapsed();
+        let took = start.stop();
         assert_eq!(Self::count(&long), Tree::size(LONG_LIVED_DEPTH));
         Some(took)
     }
 
-    fn alloc_mt(&self) -> Option<Duration> {
+    fn alloc_mt(&self) -> Option<Took> {
         let long = Self::sync_tree(LONG_LIVED_DEPTH);
         let per_thread = MT_TREES / (MT_ROUNDS * self.threads.get());
-        let start = Instant::now();
+        let start = Clock::start();
         for _ in 0..MT_ROUNDS {
             std::thread::scope(|s| {
                 for _ in 0..self.threads.get() {
@@ -108,7 +107,7 @@ impl Bench for Dumpster {
                 }
             });
         }
-        let took = start.elapsed();
+        let took = start.stop();
         assert_eq!(Self::sync_count(&long), Tree::size(LONG_LIVED_DEPTH));
         Some(took)
     }

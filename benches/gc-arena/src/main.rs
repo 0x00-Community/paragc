@@ -1,7 +1,6 @@
 //! gc-arena：单线程、增量标记，只有串行；线程数参数必须是 1。
-use std::time::{Duration, Instant};
 
-use bench_common::{Args, Bench, GcBench, LONG_LIVED_DEPTH, PAUSE_DEPTH, STRETCH_DEPTH, Tree};
+use bench_common::{Args, Bench, Clock, Took, GcBench, LONG_LIVED_DEPTH, PAUSE_DEPTH, STRETCH_DEPTH, Tree};
 use gc_arena::{Arena, Collect, Gc, Mutation, Rootable};
 
 #[derive(Collect)]
@@ -45,21 +44,21 @@ impl GcArena {
 impl Bench for GcArena {
     const NAME: &str = "gc-arena";
 
-    fn pause(&self) -> Option<Duration> {
+    fn pause(&self) -> Option<Took> {
         let mut heap = Heap::new(|_| Roots { live: None });
         heap.mutate_root(|mc, roots| roots.live = Some(Self::tree(mc, PAUSE_DEPTH)));
         heap.mutate(|mc, _| {
             Self::tree(mc, PAUSE_DEPTH);
         });
-        let start = Instant::now();
+        let start = Clock::start();
         heap.finish_cycle();
-        let took = start.elapsed();
+        let took = start.stop();
         assert_eq!(Self::count(&heap), Tree::size(PAUSE_DEPTH));
         Some(took)
     }
 
-    fn gcbench(&self) -> Option<Duration> {
-        let start = Instant::now();
+    fn gcbench(&self) -> Option<Took> {
+        let start = Clock::start();
         let mut heap = Heap::new(|_| Roots { live: None });
         heap.mutate(|mc, _| {
             Self::tree(mc, STRETCH_DEPTH);
@@ -74,7 +73,7 @@ impl Bench for GcArena {
                 heap.collect_debt();
             }
         }
-        let took = start.elapsed();
+        let took = start.stop();
         assert_eq!(Self::count(&heap), Tree::size(LONG_LIVED_DEPTH));
         Some(took)
     }

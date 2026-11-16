@@ -1,8 +1,7 @@
 //! paragc：pause / gcbench 的线程数是回收线程数；alloc-mt 是 mutator 线程数（回收线程同数）。
 use std::num::NonZeroUsize;
-use std::time::{Duration, Instant};
 
-use bench_common::{Args, Bench, GcBench, LONG_LIVED_DEPTH, MT_DEPTH, MT_ROUNDS, MT_TREES, PAUSE_DEPTH, STRETCH_DEPTH, Tree};
+use bench_common::{Args, Bench, Clock, Took, GcBench, LONG_LIVED_DEPTH, MT_DEPTH, MT_ROUNDS, MT_TREES, PAUSE_DEPTH, STRETCH_DEPTH, Tree};
 use paragc::{Gc, Heap, Mutator, Root, Tlab, Trace, brand};
 
 #[derive(Trace)]
@@ -45,21 +44,21 @@ impl Paragc {
 impl Bench for Paragc {
     const NAME: &str = "paragc";
 
-    fn pause(&self) -> Option<Duration> {
+    fn pause(&self) -> Option<Took> {
         let mut heap = Heap::new(self.threads);
         let live = Self::rooted(&heap, PAUSE_DEPTH);
         heap.mutate(|m| {
             Self::tree(m, PAUSE_DEPTH);
         });
-        let start = Instant::now();
+        let start = Clock::start();
         heap.collect();
-        let took = start.elapsed();
+        let took = start.stop();
         assert_eq!(Self::count(&heap, &live), Tree::size(PAUSE_DEPTH));
         Some(took)
     }
 
-    fn gcbench(&self) -> Option<Duration> {
-        let start = Instant::now();
+    fn gcbench(&self) -> Option<Took> {
+        let start = Clock::start();
         let mut heap = Heap::new(self.threads);
         heap.mutate(|m| {
             Self::tree(m, STRETCH_DEPTH);
@@ -74,16 +73,16 @@ impl Bench for Paragc {
                 heap.collect_if_needed();
             }
         }
-        let took = start.elapsed();
+        let took = start.stop();
         assert_eq!(Self::count(&heap, &long), Tree::size(LONG_LIVED_DEPTH));
         Some(took)
     }
 
-    fn alloc_mt(&self) -> Option<Duration> {
+    fn alloc_mt(&self) -> Option<Took> {
         let mut heap = Heap::new(self.threads);
         let long = Self::rooted(&heap, LONG_LIVED_DEPTH);
         let per_thread = MT_TREES / (MT_ROUNDS * self.threads.get());
-        let start = Instant::now();
+        let start = Clock::start();
         for _ in 0..MT_ROUNDS {
             std::thread::scope(|s| {
                 let heap = &heap;
@@ -100,7 +99,7 @@ impl Bench for Paragc {
             });
             heap.collect_if_needed();
         }
-        let took = start.elapsed();
+        let took = start.stop();
         assert_eq!(Self::count(&heap, &long), Tree::size(LONG_LIVED_DEPTH));
         Some(took)
     }

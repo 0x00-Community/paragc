@@ -1,11 +1,11 @@
 //! 各回收器共用的工作负载定义与计时报告。
 //!
-//! 每个回收器一个可执行文件：`bench-<名字> <工作负载> <线程数>`，打印一行 `名字\t工作负载\t线程数\t毫秒`。
+//! 每个回收器一个可执行文件：`bench-<名字> <工作负载> <线程数>`，打印一行 `名字\t工作负载\t线程数\t墙钟毫秒\tCPU 毫秒`。
 //! 线程数：pause / gcbench 是回收线程数，alloc-mt 是 mutator 线程数（回收线程同数）。
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 停顿：活着的满二叉树层数（另造同样大的一棵垃圾）
 pub const PAUSE_DEPTH: u32 = 20;
@@ -74,13 +74,45 @@ impl fmt::Display for Workload {
     }
 }
 
+/// 一次计时：墙钟时间与整个进程（全部线程）的 CPU 时间。CPU ÷ 墙钟 ≈ 平均有几个线程在干活。
+#[derive(Clone, Copy)]
+pub struct Took {
+    pub wall: Duration,
+    pub cpu: Duration,
+}
+
+/// 计时起点。
+pub struct Clock {
+    wall: Instant,
+    cpu: Duration,
+}
+
+impl Clock {
+    pub fn start() -> Self {
+        Self { wall: Instant::now(), cpu: Self::process_cpu() }
+    }
+
+    pub fn stop(&self) -> Took {
+        Took { wall: self.wall.elapsed(), cpu: Self::process_cpu().saturating_sub(self.cpu) }
+    }
+
+    /// 整个进程到目前为止用掉的 CPU 时间（全部线程之和）。
+    fn process_cpu() -> Duration {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: ts 是有效的输出位置
+        let ok = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &raw mut ts) } == 0;
+        assert!(ok, "clock_gettime(CLOCK_PROCESS_CPUTIME_ID) 失败");
+        Duration::new(u64::try_from(ts.tv_sec).unwrap_or(0), u32::try_from(ts.tv_nsec).unwrap_or(0))
+    }
+}
+
 /// 一个回收器的三项基准；不支持的返回 None。
 pub trait Bench {
     const NAME: &str;
 
-    fn pause(&self) -> Option<Duration>;
-    fn gcbench(&self) -> Option<Duration>;
-    fn alloc_mt(&self) -> Option<Duration> {
+    fn pause(&self) -> Option<Took>;
+    fn gcbench(&self) -> Option<Took>;
+    fn alloc_mt(&self) -> Option<Took> {
         None
     }
 }
@@ -108,7 +140,7 @@ impl Args {
             Workload::AllocMt => bench.alloc_mt(),
         };
         match took {
-            Some(d) => println!("{}\t{}\t{}\t{:.2}", B::NAME, self.workload, self.threads, d.as_secs_f64() * 1e3),
+            Some(t) => println!("{}\t{}\t{}\t{:.2}\t{:.2}", B::NAME, self.workload, self.threads, t.wall.as_secs_f64() * 1e3, t.cpu.as_secs_f64() * 1e3),
             None => {
                 eprintln!("{} 不支持 {}", B::NAME, self.workload);
                 std::process::exit(2);

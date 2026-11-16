@@ -12,9 +12,8 @@
 use std::ffi::CStr;
 use std::num::NonZeroUsize;
 use std::str::FromStr;
-use std::time::{Duration, Instant};
 
-use bench_common::{Args, Bench, GcBench, LONG_LIVED_DEPTH, PAUSE_DEPTH, STRETCH_DEPTH, Tree};
+use bench_common::{Args, Bench, Clock, Took, GcBench, LONG_LIVED_DEPTH, PAUSE_DEPTH, STRETCH_DEPTH, Tree};
 use v8::cppgc::{EmbedderStackState, GarbageCollected, Heap, HeapCreateParams, Member, Persistent, UnsafePtr, Visitor, make_garbage_collected};
 use v8::{GarbageCollectionType, SharedRef, UniqueRef};
 
@@ -136,29 +135,29 @@ impl Attached {
 impl Bench for Attached {
     const NAME: &str = "cppgc";
 
-    fn pause(&self) -> Option<Duration> {
+    fn pause(&self) -> Option<Took> {
         let (mut isolate, heap) = self.isolate();
         // SAFETY: 堆归 isolate 所有，isolate 活到函数末尾
         let heap = unsafe { &*heap };
         // 基线：cppgc 堆是空的时候一次完整 GC 的耗时（V8 自己那一份），打到 stderr 供对照
-        let start = Instant::now();
+        let start = Clock::start();
         isolate.request_garbage_collection_for_testing(GarbageCollectionType::Full);
-        eprintln!("cppgc 空堆完整 GC 基线 {:.2} ms", start.elapsed().as_secs_f64() * 1e3);
+        eprintln!("cppgc 空堆完整 GC 基线 {:.2} ms", start.stop().wall.as_secs_f64() * 1e3);
         let live = Persistent::new(&V8::tree(heap, PAUSE_DEPTH));
         V8::tree(heap, PAUSE_DEPTH);
-        let start = Instant::now();
+        let start = Clock::start();
         isolate.request_garbage_collection_for_testing(GarbageCollectionType::Full);
-        let took = start.elapsed();
+        let took = start.stop();
         assert_eq!(V8::count(&live), Tree::size(PAUSE_DEPTH));
         drop(live);
         Some(took)
     }
 
-    fn gcbench(&self) -> Option<Duration> {
+    fn gcbench(&self) -> Option<Took> {
         let (isolate, heap) = self.isolate();
         // SAFETY: 同上
         let heap = unsafe { &*heap };
-        let start = Instant::now();
+        let start = Clock::start();
         V8::tree(heap, STRETCH_DEPTH);
         let long = Persistent::new(&V8::tree(heap, LONG_LIVED_DEPTH));
         for (depth, iters) in GcBench::rounds() {
@@ -166,7 +165,7 @@ impl Bench for Attached {
                 V8::tree(heap, depth);
             }
         }
-        let took = start.elapsed();
+        let took = start.stop();
         assert_eq!(V8::count(&long), Tree::size(LONG_LIVED_DEPTH));
         drop(long);
         drop(isolate);
@@ -210,21 +209,21 @@ impl Trigger {
 impl Bench for Detached {
     const NAME: &str = "cppgc-detached";
 
-    fn pause(&self) -> Option<Duration> {
+    fn pause(&self) -> Option<Took> {
         let heap = self.heap();
         let live = Persistent::new(&V8::tree(&heap, PAUSE_DEPTH));
         V8::tree(&heap, PAUSE_DEPTH);
-        let start = Instant::now();
+        let start = Clock::start();
         Self::collect(&heap);
-        let took = start.elapsed();
+        let took = start.stop();
         assert_eq!(V8::count(&live), Tree::size(PAUSE_DEPTH));
         drop(live);
         Some(took)
     }
 
-    fn gcbench(&self) -> Option<Duration> {
+    fn gcbench(&self) -> Option<Took> {
         let heap = self.heap();
-        let start = Instant::now();
+        let start = Clock::start();
         let mut trigger = Trigger::default();
         V8::tree(&heap, STRETCH_DEPTH);
         trigger.allocated(&heap, Tree::size(STRETCH_DEPTH));
@@ -236,7 +235,7 @@ impl Bench for Detached {
                 trigger.allocated(&heap, Tree::size(depth));
             }
         }
-        let took = start.elapsed();
+        let took = start.stop();
         assert_eq!(V8::count(&long), Tree::size(LONG_LIVED_DEPTH));
         drop(long);
         Some(took)
