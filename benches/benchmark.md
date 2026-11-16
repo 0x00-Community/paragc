@@ -12,7 +12,7 @@ behind Blink), [gc-arena](https://crates.io/crates/gc-arena), [gc](https://crate
 | --- | --- |
 | Machine | Intel Core Ultra 7 356H, 16 cores (1 thread per core), Linux 7.0 |
 | Rust | 1.98.1, release profile |
-| paragc | commit `bb6c81c` (after 0.2.0: concurrent recount, cheaper single-threaded recount); the other collectors were measured with `5c4c5c5` |
+| paragc | 0.2.1 (commit `bb6c81c`: concurrent recount, cheaper single-threaded recount); the other collectors were measured with `5c4c5c5` |
 | cppgc | V8 15.2.124.1 through rusty_v8 (`v8` crate 152.2.0) |
 | Others | gc-arena 0.7.0, gc 0.5.1, dumpster 2.1.0 |
 | Method | every configuration run 5 times in a fresh process, fastest kept; runs started only once the 1-minute load average was below 2.5 (0.5 at the start, 0.8 at the end) |

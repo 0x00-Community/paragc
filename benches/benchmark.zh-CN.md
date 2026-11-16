@@ -12,7 +12,7 @@ paragc 与 [cppgc](https://chromium.googlesource.com/v8/v8/+/main/include/cppgc/
 | --- | --- |
 | 机器 | Intel Core Ultra 7 356H，16 核（每核 1 线程），Linux 7.0 |
 | Rust | 1.98.1，release |
-| paragc | 提交 `bb6c81c`（0.2.0 之后：并发重新计数、单线程重新计数更便宜）；其他回收器是 `5c4c5c5` 时量的 |
+| paragc | 0.2.1（提交 `bb6c81c`：并发重新计数、单线程重新计数更便宜）；其他回收器是 `5c4c5c5` 时量的 |
 | cppgc | V8 15.2.124.1，经 rusty_v8（`v8` crate 152.2.0） |
 | 其他 | gc-arena 0.7.0、gc 0.5.1、dumpster 2.1.0 |
 | 方法 | 每个配置在新进程里跑 5 次取最快；1 分钟负载低于 2.5 才开始（开始 0.5、结束 0.8） |
