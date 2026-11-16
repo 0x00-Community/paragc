@@ -8,6 +8,7 @@ mod header;
 mod heap;
 mod layout;
 mod mark;
+mod release;
 mod roots;
 mod sweep;
 mod trace;

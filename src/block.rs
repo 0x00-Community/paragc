@@ -89,10 +89,14 @@ impl Block {
         self.meta().starts[g / BITS].fetch_and(!(1 << (g % BITS)), Ordering::Relaxed);
     }
 
-    /// 按剩下的对象起点重算行标记（引用计数释放过对象的块）：每个还在的对象占的行标成 `epoch`，其余行空出来。
-    /// 记下存活字节数；返回是否有空行。SAFETY（调用方）：没有 mutator（独占堆），块里剩下的对象都活着。
+    /// 按还在的老对象（标记纪元 = `epoch`）重算行标记（引用计数释放过对象的块）：它们占的行标成 `epoch`，其余行空出来；
+    /// 年轻对象的行不标（同一次停顿里年轻追踪会给活下来的标上，死掉的由清扫收）。
+    /// 块上次清扫后被拿去分配过（里面可能有还没扫的死年轻对象）：保留这个状态、返回 false，交给年轻清扫分类；
+    /// 否则记下存活字节数，返回是否有空行（可以直接放回可用队列）。
+    /// SAFETY（调用方）：没有 mutator（独占堆），起点位标着的对象都还没析构。
     pub(crate) unsafe fn recompute_lines(self, epoch: u32) -> bool {
         let meta = self.meta();
+        let reused = meta.live.load(Ordering::Relaxed) == REUSED;
         for line in &meta.lines {
             line.store(0, Ordering::Relaxed);
         }
@@ -103,11 +107,16 @@ impl Block {
                 let bit = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
                 let p = self.base().wrapping_add((w * BITS + bit) * GRANULE);
-                // SAFETY: 起点位标着的地方是活对象
-                let bytes = unsafe { &*p.cast::<Header>() }.bytes();
-                self.mark_lines(p, bytes, epoch);
-                live += bytes;
+                // SAFETY: 起点位标着的地方是还没析构的对象
+                let h = unsafe { &*p.cast::<Header>() };
+                if h.is_marked(epoch) {
+                    self.mark_lines(p, h.bytes(), epoch);
+                    live += h.bytes();
+                }
             }
+        }
+        if reused {
+            return false;
         }
         meta.live.store(u32::try_from(live).unwrap_or(REUSED - 1), Ordering::Relaxed);
         meta.lines[Self::FIRST_LINE..].iter().any(|l| l.load(Ordering::Relaxed) != epoch)

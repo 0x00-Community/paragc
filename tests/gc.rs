@@ -1032,3 +1032,49 @@ fn reference_counting_leaves_cycles_to_tracing() {
     assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed) - before, PAIRS * 4, "完整回收应收掉环");
     drop(root);
 }
+
+/// 引用计数的减量移出停顿、在后台与 mutator 并发处理：
+/// 老链整体扔掉后 `finish_young`（停顿）返回时还一个都没析构；之后 mutator 照常挪 / 新建 / 扔，另一个线程同时
+/// `sweep_concurrently` 连锁释放——不析构还挂着的节点、链上计数恰好；下一次停顿重算行，空出的行被复用（块数不涨）。
+#[test]
+fn background_release_while_mutating() {
+    const CHAIN: usize = if cfg!(miri) { 60 } else { 20_000 };
+    let moves = Moves::default();
+    let mut heap = Heap::new(THREADS);
+    let board = board(&heap);
+    let spare: Root<BoardB> = heap.mutate(|m| m.root(m.alloc(Board { cells: vec![Slot::default()] })));
+    // 一条长的老链挂在另一个板子上，完整回收后计数可信
+    heap.mutate(|m| {
+        let cell = &m.get(&spare).cells[0];
+        for _ in 0..CHAIN {
+            Moves::push(m, cell, m.alloc(Link { next: Slot::default(), tag: moves.ledger.tag() }));
+        }
+    });
+    heap.collect();
+    // 整条扔掉：只改了板子上的一个槽
+    heap.mutate(|m| m.get(&spare).cells[0].set(m, None));
+    moves.discarded.fetch_add(CHAIN, Ordering::Relaxed);
+    let before = moves.ledger.dropped.load(Ordering::Relaxed);
+    heap.finish_young();
+    assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed), before, "停顿里不该做减量");
+    // mutator 跑着，后台连锁释放
+    moves.round(&heap, &board, 0, Heap::sweep_concurrently);
+    assert!(moves.ledger.dropped.load(Ordering::Relaxed) - before >= CHAIN, "后台没把扔掉的链释放完");
+    moves.check(&heap, &board, 0);
+    // 下一次停顿重算行；再分配同样多的节点，空出的行被复用（块数基本不涨）
+    heap.collect_young();
+    let blocks_after_release = heap.stats().blocks;
+    heap.mutate(|m| {
+        let cell = &m.get(&spare).cells[0];
+        for _ in 0..CHAIN {
+            Moves::push(m, cell, m.alloc(Link { next: Slot::default(), tag: moves.ledger.tag() }));
+        }
+    });
+    heap.collect_young();
+    let slack = 16;
+    assert!(heap.stats().blocks <= blocks_after_release + slack, "释放的行没被复用：{} ⇒ {}", blocks_after_release, heap.stats().blocks);
+    drop(spare);
+    heap.collect();
+    moves.discarded.fetch_add(CHAIN, Ordering::Relaxed);
+    moves.finish(heap, board);
+}

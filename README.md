@@ -39,7 +39,7 @@ collection marks and sweeps on every core.
 | 🏷️ **Branded handles** | `Gc<'gc, T>` cannot escape the `mutate` closure. `Root<B>` handles carry no lifetime and can be stored anywhere and sent across threads. |
 | 📦 **Opportunistic evacuation** | A stop-the-world collection moves the live objects out of sparse blocks while it marks (Immix defragmentation): one pass marks, copies and rewrites every edge. Concurrent marking never moves anything, so mutators need no read barrier. |
 | 🐣 **Young collections** | `Heap::collect_young` traces only objects allocated since the last collection, starting from the roots and the slots the write barrier logged, and sweeps only the blocks allocated into since; old objects are not touched. `collect_if_needed` runs young collections and a full one every few rounds (the first stage of LXR-style young-object reclamation). |
-| 🔢 **Reference counting** | Old objects carry a small reference count, maintained by the `Slot` write barrier (each slot logged once per round) and settled at young collections: objects whose count drops to zero are freed right there, cascading, without tracing; their lines go back to the allocator. Cycles and objects with overflowing counts are left to tracing (LXR stage two). |
+| 🔢 **Reference counting** | Old objects carry a small reference count, maintained by the `Slot` write barrier (each slot logged once per round) and settled at young collections. The pause only applies increments and queues the decrements; `sweep_concurrently` frees objects whose count drops to zero on the pool, cascading, while mutators run, and their lines return to the allocator at the next pause. Tracing (a full collection) runs rarely, for cycles and objects whose count overflowed (LXR stages two and three). |
 | 🛡️ **Checked at compile time** | `#[derive(Trace)]` rejects `Drop` on traced types, and object data aligned above 8 bytes is a compile error. |
 
 ## 🚀 Usage
@@ -95,6 +95,7 @@ assert_eq!(sum, 999 * 1000 / 2);
 | Evacuation | Only in a stop-the-world `finish_marking` (no concurrent marking in progress). Candidates: blocks that have not been allocated into since they were swept and hold less than a quarter of a block of live data; at least 4, at most 1024. The other swept blocks become copy targets. While marking, the first worker to reach an object in a candidate block claims it (mark word: copying), copies it into its own copy buffer (the new copy is marked, with start bit and line marks) and leaves a forwarding address in the old header; others wait or take the new address. Every edge is rewritten through `Trace::relocate`; root slots with a CAS, so a handle dropped on another thread meanwhile stays dropped. Sweeping clears the old copies' start bits without running their destructors. |
 | Young collections | Sticky mark bits: objects marked with the last finished epoch are old, new objects start at 0 and are young. A young collection marks with that same epoch, so an old object stops the trace and a reached young object is promoted. Old → young edges can only come from `Slot` writes, so outside concurrent marking the barrier logs the slot whenever the value written is young; during concurrent marking every new object is black and survives as old, so nothing is logged. Only blocks allocated into since their last sweep are swept; the log is cleared by every collection. |
 | Reference counting | RC(x) = edges to x from old objects; edges from a young object are counted when it is promoted. The count lives in the header next to the size (6 bits, sticky when full, plus a parity bit: a stop-the-world full collection flips it and recounts every edge exactly while it marks). A `Slot` remembers the value it last counted; an old object's slot is logged on its first write in a round, and a young collection settles it (new value +1, last counted −1), adds 1 for each current root and takes 1 off the previous round's roots (deferred root counting). Decrements run after all increments; an old object reaching zero has its edges decremented, is finalized and its start bit cleared, and the lines of affected blocks are recomputed. Concurrent marking allocates black objects whose edges are never scanned, so counts are not trusted (nothing is freed by count) from its start until the next recount. |
+| Background release | `finish_young` (the pause) settles increments and pushes decrements onto a queue; `collect_young` = `finish_young` + `sweep_concurrently`. Workers pop a decrement; whoever brings a count to zero finalizes the object, clears its start bit, queues decrements for its edges and records the block as dirty. Objects at zero have no counted references, and every root and promoted young object was counted, so mutators cannot reach them. Dirty blocks get their lines recomputed from the old objects left at the start of the next pause; a block allocated into since its last sweep keeps that status and is left to the young sweep (it may hold unswept dead young objects). Every collection first finishes pending decrements, before a recount could flip the parity under them. `collect_if_needed` runs a full collection every 16 young ones while counts are trusted, every 4 otherwise. |
 
 Work-stealing deques and backoff come from [crossbeam](https://github.com/crossbeam-rs/crossbeam) (`crossbeam-deque`,
 `crossbeam-utils`); the append-only segmented vector and the block stock come from
@@ -132,6 +133,7 @@ Work-stealing deques and backoff come from [crossbeam](https://github.com/crossb
 | `evacuation_with_shared_children` | Many parents share a few children (one `Slot` and one plain field each), so several workers race to claim the same child; both edges of every parent end up at the same new copy, nothing is finalized twice |
 | `young_collection_frees_only_young_garbage` | Young objects hung off an old object's slot, off an old node and under another young node survive; a young collection finalizes exactly the discarded young objects (by tracing) and the discarded old ones (by reference count) |
 | `young_collections_while_relinking` | Mutators moving nodes between old and young objects, with young collections, concurrent marking finished by a young collection, and full collections in turn; counts exact every round |
+| `background_release_while_mutating` | An old chain dropped at once: `finish_young` returns with nothing freed yet; the cascade then runs on the pool while mutators keep relinking, freeing nothing still linked; at the next pause the freed lines are reused |
 | `reference_counting_leaves_cycles_to_tracing` | Chains of old objects dropped at once are freed by their counts at a young collection (a 500-deep cascade); two-node rings stay until a full collection |
 
 All of them also run under Miri with both Stacked Borrows and Tree Borrows (scaled down under `cfg(miri)`).
@@ -166,10 +168,13 @@ collection marks on one thread even with every parallel flag on, and pays an FFI
 ## 🗺️ Roadmap
 
 Done: parallel stop-the-world collection, a persistent pool, concurrent marking, concurrent and lazy sweeping,
-opportunistic evacuation, young collections, reference counting for old objects. Next, the rest of LXR:
+opportunistic evacuation, young collections, reference counting for old objects with decrements processed concurrently,
+and full tracing run only every 16 young collections while counts are trusted. Still open:
 
-1. Tracing only for cycles and for objects whose count overflowed, run concurrently and rarely; decrements processed
-   lazily on the pool instead of in the pause
+1. A concurrent full collection that also recounts (today a concurrent mark leaves counts untrusted until the next
+   stop-the-world full collection, because black-allocated objects are never scanned)
+2. Cheaper recounting: a stop-the-world full collection now pays an atomic increment per edge (the 1-thread pause in the
+   benchmark grew from about 21 ms to about 26 ms)
 
 ## 📜 License
 

@@ -22,8 +22,10 @@ pub(crate) const UNITS_PER_WORKER: usize = 8;
 pub(crate) const MIN_TRIGGER: usize = 4 * 1024 * 1024;
 /// 触发回收的倍数：新领用的字节数超过「上次存活字节 × 它」就回收
 pub(crate) const GROWTH: usize = 2;
-/// collect_if_needed：每这么多次年轻回收穿插一次完整回收（收掉死掉的老对象）
+/// collect_if_needed：引用计数不可信时，每这么多次年轻回收穿插一次完整回收（收掉死掉的老对象、重新计数）
 pub(crate) const YOUNG_PER_FULL: usize = 4;
+/// collect_if_needed：引用计数可信时（死掉的老对象由计数收），每这么多次年轻回收才一次完整回收（收环与计数粘住的）
+pub(crate) const YOUNG_PER_FULL_RC: usize = 16;
 /// 疏散候选：上次清扫后存活不到这么多字节的块（块的 1/4）
 pub(crate) const EVACUATE_LIVE: usize = BLOCK / 4;
 /// 疏散候选至少这么多个才值得疏散
