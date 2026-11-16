@@ -11,7 +11,17 @@ use crate::Trace;
 use crate::layout::GRANULE;
 use crate::trace::Tracer;
 
-/// 头里 `granules` 的最高位：大对象（单独分配，不在块里）
+/// 头里 `info` 的布局：低 [`SIZE_BITS`] 位是粒度数，往上 [`RC_BITS`] 位是引用计数，再往上一位是计数的奇偶，最高位是大对象
+const SIZE_BITS: u32 = 24;
+const SIZE_MASK: u32 = (1 << SIZE_BITS) - 1;
+const RC_BITS: u32 = 6;
+const RC_SHIFT: u32 = SIZE_BITS;
+/// 引用计数的上限：到了就粘住（不再加减），留给追踪回收
+const RC_MAX: u32 = (1 << RC_BITS) - 1;
+const RC_MASK: u32 = RC_MAX << RC_SHIFT;
+/// 计数属于哪一「代」：完整回收重新计数时翻转，旧计数一次性作废
+const PARITY_BIT: u32 = 1 << (RC_SHIFT + RC_BITS);
+/// 大对象（单独分配，不在块里）
 const LARGE_BIT: u32 = 1 << 31;
 /// 标记字：已搬走，新地址在 `drop` 那个字里
 const FORWARDED: u32 = 1 << 31;
@@ -28,8 +38,8 @@ pub(crate) struct Header {
     drop: Option<unsafe fn(*mut u8)>,
     /// 最后一次被标记时的纪元，或 BUSY / FORWARDED
     mark: AtomicU32,
-    /// 对象占的粒度数（含头），最高位是 [`LARGE_BIT`]
-    granules: u32,
+    /// 粒度数（含头）、引用计数、计数奇偶、大对象位（见 [`SIZE_BITS`] 等）
+    info: AtomicU32,
 }
 
 /// 头的字节数；对象数据紧跟在后面
@@ -50,12 +60,12 @@ impl Header {
     /// `mark`：初始标记纪元。
     pub(crate) fn new<T: Trace>(bytes: usize, large: bool, mark: u32) -> Self {
         let granules = u32::try_from(bytes / GRANULE).expect("对象太大");
-        assert!(granules & LARGE_BIT == 0, "对象太大");
+        assert!(granules <= SIZE_MASK, "对象太大（单个对象至多 128 MiB）");
         Self {
             visit: Self::visit_as::<T>,
             drop: needs_drop::<T>().then_some(Self::drop_as::<T> as unsafe fn(*mut u8)),
             mark: AtomicU32::new(mark),
-            granules: granules | if large { LARGE_BIT } else { 0 },
+            info: AtomicU32::new(granules | if large { LARGE_BIT } else { 0 }),
         }
     }
 
@@ -87,11 +97,11 @@ impl Header {
     }
 
     pub(crate) fn bytes(&self) -> usize {
-        (self.granules & !LARGE_BIT) as usize * GRANULE
+        (self.info.load(Ordering::Relaxed) & SIZE_MASK) as usize * GRANULE
     }
 
     pub(crate) fn is_large(&self) -> bool {
-        self.granules & LARGE_BIT != 0
+        self.info.load(Ordering::Relaxed) & LARGE_BIT != 0
     }
 
     /// 这一轮第一次标记它时返回 true（只有一个线程会拿到 true）。
@@ -101,6 +111,43 @@ impl Header {
 
     pub(crate) fn is_marked(&self, epoch: u32) -> bool {
         self.mark.load(Ordering::Acquire) == epoch
+    }
+
+    /// 引用计数加一（`parity` 是当前计数的奇偶：对不上说明是上一代的旧计数，从 1 起算）。粘住了就不变。
+    pub(crate) fn rc_inc(&self, parity: bool) {
+        let parity = if parity { PARITY_BIT } else { 0 };
+        let mut word = self.info.load(Ordering::Relaxed);
+        loop {
+            let rc = if word & PARITY_BIT == parity { (word & RC_MASK) >> RC_SHIFT } else { 0 };
+            if rc == RC_MAX {
+                return;
+            }
+            let new = (word & !(RC_MASK | PARITY_BIT)) | parity | ((rc + 1) << RC_SHIFT);
+            match self.info.compare_exchange_weak(word, new, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return,
+                Err(now) => word = now,
+            }
+        }
+    }
+
+    /// 引用计数减一；减到 0 返回 true。粘住的、旧一代的、已经是 0 的都不变，返回 false。
+    pub(crate) fn rc_dec(&self, parity: bool) -> bool {
+        let parity = if parity { PARITY_BIT } else { 0 };
+        let mut word = self.info.load(Ordering::Relaxed);
+        loop {
+            if word & PARITY_BIT != parity {
+                return false;
+            }
+            let rc = (word & RC_MASK) >> RC_SHIFT;
+            if rc == RC_MAX || rc == 0 {
+                return false;
+            }
+            let new = (word & !RC_MASK) | ((rc - 1) << RC_SHIFT);
+            match self.info.compare_exchange_weak(word, new, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return rc == 1,
+                Err(now) => word = now,
+            }
+        }
     }
 
     /// 已经被搬走（清扫时不析构、不算存活）。

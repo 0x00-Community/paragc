@@ -20,6 +20,8 @@ struct Meta {
     live: AtomicU32,
     /// 这一轮要疏散：里面的活对象被追踪到时搬走
     evacuate: AtomicBool,
+    /// 在可用队列里（防止同一块进队两次）
+    listed: AtomicBool,
 }
 
 /// [`Meta::live`]：块被重新拿去分配了，上次清扫的存活量不再作数
@@ -69,6 +71,46 @@ impl Block {
     pub(crate) fn live_since_sweep(self) -> Option<usize> {
         let live = self.meta().live.load(Ordering::Relaxed);
         (live != REUSED).then_some(live as usize)
+    }
+
+    /// 要放进可用队列：之前不在里面才返回 true。
+    pub(crate) fn list(self) -> bool {
+        !self.meta().listed.swap(true, Ordering::AcqRel)
+    }
+
+    /// 从可用队列里拿出来了。
+    pub(crate) fn unlist(self) {
+        self.meta().listed.store(false, Ordering::Release);
+    }
+
+    /// 清掉 `p` 处的对象起点（引用计数释放了它）。
+    pub(crate) fn clear_start(self, p: *const u8) {
+        let g = self.offset(p) / GRANULE;
+        self.meta().starts[g / BITS].fetch_and(!(1 << (g % BITS)), Ordering::Relaxed);
+    }
+
+    /// 按剩下的对象起点重算行标记（引用计数释放过对象的块）：每个还在的对象占的行标成 `epoch`，其余行空出来。
+    /// 记下存活字节数；返回是否有空行。SAFETY（调用方）：没有 mutator（独占堆），块里剩下的对象都活着。
+    pub(crate) unsafe fn recompute_lines(self, epoch: u32) -> bool {
+        let meta = self.meta();
+        for line in &meta.lines {
+            line.store(0, Ordering::Relaxed);
+        }
+        let mut live = 0;
+        for (w, word) in meta.starts.iter().enumerate() {
+            let mut bits = word.load(Ordering::Relaxed);
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let p = self.base().wrapping_add((w * BITS + bit) * GRANULE);
+                // SAFETY: 起点位标着的地方是活对象
+                let bytes = unsafe { &*p.cast::<Header>() }.bytes();
+                self.mark_lines(p, bytes, epoch);
+                live += bytes;
+            }
+        }
+        meta.live.store(u32::try_from(live).unwrap_or(REUSED - 1), Ordering::Relaxed);
+        meta.lines[Self::FIRST_LINE..].iter().any(|l| l.load(Ordering::Relaxed) != epoch)
     }
 
     pub(crate) fn set_evacuate(self) {

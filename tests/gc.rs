@@ -891,8 +891,8 @@ fn evacuation_with_shared_children() {
 
 /// 年轻回收的精确账目：老节点（经过一次完整回收）挂在板子的 0 号、2 号槽；然后新建年轻节点，三种方式挂上：
 /// 直接挂到老板子的 1 号槽（老对象的槽 ⇒ 记忆集）、挂到 0 号槽链头老节点的 next（老对象的槽）、挂到另一个年轻节点底下（年轻 → 年轻）；
-/// 其余年轻节点扔掉。再从 2 号槽摘掉一些老节点（老垃圾）。年轻回收应恰好析构扔掉的年轻节点、不碰老垃圾，链上节点一个不少；
-/// 之后的完整回收再收掉老垃圾。
+/// 其余年轻节点扔掉。再从 2 号槽摘掉一些老节点（老垃圾）。年轻回收应恰好析构扔掉的年轻节点（追踪），
+/// 以及扔掉的老节点（引用计数归零），链上节点一个不少；之后的完整回收不再多析构。
 #[test]
 fn young_collection_frees_only_young_garbage() {
     const OLD: usize = if cfg!(miri) { 60 } else { 2_000 };
@@ -943,9 +943,9 @@ fn young_collection_frees_only_young_garbage() {
     let before = moves.ledger.dropped.load(Ordering::Relaxed);
     heap.collect_young();
     assert_eq!(heap.stats().young_collections, 1);
-    assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed) - before, young_garbage, "年轻回收析构的不是恰好扔掉的年轻节点");
+    assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed) - before, young_garbage + OLD_DISCARD, "年轻回收析构的不是恰好扔掉的年轻节点 + 老节点");
     assert_eq!(Moves::reachable(&heap, &board), OLD - OLD_DISCARD + (YOUNG - young_garbage), "年轻回收后链上丢了节点");
-    // 完整回收收掉老垃圾
+    // 完整回收没有剩下的垃圾
     heap.collect();
     assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed) - before, young_garbage + OLD_DISCARD);
     assert_eq!(Moves::reachable(&heap, &board), OLD - OLD_DISCARD + (YOUNG - young_garbage));
@@ -979,4 +979,56 @@ fn young_collections_while_relinking() {
     }
     assert!(heap.stats().young_collections > 0);
     moves.finish(heap, board);
+}
+
+/// 环测试：持有者链上每个持有者挂一个两节点的环。
+#[derive(Trace)]
+struct Holder<'gc> {
+    ring: Slot<'gc, Link<'gc>>,
+    next: Slot<'gc, Holder<'gc>>,
+    tag: Counted,
+}
+
+#[derive(Trace)]
+struct Holders<'gc> {
+    head: Slot<'gc, Holder<'gc>>,
+    plain: Slot<'gc, Link<'gc>>,
+}
+
+brand!(HoldersB = for<'gc> Holders<'gc>);
+
+/// 引用计数收不了环：PAIRS 个持有者各挂一个两节点环（a.next = c、c.next = a），另有 PAIRS 个普通节点；
+/// 完整回收后都是老的。然后把持有者链和普通链都摘掉：持有者和普通节点计数归零，年轻回收（引用计数）就收掉；
+/// 环内互相计数不为 0，年轻回收不析构它们，要等完整回收（追踪）。
+#[test]
+fn reference_counting_leaves_cycles_to_tracing() {
+    const PAIRS: usize = if cfg!(miri) { 20 } else { 500 };
+    let moves = Moves::default();
+    let mut heap = Heap::new(THREADS);
+    let root: Root<HoldersB> = heap.mutate(|m| m.root(m.alloc(Holders { head: Slot::default(), plain: Slot::default() })));
+    heap.mutate(|m| {
+        let r = m.get(&root);
+        for _ in 0..PAIRS {
+            let a = m.alloc(Link { next: Slot::default(), tag: moves.ledger.tag() });
+            let c = m.alloc(Link { next: Some(a).into(), tag: moves.ledger.tag() });
+            a.next.set(m, Some(c));
+            let h = m.alloc(Holder { ring: Some(a).into(), next: r.head.get().into(), tag: moves.ledger.tag() });
+            r.head.set(m, Some(h));
+            let p = m.alloc(Link { next: r.plain.get().into(), tag: moves.ledger.tag() });
+            r.plain.set(m, Some(p));
+        }
+    });
+    heap.collect();
+    let before = moves.ledger.dropped.load(Ordering::Relaxed);
+    assert_eq!(before, 0);
+    heap.mutate(|m| {
+        let r = m.get(&root);
+        r.head.set(m, None);
+        r.plain.set(m, None);
+    });
+    heap.collect_young();
+    assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed) - before, PAIRS * 2, "引用计数应收掉持有者与普通节点，环留着");
+    heap.collect();
+    assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed) - before, PAIRS * 4, "完整回收应收掉环");
+    drop(root);
 }

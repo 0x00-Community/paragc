@@ -4,7 +4,7 @@ use core::fmt;
 use core::marker::PhantomData;
 use core::ops::Deref;
 use core::ptr::{NonNull, null_mut};
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use crate::Mutator;
 use crate::header::Header;
@@ -77,21 +77,70 @@ impl<T: fmt::Debug> fmt::Debug for Gc<'_, T> {
 
 /// 原子的可空指针槽：对象里要改的边放这里（`Trace` 要求 `Sync`，所以 `Cell<Gc>` 用不了）。
 ///
-/// 写入要带 [`Mutator`]：并发标记期间被覆盖的旧值要经写屏障交给回收器（初始快照）。
+/// 写入要带 [`Mutator`]：并发标记期间被覆盖的旧值要经写屏障交给回收器（初始快照）；
+/// 平时老对象里的槽每轮第一次被写时登记，回收时按「新值 +1、上次计入的值 −1」结算引用计数。
+#[repr(C)]
 pub struct Slot<'gc, T> {
     ptr: AtomicPtr<T>,
+    /// 上次计入引用计数的值（地址）| [`LOGGED`]；[`UNCOUNTED`] = 不计数（年轻对象里的槽，晋升时才开始计）
+    counted: AtomicUsize,
     _brand: PhantomData<Gc<'gc, T>>,
+}
+
+/// [`Slot::counted`]：这个槽不在引用计数里
+pub(crate) const UNCOUNTED: usize = usize::MAX;
+/// [`Slot::counted`] 的最低位：本轮已登记（地址按粒度对齐，最低位空着）
+pub(crate) const LOGGED: usize = 1;
+
+/// 抹掉类型的槽：写屏障登记、回收时结算用（与 [`Slot`] 同布局）。
+#[repr(C)]
+pub(crate) struct RawSlot {
+    pub(crate) ptr: AtomicPtr<u8>,
+    pub(crate) counted: AtomicUsize,
+}
+
+impl RawSlot {
+    fn header(p: *mut u8) -> Option<*const Header> {
+        (!p.is_null()).then(|| Header::of(p))
+    }
+
+    fn from_counted(c: usize) -> Option<*const Header> {
+        (c != UNCOUNTED && c & !LOGGED != 0).then(|| Header::of(core::ptr::with_exposed_provenance::<u8>(c & !LOGGED)))
+    }
+
+    /// 本轮第一次被写：打上登记标志，返回 true（调用方把槽地址交给回收器）。不计数的槽返回 false。
+    pub(crate) fn log(&self) -> bool {
+        let c = self.counted.load(Ordering::Relaxed);
+        c != UNCOUNTED && c & LOGGED == 0 && self.counted.compare_exchange(c, c | LOGGED, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+    }
+
+    /// 清掉登记标志（计数不可信时丢弃登记）。
+    pub(crate) fn unlog(&self) {
+        self.counted.fetch_and(!LOGGED, Ordering::AcqRel);
+    }
+
+    /// 改成计入当前值；返回（当前值, 上次计入的值）。
+    pub(crate) fn recount(&self) -> (Option<*const Header>, Option<*const Header>) {
+        let p = self.ptr.load(Ordering::Acquire);
+        let prev = self.counted.swap(p.expose_provenance(), Ordering::AcqRel);
+        (Self::header(p), Self::from_counted(prev))
+    }
+
+    /// 上次计入的值（释放它所在的对象时 −1）。
+    pub(crate) fn counted(&self) -> Option<*const Header> {
+        Self::from_counted(self.counted.load(Ordering::Acquire))
+    }
 }
 
 impl<T> Default for Slot<'_, T> {
     fn default() -> Self {
-        Self { ptr: AtomicPtr::new(null_mut()), _brand: PhantomData }
+        Self { ptr: AtomicPtr::new(null_mut()), counted: AtomicUsize::new(UNCOUNTED), _brand: PhantomData }
     }
 }
 
 impl<'gc, T> From<Option<Gc<'gc, T>>> for Slot<'gc, T> {
     fn from(v: Option<Gc<'gc, T>>) -> Self {
-        Self { ptr: AtomicPtr::new(Self::raw(v)), _brand: PhantomData }
+        Self { ptr: AtomicPtr::new(Self::raw(v)), counted: AtomicUsize::new(UNCOUNTED), _brand: PhantomData }
     }
 }
 
@@ -141,10 +190,17 @@ impl<'gc, T> Slot<'gc, T> {
         *self.ptr.get_mut() = Self::raw(v);
     }
 
-    /// 写屏障：被覆盖的旧值（并发标记的初始快照）与写进去的新值（年轻对象 ⇒ 记下这个槽，年轻回收从它出发）。
+    /// 抹掉类型的视图。
+    pub(crate) fn raw_slot(&self) -> &RawSlot {
+        // SAFETY: Slot 与 RawSlot 都是 repr(C)，前两个字段同类型同顺序（AtomicPtr<T> 与 AtomicPtr<u8> 同布局）
+        unsafe { &*(&raw const *self).cast::<RawSlot>() }
+    }
+
+    /// 写屏障：被覆盖的旧值（并发标记的初始快照）、写进去的新值（年轻对象 ⇒ 记下这个槽，年轻回收从它出发）、
+    /// 引用计数登记（老对象里的槽本轮第一次被写）。
     fn barrier(&self, m: &Mutator<'gc>, old: *mut T, new: *mut T) {
         let header = |p: *mut T| (!p.is_null()).then(|| Header::of(p.cast()));
-        m.written((&raw const self.ptr).cast(), header(old), header(new));
+        m.written(self.raw_slot(), header(old), header(new));
     }
 }
 
