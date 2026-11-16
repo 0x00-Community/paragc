@@ -241,7 +241,7 @@ fn check(heaps: &[Heap], h: usize, root: &Root<ItemB>, depth: usize) {
 }
 
 /// 全部堆并行回收（每个堆一个线程），同时另一个线程释放 `dropping` 里的根。
-fn collect_all(heaps: &mut [Heap], dropping: Vec<(usize, Root<ItemB>)>) {
+fn collect_all<T: Send>(heaps: &mut [Heap], dropping: Vec<T>) {
     std::thread::scope(|s| {
         s.spawn(move || {
             // 倒着、隔一个地释放，打乱次序
@@ -318,8 +318,254 @@ fn eight_threads_eight_heaps_crossed() {
         if ledger.dropped.load(Ordering::Relaxed) == ledger.made.load(Ordering::Relaxed) {
             break;
         }
-        collect_all(&mut heaps, Vec::new());
+        collect_all(&mut heaps, Vec::<()>::new());
     }
     assert_eq!(ledger.dropped.load(Ordering::Relaxed), ledger.made.load(Ordering::Relaxed), "有对象没被回收");
     assert!(heaps.iter().all(|h| h.stats().live == 0 && h.stats().large == 0), "堆里还有存活对象");
+}
+
+/// 深树测试的节点：两个可改的孩子，带析构计数。
+#[derive(Trace)]
+struct Bin<'gc> {
+    left: Slot<'gc, Bin<'gc>>,
+    right: Slot<'gc, Bin<'gc>>,
+    tag: Counted,
+}
+
+brand!(BinB = for<'gc> Bin<'gc>);
+
+impl Bin<'_> {
+    /// 从 `self` 出发可达的节点数（显式栈，不递归）。
+    fn count(&self) -> usize {
+        let mut stack = vec![self];
+        let mut n = 0;
+        while let Some(b) = stack.pop() {
+            n += 1;
+            stack.extend(b.left.get().map(Gc::get));
+            stack.extend(b.right.get().map(Gc::get));
+        }
+        n
+    }
+}
+
+/// 满二叉树（`depth` 层，2^depth − 1 个节点），自底向上逐层造。
+fn build_tree(heap: &Heap, drops: &Arc<AtomicUsize>, depth: u32) -> Root<BinB> {
+    heap.mutate(|m| {
+        let tag = || Counted(drops.clone());
+        let mut level: Vec<_> = (0..1usize << (depth - 1)).map(|_| m.alloc(Bin { left: Slot::default(), right: Slot::default(), tag: tag() })).collect();
+        while level.len() > 1 {
+            level = level.chunks(2).map(|pair| m.alloc(Bin { left: pair[0].into(), right: pair[1].into(), tag: tag() })).collect();
+        }
+        m.root(level[0])
+    })
+}
+
+#[test]
+fn deep_binary_tree() {
+    const DEPTH: u32 = if cfg!(miri) { 7 } else { 20 };
+    const ALL: usize = (1 << DEPTH) - 1;
+    const HALF: usize = (1 << (DEPTH - 1)) - 1;
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut heap = Heap::new(THREADS);
+    let root = build_tree(&heap, &drops, DEPTH);
+    heap.collect();
+    assert_eq!(drops.load(Ordering::Relaxed), 0);
+    assert_eq!(heap.mutate(|m| m.get(&root).count()), ALL);
+    // 剪掉右子树：恰好 2^(DEPTH-1) − 1 个节点析构
+    heap.mutate(|m| m.get(&root).right.set(None));
+    heap.collect();
+    assert_eq!(drops.load(Ordering::Relaxed), HALF);
+    assert_eq!(heap.mutate(|m| m.get(&root).count()), ALL - HALF);
+    drop(root);
+    heap.collect();
+    assert_eq!(drops.load(Ordering::Relaxed), ALL);
+    assert_eq!(heap.stats().live, 0);
+}
+
+#[test]
+fn deep_chain() {
+    const LEN: usize = if cfg!(miri) { 500 } else { 1_000_000 };
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut heap = Heap::new(THREADS);
+    let root: Root<BinB> = heap.mutate(|m| {
+        let mut top: Option<Gc<'_, Bin<'_>>> = None;
+        for _ in 0..LEN {
+            top = Some(m.alloc(Bin { left: top.into(), right: Slot::default(), tag: Counted(drops.clone()) }));
+        }
+        m.root(top.expect("LEN > 0"))
+    });
+    heap.collect();
+    assert_eq!(heap.mutate(|m| m.get(&root).count()), LEN);
+    // 从中间剪断：后一半析构
+    heap.mutate(|m| {
+        let mut cur = m.get(&root);
+        for _ in 1..LEN / 2 {
+            cur = cur.left.get().expect("链够长");
+        }
+        cur.left.set(None);
+    });
+    heap.collect();
+    assert_eq!(drops.load(Ordering::Relaxed), LEN - LEN / 2);
+    assert_eq!(heap.mutate(|m| m.get(&root).count()), LEN / 2);
+    drop(root);
+    heap.collect();
+    assert_eq!(drops.load(Ordering::Relaxed), LEN);
+}
+
+/// 交叉深树的节点：树节点用两个孩子，链节点只用 left；树叶带着别的堆上深链中某个节点的根。
+#[derive(Trace)]
+struct XNode<'gc> {
+    left: Slot<'gc, XNode<'gc>>,
+    right: Slot<'gc, XNode<'gc>>,
+    /// (堆号, 根)：别的堆上深链里的一个节点
+    guest: Option<(usize, Root<XB>)>,
+    tag: Counted,
+}
+
+brand!(XB = for<'gc> XNode<'gc>);
+
+/// 每个堆一棵满二叉树的层数
+const X_DEPTH: u32 = if cfg!(miri) { 4 } else { 15 };
+const X_LEAVES: usize = 1 << (X_DEPTH - 1);
+const X_TREE: usize = (1 << X_DEPTH) - 1;
+/// 树叶依次锚在深链的 X_OFFSET、X_OFFSET + X_STEP、… 处
+const X_OFFSET: usize = if cfg!(miri) { 3 } else { 1000 };
+const X_STEP: usize = if cfg!(miri) { 2 } else { 4 };
+/// 每个堆一条深链的长度
+const X_CHAIN: usize = X_OFFSET + X_LEAVES * X_STEP;
+
+impl XNode<'_> {
+    /// 从这里可达的本堆节点数（不跨堆，显式栈）。
+    fn reach(&self) -> usize {
+        let mut stack = vec![self];
+        let mut n = 0;
+        while let Some(x) = stack.pop() {
+            n += 1;
+            stack.extend(x.left.get().map(Gc::get));
+            stack.extend(x.right.get().map(Gc::get));
+        }
+        n
+    }
+}
+
+impl Ledger {
+    /// 第 `h` 个堆上一条 X_CHAIN 长的深链。
+    fn x_chain(&self, heap: &Heap) -> Root<XB> {
+        heap.mutate(|m| {
+            let mut top: Option<Gc<'_, XNode<'_>>> = None;
+            for _ in 0..X_CHAIN {
+                top = Some(m.alloc(XNode { left: top.into(), right: Slot::default(), guest: None, tag: self.tag() }));
+            }
+            m.root(top.expect("X_CHAIN > 0"))
+        })
+    }
+
+    /// 在 `heap` 上造满二叉树，第 i 片叶子带 `guests[i]`。
+    fn x_tree(&self, heap: &Heap, guests: Vec<(usize, Root<XB>)>) -> Root<XB> {
+        heap.mutate(|m| {
+            let mut guests = guests.into_iter();
+            let mut level: Vec<_> = (0..X_LEAVES)
+                .map(|_| m.alloc(XNode { left: Slot::default(), right: Slot::default(), guest: guests.next(), tag: self.tag() }))
+                .collect();
+            while level.len() > 1 {
+                level = level
+                    .chunks(2)
+                    .map(|pair| m.alloc(XNode { left: pair[0].into(), right: pair[1].into(), guest: None, tag: self.tag() }))
+                    .collect();
+            }
+            m.root(level[0])
+        })
+    }
+}
+
+/// 第 `h` 个堆深链上锚点的根（第 i 个在深度 X_OFFSET + i·X_STEP）。
+fn x_anchors(heap: &Heap, h: usize, chain: &Root<XB>) -> Vec<(usize, Root<XB>)> {
+    heap.mutate(|m| {
+        let mut out = Vec::with_capacity(X_LEAVES);
+        let mut cur = Some(m.get(chain));
+        let mut depth = 0;
+        while let Some(n) = cur {
+            if depth >= X_OFFSET && (depth - X_OFFSET).is_multiple_of(X_STEP) && out.len() < X_LEAVES {
+                out.push((h, m.root(n)));
+            }
+            depth += 1;
+            cur = n.left.get();
+        }
+        out
+    })
+}
+
+/// 树 `h` 最左（或最右）那片叶子锚着的深链，从锚点往下还有多长；树和链在不同的堆，嵌套 mutate。
+fn x_edge_reach(heaps: &[Heap], h: usize, tree: &Root<XB>, leftmost: bool) -> usize {
+    heaps[h].mutate(|m| {
+        let mut cur = m.get(tree);
+        while let Some(next) = if leftmost { cur.left.get().or(cur.right.get()) } else { cur.right.get().or(cur.left.get()) } {
+            cur = next;
+        }
+        let (g, root) = cur.guest.as_ref().expect("叶子都带锚");
+        heaps[*g].mutate(|gm| gm.get(root).reach())
+    })
+}
+
+/// 8 线程 × 8 堆的交叉深树：每个堆一条深链 + 一棵满二叉树，树叶锚在下一个堆的深链上（跨堆持有）；
+/// 链根、剪枝、树根都由别的线程在别的时刻释放，全部堆并行回收；每一步核对析构数恰好等于理论值。
+#[test]
+fn crossed_deep_trees() {
+    let ledger = Ledger::default();
+    let dropped = || ledger.dropped.load(Ordering::Relaxed);
+    let mut heaps: Vec<Heap> = (0..HEAPS).map(|_| Heap::new(THREADS)).collect();
+    // 1. 每个线程在自己的堆上造深链
+    let chains: Vec<Root<XB>> = std::thread::scope(|s| {
+        let (heaps, ledger) = (&heaps, &ledger);
+        let hs: Vec<_> = (0..WORKERS).map(|t| s.spawn(move || ledger.x_chain(&heaps[t]))).collect();
+        hs.into_iter().map(|h| h.join().expect("造链 panic")).collect()
+    });
+    // 2. 线程 t 在下一个堆的深链上取锚点（那个堆同时正被它的线程造树），在自己的堆上造树
+    let trees: Vec<Root<XB>> = std::thread::scope(|s| {
+        let (heaps, ledger, chains) = (&heaps, &ledger, &chains);
+        let hs: Vec<_> = (0..WORKERS)
+            .map(|t| {
+                s.spawn(move || {
+                    let next = (t + 1) % HEAPS;
+                    ledger.x_tree(&heaps[t], x_anchors(&heaps[next], next, &chains[next]))
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().expect("造树 panic")).collect()
+    });
+    assert_eq!(dropped(), 0);
+    // 3. 链根交给另一个线程释放，同时全部堆并行回收；链头到第一个锚点之前的 X_OFFSET 个节点死掉
+    collect_all(&mut heaps, chains);
+    collect_all(&mut heaps, Vec::<()>::new());
+    assert_eq!(dropped(), HEAPS * X_OFFSET);
+    for (h, tree) in trees.iter().enumerate() {
+        assert_eq!(heaps[h].mutate(|m| m.get(tree).reach()), X_TREE);
+        assert_eq!(x_edge_reach(&heaps, h, tree, true), X_CHAIN - X_OFFSET);
+        assert_eq!(x_edge_reach(&heaps, h, tree, false), X_CHAIN - X_OFFSET - (X_LEAVES - 1) * X_STEP);
+    }
+    // 4. 线程 t 剪掉堆 (t + 2) 那棵树的左半边：左子树死掉，它的叶子带的锚随之释放，
+    //    下一个堆深链上前一半锚点之间的节点再下一轮死掉
+    std::thread::scope(|s| {
+        let (heaps, trees) = (&heaps, &trees);
+        for t in 0..WORKERS {
+            s.spawn(move || {
+                let h = (t + 2) % HEAPS;
+                heaps[h].mutate(|m| m.get(&trees[h]).left.set(None));
+            });
+        }
+    });
+    collect_all(&mut heaps, Vec::<()>::new());
+    collect_all(&mut heaps, Vec::<()>::new());
+    assert_eq!(dropped(), HEAPS * (X_OFFSET + X_TREE / 2 + X_LEAVES / 2 * X_STEP));
+    for (h, tree) in trees.iter().enumerate() {
+        assert_eq!(heaps[h].mutate(|m| m.get(tree).reach()), X_TREE - X_TREE / 2);
+        assert_eq!(x_edge_reach(&heaps, h, tree, true), X_CHAIN - X_OFFSET - X_LEAVES / 2 * X_STEP);
+    }
+    // 5. 树根交给另一个线程、在第一轮回收的同时释放：释放可能晚于那个堆的标记，树要到第二轮才死；
+    //    树死时锚才释放，链要到第三轮才死
+    collect_all(&mut heaps, trees);
+    collect_all(&mut heaps, Vec::<()>::new());
+    collect_all(&mut heaps, Vec::<()>::new());
+    assert_eq!(dropped(), ledger.made.load(Ordering::Relaxed));
+    assert!(heaps.iter().all(|h| h.stats().live == 0), "堆里还有存活对象");
 }

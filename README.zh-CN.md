@@ -54,6 +54,10 @@ MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-tree-borrows" cargo +nightly miri
 `eight_threads_eight_heaps_crossed`：8 线程 × 8 堆，跨堆持有根（链头挂着别的堆上的链）、跨线程检查与释放、
 全部堆并行回收的同时另一个线程释放根、大对象与节点成环；最后反复回收直到析构数 = 创建数。Miri 下缩成 4 × 4。
 
+深树：`deep_binary_tree`（20 层满二叉树约 100 万节点，剪半棵、全释放）、`deep_chain`（100 万节点单链，从中间剪断）、
+`crossed_deep_trees`（8 堆各一条深链 + 一棵 15 层满二叉树，树叶锚在下一个堆的深链上；链根、剪枝、树根由别的线程在回收同时释放，
+每一步析构数恰好等于理论值）。标记用显式工作队列、析构不沿 `Gc` 走，深度不吃调用栈。
+
 ## 许可
 
 MIT
