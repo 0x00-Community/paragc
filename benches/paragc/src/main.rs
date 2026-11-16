@@ -78,6 +78,20 @@ impl Bench for Paragc {
         Some(took)
     }
 
+    fn pause_concurrent(&self) -> Option<Took> {
+        let mut heap = Heap::new(self.threads);
+        let live = Self::rooted(&heap, PAUSE_DEPTH);
+        heap.mutate(|m| {
+            Self::tree(m, PAUSE_DEPTH);
+        });
+        assert!(heap.mark_concurrently());
+        let start = Clock::start();
+        heap.collect();
+        let took = start.stop();
+        assert_eq!(Self::count(&heap, &live), Tree::size(PAUSE_DEPTH));
+        Some(took)
+    }
+
     fn alloc_mt(&self) -> Option<Took> {
         let mut heap = Heap::new(self.threads);
         let long = Self::rooted(&heap, LONG_LIVED_DEPTH);

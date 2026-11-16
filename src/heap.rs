@@ -165,10 +165,15 @@ impl Heap {
         true
     }
 
-    /// 写屏障：并发标记中覆盖掉的旧值若还没标，放进灰队列（保住初始快照）。
+    /// 写屏障：并发标记中覆盖掉的旧值若还没标，就标上（连同它跨的行）并放进灰队列（保住初始快照）。
+    /// 灰队列里的对象都已标过，取出来只追踪它的边，所以这里必须先标。
     pub(crate) fn remember(&self, old: *const Header, epoch: u32) {
         // SAFETY: old 来自本堆的槽，初始快照时活着，本轮不会被回收
-        if !unsafe { &*old }.is_marked(epoch) {
+        let h = unsafe { &*old };
+        if h.mark(epoch) {
+            if !h.is_large() {
+                Block::containing(old.cast()).mark_lines(old.cast(), h.bytes(), epoch);
+            }
             self.grey.push(old.expose_provenance());
         }
     }
@@ -355,6 +360,11 @@ pub struct Mutator<'gc> {
 impl<'gc> Mutator<'gc> {
     pub(crate) fn heap(&self) -> &'gc Heap {
         self.heap
+    }
+
+    /// 这次 mutate 是否落在并发标记期间（写屏障与黑分配生效）。
+    pub fn is_marking(&self) -> bool {
+        self.marking.is_some()
     }
 
     /// 写屏障：槽里被覆盖掉的旧值（并发标记中才有事）。

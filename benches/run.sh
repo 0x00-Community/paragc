@@ -16,7 +16,7 @@ cargo build --release -q $(printf -- '-p bench-%s ' "${LIBS[@]}" | sed 's/-p ben
 # 每个库支持的 (工作负载, 线程数)
 configs() {
     case $1 in
-        paragc) echo "pause 1" "pause 4" "pause $THREADS" "gcbench 1" "gcbench 4" "gcbench $THREADS" "alloc-mt 1" "alloc-mt 4" "alloc-mt $THREADS" ;;
+        paragc) echo "pause 1" "pause 4" "pause $THREADS" "pause-cm 1" "pause-cm 4" "pause-cm $THREADS" "gcbench 1" "gcbench 4" "gcbench $THREADS" "alloc-mt 1" "alloc-mt 4" "alloc-mt $THREADS" ;;
         cppgc | cppgc-par | cppgc-detached) echo "pause 1" "pause 4" "pause $THREADS" "gcbench 1" "gcbench 4" "gcbench $THREADS" ;;
         dumpster) echo "pause 1" "gcbench 1" "alloc-mt 1" "alloc-mt 4" "alloc-mt $THREADS" ;;
         *) echo "pause 1" "gcbench 1" ;;

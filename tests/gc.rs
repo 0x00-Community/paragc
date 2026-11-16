@@ -431,7 +431,7 @@ const X_LEAVES: usize = 1 << (X_DEPTH - 1);
 const X_TREE: usize = (1 << X_DEPTH) - 1;
 /// 树叶依次锚在深链的 X_OFFSET、X_OFFSET + X_STEP、… 处
 const X_OFFSET: usize = if cfg!(miri) { 3 } else { 1000 };
-const X_STEP: usize = if cfg!(miri) { 2 } else { 4 };
+const X_STEP: usize = if cfg!(miri) { 1 } else { 4 };
 /// 每个堆一条深链的长度
 const X_CHAIN: usize = X_OFFSET + X_LEAVES * X_STEP;
 
@@ -569,4 +569,167 @@ fn crossed_deep_trees() {
     collect_all(&mut heaps, Vec::<()>::new());
     assert_eq!(dropped(), ledger.made.load(Ordering::Relaxed));
     assert!(heaps.iter().all(|h| h.stats().live == 0), "堆里还有存活对象");
+}
+
+/// 并发标记测试的节点：链上的下一个是可改的槽。
+#[derive(Trace)]
+struct Link<'gc> {
+    next: Slot<'gc, Link<'gc>>,
+    tag: Counted,
+}
+
+/// 一排槽，每个槽挂一条链。
+#[derive(Trace)]
+struct Board<'gc> {
+    cells: Vec<Slot<'gc, Link<'gc>>>,
+}
+
+brand!(BoardB = for<'gc> Board<'gc>);
+
+/// 槽数是 MOVERS 的倍数（每个线程分到同样多的槽）
+const CELLS: usize = if cfg!(miri) { 4 } else { 16 };
+const MOVERS: usize = if cfg!(miri) { 2 } else { 4 };
+/// 每个 mutator 每轮做几次 mutate、每次做几步
+const MUTATES: usize = if cfg!(miri) { 6 } else { 400 };
+const STEPS: usize = if cfg!(miri) { 4 } else { 32 };
+const MARK_ROUNDS: usize = if cfg!(miri) { 2 } else { 6 };
+
+/// 每个线程自己的伪随机数（xorshift）。
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, n: usize) -> usize {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        usize::try_from(self.0 % u64::try_from(n).expect("n 不大")).expect("比 n 小")
+    }
+}
+
+/// 造了几个、扔了几个（扔 = 从链上摘下来不再挂回去）。
+#[derive(Default)]
+struct Moves {
+    ledger: Ledger,
+    discarded: AtomicUsize,
+    /// 落在并发标记期间的 mutate 次数（确认真的和标记重叠了）
+    overlapped: AtomicUsize,
+}
+
+impl Moves {
+    /// 一步：随机地 挪（从自己的槽摘下链头、在栈上拿着、再挂到任意槽）/ 新建 / 扔。
+    /// 槽 i 只归线程 i % MOVERS 摘（多生产者单消费者的 Treiber 栈没有 ABA），挂谁都能挂。
+    fn step<'gc>(&self, m: &paragc::Mutator<'gc>, board: &Board<'gc>, me: usize, rng: &mut Rng) {
+        let (a, b) = (rng.below(CELLS / MOVERS) * MOVERS + me, rng.below(CELLS));
+        match rng.below(4) {
+            0 | 1 => {
+                if let Some(x) = Self::pop(m, &board.cells[a]) {
+                    Self::push(m, &board.cells[b], x);
+                }
+            }
+            2 => {
+                let x = m.alloc(Link { next: Slot::default(), tag: self.ledger.tag() });
+                Self::push(m, &board.cells[b], x);
+            }
+            _ => {
+                if Self::pop(m, &board.cells[a]).is_some() {
+                    self.discarded.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// 摘下链头（只有这个槽的主人摘；CAS 只和挂的线程抢）；摘下来的节点此后只在栈上。
+    fn pop<'gc>(m: &paragc::Mutator<'gc>, cell: &Slot<'gc, Link<'gc>>) -> Option<Gc<'gc, Link<'gc>>> {
+        loop {
+            let x = cell.get()?;
+            if cell.compare_exchange(m, Some(x), x.next.get()).is_ok() {
+                return Some(x);
+            }
+        }
+    }
+
+    /// 挂到链头（CAS）。
+    fn push<'gc>(m: &paragc::Mutator<'gc>, cell: &Slot<'gc, Link<'gc>>, x: Gc<'gc, Link<'gc>>) {
+        loop {
+            let head = cell.get();
+            x.next.set(m, head);
+            if cell.compare_exchange(m, head, Some(x)).is_ok() {
+                return;
+            }
+        }
+    }
+
+    /// 全部链上的节点数（显式栈）。
+    fn reachable(heap: &Heap, board: &Root<BoardB>) -> usize {
+        heap.mutate(|m| {
+            let mut n = 0;
+            for cell in &m.get(board).cells {
+                let mut cur = cell.get();
+                while let Some(x) = cur {
+                    n += 1;
+                    cur = x.next.get();
+                }
+            }
+            n
+        })
+    }
+}
+
+/// 并发标记期间，多个 mutator 不停地把节点从一个槽摘下（只剩栈上引用）再挂到另一个槽、新建、扔掉；
+/// 另一个线程同时并发标记。每轮结束回收后：链上节点数 = 造的 − 扔的（初始快照没漏掉被挪动的节点）；
+/// 最后再完整回收一次：析构数恰好 = 扔掉的个数。
+#[test]
+fn concurrent_marking_while_relinking() {
+    let moves = Moves::default();
+    let mut heap = Heap::new(THREADS);
+    let board: Root<BoardB> = heap.mutate(|m| m.root(m.alloc(Board { cells: (0..CELLS).map(|_| Slot::default()).collect() })));
+    for round in 0..MARK_ROUNDS {
+        let started = std::sync::atomic::AtomicBool::new(false);
+        let marked = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let (heap, board, moves, started, marked) = (&heap, &board, &moves, &started, &marked);
+            for t in 0..MOVERS {
+                s.spawn(move || {
+                    let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ u64::try_from((round << 8) | t).expect("小"));
+                    let mut tlab = paragc::Tlab::default();
+                    // 至少 MUTATES 次，并且一直做到并发标记结束（保证和标记重叠）
+                    let mut i = 0;
+                    while i < MUTATES || !marked.load(Ordering::Acquire) {
+                        if i == MUTATES / 4 {
+                            started.store(true, Ordering::Release);
+                        }
+                        i += 1;
+                        heap.mutate_in(&mut tlab, |m| {
+                            if m.is_marking() {
+                                moves.overlapped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            let board = m.get(board);
+                            for _ in 0..STEPS {
+                                moves.step(m, &board, t, &mut rng);
+                            }
+                        });
+                    }
+                });
+            }
+            s.spawn(move || {
+                while !started.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                assert!(heap.mark_concurrently(), "这一轮还没有在标记");
+                marked.store(true, Ordering::Release);
+            });
+        });
+        heap.collect();
+        let (dropped, discarded) = (moves.ledger.dropped.load(Ordering::Relaxed), moves.discarded.load(Ordering::Relaxed));
+        assert!(dropped <= discarded, "第 {round} 轮析构了还挂在链上的节点：析构 {dropped} > 扔掉 {discarded}");
+        let live = moves.ledger.made.load(Ordering::Relaxed) - moves.discarded.load(Ordering::Relaxed);
+        assert_eq!(Moves::reachable(&heap, &board), live, "第 {round} 轮链上丢了节点");
+    }
+    assert!(moves.overlapped.load(Ordering::Relaxed) > 0, "mutate 一次也没落在并发标记期间");
+    // 浮动垃圾（标记开始后才扔的）这一轮清掉
+    heap.collect();
+    assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed), moves.discarded.load(Ordering::Relaxed));
+    drop(board);
+    heap.collect();
+    assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed), moves.ledger.made.load(Ordering::Relaxed));
 }
