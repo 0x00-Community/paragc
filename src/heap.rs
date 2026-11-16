@@ -16,12 +16,14 @@ use crate::layout::{BLOCK, GRANULE, GROWTH, LARGE, MIN_SPARE_BLOCKS, MIN_TRIGGER
 use crate::mark::Marking;
 use crate::roots::RootTable;
 use crate::sweep::{Large, Sweep, Swept};
-use crate::workers::Workers;
+use crate::workers::Pool;
 use crate::{Gc, Trace};
 
 pub struct Heap {
     /// 回收最多用几个线程
     threads: NonZeroUsize,
+    /// 回收线程池：第一次回收时才起线程
+    pool: Option<Pool>,
     /// 当前纪元：最后一次标记用的（从 1 开始；行标记 ≠ 它的行是空行）
     epoch: u32,
     /// 回收了几次（分配缓冲据此判断自己是否过期）
@@ -65,6 +67,7 @@ impl Heap {
     pub fn new(threads: NonZeroUsize) -> Self {
         Self {
             threads,
+            pool: None,
             epoch: 1,
             collections: 0,
             blocks: SegVec::default(),
@@ -156,10 +159,12 @@ impl Heap {
         let roots = unsafe { self.roots.settle() };
         let blocks = self.blocks.take();
         let large = self.large.take();
-        let workers = Workers::sized(self.threads, blocks.len() + large.len());
-        Marking::new(workers, self.epoch).run(workers, &roots);
+        let threads = self.threads;
+        let pool = self.pool.get_or_insert_with(|| Pool::new(threads));
+        let workers = pool.sized(blocks.len() + large.len());
+        Marking::new(workers, self.epoch).run(pool, &roots);
         // SAFETY: 标记完了，没有 mutator
-        let swept = unsafe { Sweep::new(&blocks, &large, self.epoch).run(workers) };
+        let swept = unsafe { Sweep::new(&blocks, &large, self.epoch).run(pool, workers) };
         self.rebuild(swept);
     }
 
@@ -189,9 +194,11 @@ impl Drop for Heap {
         self.epoch = self.epoch.wrapping_add(1);
         let blocks = self.blocks.take();
         let large = self.large.take();
-        let workers = Workers::sized(self.threads, blocks.len() + large.len());
+        // 从没回收过就不为析构专门起线程
+        let mut pool = self.pool.take().unwrap_or_else(|| Pool::new(NonZeroUsize::MIN));
+        let workers = pool.sized(blocks.len() + large.len());
         // SAFETY: 独占；这一轮谁都没标记，全部视为死
-        let swept = unsafe { Sweep::new(&blocks, &large, self.epoch).run(workers) };
+        let swept = unsafe { Sweep::new(&blocks, &large, self.epoch).run(&mut pool, workers) };
         for b in blocks {
             // SAFETY: 对象都析构过了
             unsafe { b.release() };

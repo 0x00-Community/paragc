@@ -33,7 +33,7 @@ collection marks and sweeps on every core.
 | --- | --- |
 | 🧵 **Many mutators** | `Heap::mutate(&self)` runs on any number of threads at once. Each bump-allocates in its own buffer (`Tlab`) and claims whole blocks with one atomic operation. |
 | 🔒 **Exclusive by borrowing** | `Heap::collect(&mut self)` cannot overlap a `mutate`: the borrow checker is the stop-the-world, so there is no safepoint protocol and no lock. |
-| 🏃 **Parallel collection** | Marking: one Chase–Lev deque per worker with work stealing. Sweeping, destructors included: blocks handed out in batches to the same workers. |
+| 🏃 **Parallel collection** | A persistent pool per heap (threads park between collections). Marking: one crossbeam work-stealing deque per worker, stealing in batches. Sweeping, destructors included: blocks handed out in batches to the same workers. |
 | 🏷️ **Branded handles** | `Gc<'gc, T>` cannot escape the `mutate` closure. `Root<B>` handles carry no lifetime and can be stored anywhere and sent across threads. |
 | 📌 **Non-moving** | Objects never move, so pointers stay plain pointers and nothing needs forwarding. |
 | 🛡️ **Checked at compile time** | `#[derive(Trace)]` rejects `Drop` on traced types, and object data aligned above 8 bytes is a compile error. |
@@ -82,11 +82,13 @@ assert_eq!(sum, 999 * 1000 / 2);
 | Object header | 24 bytes: trace function, drop function, mark epoch (atomic), size in granules (top bit = large). |
 | Marking | Roots are spread over the workers. Whoever swaps in the epoch first owns the object: it marks the lines it spans and pushes it to its own deque (types without edges are not pushed). |
 | Termination | A worker whose deque is empty and that cannot steal counts itself idle and keeps stealing; when every worker is idle, marking is done. |
+| Thread pool | Started at the first collection, lives as long as the heap. A collection is handed out by bumping one atomic word (generation + number of participants) and unparking only those workers; idle workers back off, then park. A panic on a worker is re-raised on the collecting thread. |
 | Sweeping | Workers claim blocks in batches, walk the start bitmap, drop unmarked objects and classify each block as empty / recyclable / full. Spare empty blocks beyond a quarter of the heap go back to the system. |
 | Roots | Each `Root<B>` owns a slot in an append-only table; freed slot numbers are folded into a read-only array at collection time and claimed with an atomic cursor during `mutate`. |
 | Stale buffers | A buffer remembers (heap, collection count); after a collection it starts over, because its block was re-classified. |
 
-The lock-free building blocks (Chase–Lev deque, append-only segmented vector, stock) come from
+Work-stealing deques and backoff come from [crossbeam](https://github.com/crossbeam-rs/crossbeam) (`crossbeam-deque`,
+`crossbeam-utils`); the append-only segmented vector and the block stock come from
 [j8lockfree](https://crates.io/crates/j8lockfree).
 
 ## 📏 Rules
@@ -110,12 +112,15 @@ The lock-free building blocks (Chase–Lev deque, append-only segmented vector, 
 | `eight_threads_eight_heaps_crossed` | 8 threads × 8 heaps: roots held across heaps, checked and released on other threads, released while all heaps collect in parallel, cycles through large objects |
 | `crossed_deep_trees` | 8 heaps, each with a deep chain and a 15-level tree whose leaves anchor into the next heap's chain; every cut matches the expected finalization count |
 
-All of them also run under Miri with both Stacked Borrows and Tree Borrows (scaled down under `cfg(miri)`):
+All of them also run under Miri with both Stacked Borrows and Tree Borrows (scaled down under `cfg(miri)`).
+`-Zmiri-ignore-leaks` is needed because crossbeam-epoch's global collector still holds deferred garbage at exit; at
+4 collector threads per heap Stacked Borrows also reports a violation inside crossbeam-epoch itself, so the tests use 2
+under Miri:
 
 ```sh
 cargo test --test gc -- --exact <name>
-MIRIFLAGS="-Zmiri-permissive-provenance" cargo +nightly miri test --test gc -- --exact <name>
-MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-tree-borrows" cargo +nightly miri test --test gc -- --exact <name>
+MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-ignore-leaks" cargo +nightly miri test --test gc -- --exact <name>
+MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-ignore-leaks -Zmiri-tree-borrows" cargo +nightly miri test --test gc -- --exact <name>
 ```
 
 ## 📊 Benchmarks
@@ -174,10 +179,9 @@ Reading these honestly:
 
 0.1 is stop-the-world and non-moving. Next:
 
-1. A persistent worker pool with parked (not spinning) idle workers, so scaling holds past 4 threads
-2. Concurrent marking: a snapshot-at-the-beginning barrier on `Slot` writes, so mutators no longer wait for marking
-3. Opportunistic evacuation of sparse blocks (Immix defragmentation)
-4. Reference counting for young objects in the style of LXR: dead young objects free their lines at once, tracing
+1. Concurrent marking: a snapshot-at-the-beginning barrier on `Slot` writes, so mutators no longer wait for marking
+2. Opportunistic evacuation of sparse blocks (Immix defragmentation)
+3. Reference counting for young objects in the style of LXR: dead young objects free their lines at once, tracing
    handles cycles and old objects
 
 ## 📜 License

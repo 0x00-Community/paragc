@@ -1,67 +1,87 @@
-//! 并行标记：每个工人一个 Chase–Lev 双端队列，自己的从底端弹，空了去偷别人的顶端。
+//! 并行标记：每个工人一个 crossbeam 双端队列（自己 LIFO 弹），根放公共注入队列；
+//! 自己的空了就成批偷（`steal_batch_and_pop`，一次搬走别人队列的一半）。
 //!
-//! 结束判定：工人自己的队列空、也偷不到时把空闲计数加一，然后边等边偷；空闲计数等于工人数时
+//! 结束判定：自己的队列空、也偷不到时把空闲计数加一，然后边退避边偷；空闲计数等于工人数时
 //! 所有队列都空、也没人还在追踪（追踪中的工人没计入空闲），标记结束。偷到了就先减一再干活；
 //! 偷到还没来得及减一时别人可能先看到「全空闲」退出，但手里的活仍由偷到的人做完，结果不受影响。
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use j8lockfree::Deque;
+use crossbeam_deque::{Injector, Steal, Stealer, Worker};
+use crossbeam_utils::{Backoff, CachePadded};
 
 use crate::header::Header;
 use crate::trace::Tracer;
-use crate::workers::{Backoff, Workers};
+use crate::workers::Pool;
 
 pub(crate) struct Marking {
-    queues: Vec<Deque<usize>>,
-    idle: AtomicUsize,
+    /// 每个工号一个本地队列，由那个工号的线程取走（只取一次）
+    locals: Vec<CachePadded<UnsafeCell<Option<Worker<usize>>>>>,
+    stealers: Vec<Stealer<usize>>,
+    /// 根
+    injector: Injector<usize>,
+    idle: CachePadded<AtomicUsize>,
     epoch: u32,
 }
 
+// SAFETY: 每个工号的本地队列只被一个线程取走（工号互不相同）；其余是线程安全的
+unsafe impl Sync for Marking {}
+
 impl Marking {
-    pub(crate) fn new(workers: Workers, epoch: u32) -> Self {
-        Self { queues: (0..workers.count()).map(|_| Deque::default()).collect(), idle: AtomicUsize::new(0), epoch }
+    pub(crate) fn new(workers: usize, epoch: u32) -> Self {
+        let locals: Vec<Worker<usize>> = (0..workers).map(|_| Worker::new_lifo()).collect();
+        let stealers = locals.iter().map(Worker::stealer).collect();
+        Self {
+            locals: locals.into_iter().map(|w| CachePadded::new(UnsafeCell::new(Some(w)))).collect(),
+            stealers,
+            injector: Injector::new(),
+            idle: CachePadded::new(AtomicUsize::new(0)),
+            epoch,
+        }
     }
 
     /// 从根出发标记全部可达对象（标记位 + 行标记）。
-    pub(crate) fn run(&self, workers: Workers, roots: &[*const Header]) {
-        // 根轮流分给各工人的队列
-        for (q, chunk) in self.queues.iter().zip(roots.chunks(roots.len().div_ceil(self.queues.len()).max(1))) {
-            let owner = q.owner().expect("还没有工人领队列");
-            let mut t = Tracer::new(&owner, self.epoch);
-            for &root in chunk {
-                t.visit(root, false);
-            }
+    pub(crate) fn run(&self, pool: &mut Pool, roots: &[*const Header]) {
+        // 根先由调用方标记（顺带写行标记），需要追踪的进注入队列
+        let seed = Worker::new_lifo();
+        let mut t = Tracer::new(&seed, self.epoch);
+        for &root in roots {
+            t.visit(root, false);
         }
-        workers.run(|i| self.work(i));
+        while let Some(item) = seed.pop() {
+            self.injector.push(item);
+        }
+        pool.run(self.locals.len(), |me| self.work(me));
     }
 
     fn work(&self, me: usize) {
-        let owner = self.queues[me].owner().expect("每个队列只有一个工人");
-        let mut t = Tracer::new(&owner, self.epoch);
+        // SAFETY: 工号 me 只在这一个线程上
+        let local = unsafe { (*self.locals[me].get()).take() }.expect("每个工号只取一次本地队列");
+        let mut t = Tracer::new(&local, self.epoch);
         loop {
-            while let Some(item) = owner.pop() {
+            while let Some(item) = local.pop() {
                 t.scan(item);
             }
-            if let Some(item) = self.steal(me) {
+            if let Some(item) = self.steal(me, &local) {
                 t.scan(item);
                 continue;
             }
             self.idle.fetch_add(1, Ordering::AcqRel);
-            match self.wait(me) {
+            match self.wait(me, &local) {
                 Some(item) => t.scan(item),
                 None => return,
             }
         }
     }
 
-    /// 空闲时边等边偷；全部空闲返回 None。
-    fn wait(&self, me: usize) -> Option<usize> {
-        let mut backoff = Backoff::default();
+    /// 空闲时边退避边偷；全部空闲返回 None。
+    fn wait(&self, me: usize, local: &Worker<usize>) -> Option<usize> {
+        let backoff = Backoff::new();
         loop {
-            if self.idle.load(Ordering::Acquire) == self.queues.len() {
+            if self.idle.load(Ordering::Acquire) == self.locals.len() {
                 return None;
             }
-            if let Some(item) = self.steal(me) {
+            if let Some(item) = self.steal(me, local) {
                 self.idle.fetch_sub(1, Ordering::AcqRel);
                 return Some(item);
             }
@@ -69,9 +89,18 @@ impl Marking {
         }
     }
 
-    /// 从下一个工人开始轮着偷一个。
-    fn steal(&self, me: usize) -> Option<usize> {
-        let n = self.queues.len();
-        (1..n).find_map(|k| self.queues[(me + k) % n].steal())
+    /// 先偷注入队列，再从下一个工人开始轮着偷；成批搬进自己的队列，返回其中一个。
+    fn steal(&self, me: usize, local: &Worker<usize>) -> Option<usize> {
+        let n = self.stealers.len();
+        loop {
+            let found = core::iter::once(self.injector.steal_batch_and_pop(local))
+                .chain((1..n).map(|k| self.stealers[(me + k) % n].steal_batch_and_pop(local)))
+                .collect::<Steal<usize>>();
+            match found {
+                Steal::Success(item) => return Some(item),
+                Steal::Empty => return None,
+                Steal::Retry => {}
+            }
+        }
     }
 }

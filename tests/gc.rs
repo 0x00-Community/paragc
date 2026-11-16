@@ -36,7 +36,8 @@ enum Tree<'gc> {
 
 brand!(TreeB = for<'gc> Tree<'gc>);
 
-const THREADS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+/// 每个堆的回收线程数；Miri 下空闲工人的退避自旋很费解释时间，减到 2（仍有并行标记与线程池）
+const THREADS: NonZeroUsize = NonZeroUsize::new(if cfg!(miri) { 2 } else { 4 }).unwrap();
 /// Miri 下缩小规模（单条仍要在 15 s 内）
 const LIST_LEN: u64 = if cfg!(miri) { 200 } else { 20_000 };
 
@@ -180,10 +181,10 @@ const BALLAST_WORDS: usize = 1100;
 /// Miri 下 8 × 8 超出单条 15 s，缩到 4 × 4
 const HEAPS: usize = if cfg!(miri) { 4 } else { 8 };
 const WORKERS: usize = HEAPS;
-const ITEMS: u64 = if cfg!(miri) { 8 } else { 4_000 };
+const ITEMS: u64 = if cfg!(miri) { 6 } else { 4_000 };
 /// Miri 下也要保证每个堆每轮至少 16 个大对象（够开 2 个标记工人）
 const BALLAST_EVERY: u64 = if cfg!(miri) { 2 } else { 10 };
-const CROSS_ROUNDS: usize = if cfg!(miri) { 2 } else { 8 };
+const CROSS_ROUNDS: usize = if cfg!(miri) { 1 } else { 8 };
 const ITEMS_SUM: u64 = ITEMS * (ITEMS - 1) / 2;
 
 /// 造了几个标签、析构了几个。

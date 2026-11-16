@@ -6,7 +6,7 @@ use std::alloc::{Layout, dealloc};
 use crate::block::{Block, State};
 use crate::header::Header;
 use crate::layout::{GRANULE, SWEEP_CHUNK};
-use crate::workers::Workers;
+use crate::workers::Pool;
 
 /// 单独分配的大对象（头指针）。
 #[derive(Clone, Copy)]
@@ -78,9 +78,9 @@ impl<'a> Sweep<'a> {
     }
 
     /// SAFETY（调用方）：标记已经做完，没有 mutator。
-    pub(crate) unsafe fn run(&self, workers: Workers) -> Swept {
+    pub(crate) unsafe fn run(&self, pool: &mut Pool, workers: usize) -> Swept {
         // SAFETY: 见上
-        workers.run(|_| unsafe { self.work() }).into_iter().fold(Swept::default(), Swept::merge)
+        pool.run(workers, |_| unsafe { self.work() }).into_iter().fold(Swept::default(), Swept::merge)
     }
 
     /// 领一批下标。

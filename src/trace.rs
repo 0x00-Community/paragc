@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicBool, AtomicI8, AtomicI16, AtomicI32, AtomicI64, 
 use core::time::Duration;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use j8lockfree::Owner;
+use crossbeam_deque::Worker;
 
 use crate::block::Block;
 use crate::header::Header;
@@ -28,12 +28,12 @@ pub unsafe trait Trace: Send + Sync {
 
 /// 标记阶段的一个工人：标记对象、标记它跨的行，把需要追踪的对象压进自己的工作队列。
 pub struct Tracer<'t> {
-    work: &'t Owner<'t, usize>,
+    work: &'t Worker<usize>,
     epoch: u32,
 }
 
 impl<'t> Tracer<'t> {
-    pub(crate) fn new(work: &'t Owner<'t, usize>, epoch: u32) -> Self {
+    pub(crate) fn new(work: &'t Worker<usize>, epoch: u32) -> Self {
         Self { work, epoch }
     }
 

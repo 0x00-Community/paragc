@@ -29,5 +29,3 @@ pub(crate) const MIN_SPARE_BLOCKS: usize = 4;
 /// 回收后留着复用的全空块不超过总块数的 1 / 它，多的还给系统
 pub(crate) const SPARE_DIVISOR: usize = 4;
 
-/// 等待别的线程时先自旋这么多轮，之后让出 CPU
-pub(crate) const SPINS: u32 = 64;

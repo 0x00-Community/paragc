@@ -32,7 +32,7 @@ paragc 是**给多个线程共用一个堆的 Rust 程序用的追踪式垃圾�
 | --- | --- |
 | 🧵 **多个 mutator** | `Heap::mutate(&self)` 可以在任意多个线程上同时调用；各自在自己的分配缓冲（`Tlab`）里碰撞分配，整块领用只要一次原子操作。 |
 | 🔒 **借用即独占** | `Heap::collect(&mut self)` 不可能和 `mutate` 重叠：借用检查器就是「停住世界」，没有安全点协议，也没有锁。 |
-| 🏃 **并行回收** | 标记：每个工人一个 Chase–Lev 双端队列、工作窃取；清扫（含析构）：块按批分给同一批工人。 |
+| 🏃 **并行回收** | 每个堆一个常驻线程池（两次回收之间线程挂起）。标记：每个工人一个 crossbeam 工作窃取双端队列、成批偷；清扫（含析构）：块按批分给同一批工人。 |
 | 🏷️ **带品牌的句柄** | `Gc<'gc, T>` 逃不出 `mutate` 的闭包；`Root<B>` 不带生命周期，可以存在任何地方、跨线程传。 |
 | 📌 **不移动** | 对象从不移动，指针就是普通指针，不需要转发。 |
 | 🛡️ **编译期检查** | `#[derive(Trace)]` 拒绝被追踪的类型实现 `Drop`；对象数据对齐超过 8 字节直接编译报错。 |
@@ -71,11 +71,13 @@ heap.collect();
 | 对象头 | 24 字节：追踪函数、析构函数、标记纪元（原子）、粒度数（最高位 = 大对象） |
 | 标记 | 根分给各工人；`swap(纪元)` 抢到的线程负责这个对象：写它跨的行标记、压进自己的队列（没有边的类型不压） |
 | 结束判定 | 自己的队列空、也偷不到 ⇒ 空闲计数 +1，边等边偷；全部工人空闲 ⇒ 结束 |
+| 线程池 | 第一次回收时起、活到堆析构；分派 = 一个原子字（代号 + 参与人数）加一代、只叫醒参与的工人；空闲工人先退避再挂起；工人里的 panic 在回收线程上重新抛出 |
 | 清扫 | 工人按批领块：按起点位图逐个看对象，没标上本轮纪元的析构、清位；块分成 全空 / 有空行 / 满，多于总块数四分之一的空块还给系统 |
 | 根 | `Root<B>` 占根表一个槽；根表只追加，空槽号在回收时整理成只读数组、mutate 期间原子游标领取 |
 | 缓冲过期 | 缓冲记着（堆, 回收次数），回收过就重来（它的块已被重新分类） |
 
-无锁基础件（Chase–Lev 双端队列、只追加分段向量、库存）来自 [j8lockfree](https://crates.io/crates/j8lockfree)。
+工作窃取双端队列与退避来自 [crossbeam](https://github.com/crossbeam-rs/crossbeam)（`crossbeam-deque`、`crossbeam-utils`）；
+只追加分段向量与块库存来自 [j8lockfree](https://crates.io/crates/j8lockfree)。
 
 ## 📏 规则
 
@@ -97,12 +99,14 @@ heap.collect();
 | `eight_threads_eight_heaps_crossed` | 8 线程 × 8 堆：跨堆持有根、别的线程检查与释放、全部堆并行回收的同时释放根、经大对象成环 |
 | `crossed_deep_trees` | 8 堆各一条深链 + 一棵 15 层满二叉树，树叶锚在下一个堆的深链上；每次剪断后析构数都恰好等于理论值 |
 
-全部测试也在 Miri 下跑（Stacked Borrows 和 Tree Borrows，`cfg(miri)` 下自动缩规模）：
+全部测试也在 Miri 下跑（Stacked Borrows 和 Tree Borrows，`cfg(miri)` 下自动缩规模）。要加 `-Zmiri-ignore-leaks`：
+crossbeam-epoch 的全局回收器退出时还拿着延迟释放的垃圾；每堆 4 个回收线程时 Stacked Borrows 还会在 crossbeam-epoch 内部报违例，
+所以 Miri 下测试用 2 个：
 
 ```sh
 cargo test --test gc -- --exact <名字>
-MIRIFLAGS="-Zmiri-permissive-provenance" cargo +nightly miri test --test gc -- --exact <名字>
-MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-tree-borrows" cargo +nightly miri test --test gc -- --exact <名字>
+MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-ignore-leaks" cargo +nightly miri test --test gc -- --exact <名字>
+MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-ignore-leaks -Zmiri-tree-borrows" cargo +nightly miri test --test gc -- --exact <名字>
 ```
 
 ## 📊 性能对比
@@ -156,10 +160,9 @@ CPU ÷ 墙钟 就是实际有几个线程在干活。Intel Core Ultra 7 356H（1
 
 0.1 是暂停式、不移动。之后：
 
-1. 常驻工人线程池、空闲时挂起而不是自旋，让 4 线程以上也能扩展
-2. 并发标记：`Slot` 写入加初始快照（SATB）屏障，mutator 不再等标记
-3. 稀疏块的机会式疏散（Immix defrag）
-4. 年轻对象引用计数（LXR 式）：年轻对象死了立刻回收行，追踪只负责环与老对象
+1. 并发标记：`Slot` 写入加初始快照（SATB）屏障，mutator 不再等标记
+2. 稀疏块的机会式疏散（Immix defrag）
+3. 年轻对象引用计数（LXR 式）：年轻对象死了立刻回收行，追踪只负责环与老对象
 
 ## 📜 许可
 
