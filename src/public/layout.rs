@@ -1,7 +1,7 @@
 //! 公开堆窗口里的布局：位置全部定死，任何进程按窗口起点 + 常量偏移就能找到。
 //!
 //! ```text
-//! 0          超级块（1 页）
+//! 0          超级块 + 挂接表（1 页）
 //! types      类型表：每个类型一项（类型键、大小、指针图在哪）
 //! map        指针图：各类型里指针槽的偏移，接着往后排
 //! entries    入口表：只有这一张，别处指进这个堆的引用各占一项
@@ -17,7 +17,7 @@ use crate::layout::BLOCK;
 use super::region::WINDOW;
 
 /// 超级块里的魔数：认出这是 paragc 的公开堆、布局版本对得上
-pub(crate) const MAGIC: u64 = u64::from_le_bytes(*b"paragcP1");
+pub(crate) const MAGIC: u64 = u64::from_le_bytes(*b"paragcP2");
 /// 页大小：各段按页对齐、按页延长文件
 pub(crate) const PAGE: usize = 4096;
 /// 类型表容量
@@ -26,6 +26,10 @@ pub(crate) const TYPE_CAP: usize = 1024;
 pub(crate) const MAP_CAP: usize = 64 * 1024;
 /// 窗口里每这么多字节给一个入口
 pub(crate) const BYTES_PER_ENTRY: usize = 16 * 1024;
+/// 挂接表容量：同时映射这个堆的地方（进程，或同一进程里的多个地址区）最多这么多
+pub(crate) const ATTACH_CAP: usize = 32;
+/// 挂接表在超级块那一页里的偏移
+pub(crate) const ATTACH_OFF: usize = 1024;
 
 /// 超级块（窗口偏移 0）。跨进程共享：除了建堆时写一次的字段，全是原子量。
 #[repr(C)]
@@ -35,13 +39,17 @@ pub(crate) struct Super {
     pub(crate) window: AtomicU64,
     /// 堆号 = 窗口号
     pub(crate) heap: AtomicU64,
-    /// 握手字：最高位是「要回收」请求，低位是 mutate 里的线程数（所有挂着这个堆的地方一起算）
-    pub(crate) gate: AtomicU64,
+    /// 回收请求（futex 字）：0 = 没人在回收，否则是回收方的挂接槽号 + 1；非 0 时新的 mutate 先等
+    pub(crate) request: AtomicU32,
+    /// 最近一次开始的回收用的纪元（回收开始时就写）：回收方被杀、别人接手时用比它新的纪元从头标
+    pub(crate) marking: AtomicU32,
     /// 最后一次完成的标记的纪元
     pub(crate) epoch: AtomicU32,
     /// 开过的块数（块区里下一个新块的序号）
     pub(crate) blocks: AtomicU32,
     pub(crate) collections: AtomicU64,
+    /// 回收方被杀、别人接手重做的次数
+    pub(crate) takeovers: AtomicU64,
     /// 可用块栈的头（见 [`super::heap::Stack`]）
     pub(crate) available: AtomicU64,
     /// 类型表里下一项
@@ -68,10 +76,12 @@ impl Super {
             magic: AtomicU64::new(MAGIC),
             window: AtomicU64::new(WINDOW as u64),
             heap: AtomicU64::new(heap),
-            gate: AtomicU64::new(0),
+            request: AtomicU32::new(0),
+            marking: AtomicU32::new(0),
             epoch: AtomicU32::new(1),
             blocks: AtomicU32::new(0),
             collections: AtomicU64::new(0),
+            takeovers: AtomicU64::new(0),
             available: AtomicU64::new(0),
             types: AtomicU32::new(0),
             map: AtomicU32::new(0),
@@ -84,6 +94,21 @@ impl Super {
         }
     }
 }
+
+/// 挂接表的一项（一条缓存行，免得各进程的计数互相挤）。
+#[repr(C, align(64))]
+pub(crate) struct Attachment {
+    /// 进程号；0 = 空槽
+    pub(crate) pid: AtomicU32,
+    /// 这个挂接里在 mutate 中的线程数（futex 字：回收方等它归零）
+    pub(crate) inside: AtomicU32,
+    /// 进程启动时间（见 [`super::process::Process`]）；0 = 还在登记
+    pub(crate) start: AtomicU64,
+    /// 这个挂接里因为回收请求挡在门口、还没进去的线程数（futex 字）：回收方先让它们进去再抢下一次，免得把 mutator 饿死
+    pub(crate) waiting: AtomicU32,
+}
+
+const _: () = assert!(size_of::<Super>() <= ATTACH_OFF && ATTACH_OFF + ATTACH_CAP * size_of::<Attachment>() <= PAGE, "挂接表放在超级块那一页里");
 
 /// 按需延长文件的几段。
 #[derive(Clone, Copy)]

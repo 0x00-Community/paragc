@@ -8,12 +8,12 @@ use core::marker::PhantomData;
 use core::num::NonZeroUsize;
 use core::ptr::{NonNull, null_mut};
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::time::Duration;
 use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-use crossbeam_utils::Backoff;
 use crate::lockfree::SegVec;
 
 use crate::block::{Block, State};
@@ -22,14 +22,19 @@ use crate::header::{Core, MAX_EPOCH};
 use crate::layout::{BLOCK, GRANULE, LARGE};
 use crate::workers::Pool;
 
-use super::layout::{BlockState, Entry, Kind, Layout, MAP_CAP, PAGE, Segment, Super, TYPE_CAP, TypeEntry};
+use super::layout::{ATTACH_CAP, ATTACH_OFF, Attachment, BlockState, Entry, Kind, Layout, MAP_CAP, PAGE, Segment, Super, TYPE_CAP, TypeEntry};
 use super::mark::Marker;
+use super::process::{FutexWord, Process};
 use super::ptr::{EdgeMap, PHEADER, PHeader, Public, PublicBrand, PublicGc, Shared};
 use super::region::{Region, WINDOW};
 use super::space::Space;
 
-/// 握手字的最高位：要回收，新的 mutate 先等
-const REQUEST: u64 = 1 << 63;
+/// 等别人（回收方、mutate 里的线程）时每隔多久醒来查一次对方进程还在不在
+const POLL: Duration = Duration::from_millis(10);
+/// [`Attachment::pid`]：有人正在收拾这个死掉的挂接（防两个回收方重复还它的入口）
+const REAPING: u32 = u32::MAX;
+/// 回收方抢回收权前，等挡在门口的 mutator 进门最多等这么多轮（每轮 [`POLL`]）
+const YIELD_ROUNDS: usize = 10;
 /// 清扫时每次领多少块
 const SWEEP_BATCH: usize = 16;
 /// 栈头低 32 位：栈顶序号 + 1（0 = 空）；高 32 位是改动次数（防 ABA）
@@ -138,6 +143,8 @@ pub(crate) struct Inner {
     types: SegVec<(usize, u32)>,
     /// 给 mutate 复用的分配缓冲
     spare: AtomicPtr<Tlab>,
+    /// 本句柄在挂接表里的槽号
+    slot: usize,
 }
 
 // SAFETY: 窗口里的状态都是原子量或由握手保护；其余是线程安全的
@@ -149,7 +156,7 @@ impl Inner {
     /// 窗口 `index` 已经映射上 `backing`；`fresh` 时写新的超级块，否则核对。出错时析构负责还窗口。
     pub(crate) fn new(space: Arc<Space>, index: usize, backing: Backing, threads: NonZeroUsize, fresh: bool) -> io::Result<Self> {
         let window = NonNull::new(space.region().window(index)).expect("窗口地址非空");
-        let me = Self { space, index, window, layout: Layout::new(), backing, threads, pool: OnceLock::new(), types: SegVec::default(), spare: AtomicPtr::new(null_mut()) };
+        let mut me = Self { space, index, window, layout: Layout::new(), backing, threads, pool: OnceLock::new(), types: SegVec::default(), spare: AtomicPtr::new(null_mut()), slot: ATTACH_CAP };
         if fresh {
             me.backing.commit(0, PAGE);
             // SAFETY: 新堆，窗口开头一页刚有内存，还没人读
@@ -157,7 +164,118 @@ impl Inner {
         } else if me.sup().heap.load(Ordering::Acquire) != index as u64 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "超级块里的堆号与窗口不符"));
         }
+        me.slot = me.attach().ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "这个公开堆的挂接表满了"))?;
         Ok(me)
+    }
+
+    /// 在挂接表里领一个槽登记本进程；满了先收拾死掉的挂接再试一次。
+    fn attach(&self) -> Option<usize> {
+        let me = Process::current();
+        let claim = || (0..ATTACH_CAP).find(|&i| self.attachment(i).pid.compare_exchange(0, me.pid, Ordering::AcqRel, Ordering::Relaxed).is_ok());
+        let slot = claim().or_else(|| {
+            self.reap_dead();
+            claim()
+        })?;
+        let a = self.attachment(slot);
+        a.inside.store(0, Ordering::Relaxed);
+        a.waiting.store(0, Ordering::Relaxed);
+        a.start.store(me.start, Ordering::Release);
+        Some(slot)
+    }
+
+    fn attachment(&self, i: usize) -> &Attachment {
+        // SAFETY: 挂接表在超级块那一页里（建堆时就有内存），i < ATTACH_CAP；表项全是原子量
+        unsafe { &*self.at::<Attachment>(ATTACH_OFF).add(i) }
+    }
+
+    /// 挂接槽 `i` 的进程还活着（空槽、正在被收拾的都算不活）。
+    fn alive(&self, i: usize) -> bool {
+        let a = self.attachment(i);
+        let pid = a.pid.load(Ordering::Acquire);
+        pid != 0 && pid != REAPING && Process { pid, start: a.start.load(Ordering::Acquire) }.alive()
+    }
+
+    /// 收拾所有死掉的挂接。
+    ///
+    /// 正挂着回收请求的那个不收拾：它的槽要是被新进程领走，大家会以为回收方还活着，一直等下去；它由接手的回收方换下来后再收拾。
+    fn reap_dead(&self) {
+        let owner = self.sup().request.load(Ordering::SeqCst) as usize;
+        for i in 0..ATTACH_CAP {
+            let pid = self.attachment(i).pid.load(Ordering::Acquire);
+            if pid != 0 && pid != REAPING && i + 1 != owner && !self.alive(i) {
+                self.reap(i, pid);
+            }
+        }
+    }
+
+    /// 收拾死掉的挂接 `i`（进程号 `pid`）：还掉它持有的入口、清掉它的 mutate 计数，空出槽。先把进程号换成 [`REAPING`]，只有换成功的那个来做。
+    fn reap(&self, i: usize, pid: u32) {
+        let a = self.attachment(i);
+        if a.pid.compare_exchange(pid, REAPING, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            return;
+        }
+        let holder = u32::try_from(i + 1).expect("挂接槽号");
+        // 持有方是它的入口都还掉（含领到一半、指针还没写的）
+        for j in 0..self.sup().entries.load(Ordering::Acquire) {
+            if self.entry(j).holder.load(Ordering::Acquire) == holder {
+                self.release_entry(j);
+            }
+        }
+        a.inside.store(0, Ordering::Release);
+        a.waiting.store(0, Ordering::Release);
+        a.start.store(0, Ordering::Relaxed);
+        a.pid.store(0, Ordering::Release);
+    }
+
+    /// 抢回收权之前：上一次回收挡在门口的 mutator 先进门（醒过来要时间，不让一让就会被接连的回收饿死）。
+    /// 死掉的挂接不等；最多等 [`YIELD_ROUNDS`] 轮。
+    fn yield_to_waiting(&self) {
+        for _ in 0..YIELD_ROUNDS {
+            let Some(i) = (0..ATTACH_CAP).find(|&i| self.attachment(i).waiting.load(Ordering::SeqCst) != 0 && self.alive(i)) else {
+                return;
+            };
+            let waiting = &self.attachment(i).waiting;
+            waiting.wait(waiting.load(Ordering::SeqCst), POLL);
+        }
+    }
+
+    /// 暂停式回收。拿回收权：没人在回收就占下；别人在回收、它还活着就等它做完返回；它死了（回收到一半被杀）就接手，
+    /// 从头再收一遍（标记只写新纪元、纪元到最后才发布，清扫重做结果一样）。然后等每个挂接的 mutate 走空（死了的不等），
+    /// 收拾死掉的挂接，并行标记 + 清扫。
+    fn collect(&self) {
+        let sup = self.sup();
+        let me = u32::try_from(self.slot + 1).expect("挂接槽号");
+        loop {
+            let owner = sup.request.load(Ordering::SeqCst);
+            if owner == 0 {
+                self.yield_to_waiting();
+                if sup.request.compare_exchange(0, me, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                    break;
+                }
+            } else if self.alive(owner as usize - 1) {
+                sup.request.wait(owner, POLL);
+                if sup.request.load(Ordering::SeqCst) != owner {
+                    return;
+                }
+            } else if sup.request.compare_exchange(owner, me, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                sup.takeovers.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+        }
+        for i in 0..ATTACH_CAP {
+            let inside = &self.attachment(i).inside;
+            loop {
+                let n = inside.load(Ordering::SeqCst);
+                if n == 0 || !self.alive(i) {
+                    break;
+                }
+                inside.wait(n, POLL);
+            }
+        }
+        self.reap_dead();
+        self.collect_exclusive();
+        sup.request.store(0, Ordering::SeqCst);
+        sup.request.wake_all();
     }
 
     pub(crate) fn sup(&self) -> &Super {
@@ -193,6 +311,10 @@ impl Inner {
         let (start, limit) = self.layout.segment(segment);
         let to = end.next_multiple_of(PAGE).min(limit);
         let from = have.max(start);
+        // 这一段还一项都没用（比如没有入口时回收）：没有要延长的（fallocate 不收 0 长度）
+        if to <= from {
+            return;
+        }
         self.backing.commit(from, to - from);
         committed.fetch_max(to as u64, Ordering::AcqRel);
     }
@@ -284,7 +406,7 @@ impl Inner {
             i
         });
         let e = self.entry(i);
-        e.holder.store(0, Ordering::Relaxed);
+        e.holder.store(u32::try_from(self.slot + 1).expect("挂接槽号"), Ordering::Relaxed);
         e.ptr.store(off, Ordering::Release);
         i
     }
@@ -292,6 +414,8 @@ impl Inner {
     /// 句柄析构：清空入口、还回栈里（任何时候、任何线程）。
     pub(crate) fn release_entry(&self, i: u32) {
         let e = self.entry(i);
+        // 先清持有方：收拾死进程时按持有方认它没还的入口，还过的不能再还一次
+        e.holder.store(0, Ordering::Release);
         e.ptr.store(0, Ordering::Release);
         Stack { head: &self.sup().free_entries }.push(i, &e.next);
     }
@@ -331,22 +455,35 @@ impl Inner {
     }
 
     /// 大对象：开一串连续的新块，对象头在第一块开头。
-    fn alloc_large(&self, bytes: usize) -> *mut u8 {
+    /// 大对象：开一串连续的新块，对象头在第一块开头；返回（地址, 第一块序号, 块数）。块的种类等对象写完再登记
+    /// （[`Inner::publish_large`]）：进程死在中间，这些块停在「还没开过」，清扫不会去读没写完的头。
+    fn alloc_large(&self, bytes: usize) -> (*mut u8, u32, u32) {
         let n = bytes.div_ceil(BLOCK);
         let i = self.open_blocks(n);
         self.sup().allocated.fetch_add((n * BLOCK) as u64, Ordering::Relaxed);
-        for j in i + 1..i + u32::try_from(n).expect("块数") {
+        (self.block(i).line(0), i, u32::try_from(n).expect("块数"))
+    }
+
+    /// 大对象写完了：登记块的种类，先尾后头（清扫从头认出大对象）。
+    fn publish_large(&self, first: u32, n: u32) {
+        for j in first + 1..first + n {
             self.state(j).kind.store(Kind::LargeTail as u32, Ordering::Release);
         }
-        self.state(i).kind.store(Kind::LargeHead as u32, Ordering::Release);
-        self.block(i).line(0)
+        self.state(first).kind.store(Kind::LargeHead as u32, Ordering::Release);
     }
 
     /// 暂停式回收（握手已经把 mutator 都挡在外面）：从入口表出发并行标记，再并行清扫。
+    ///
+    /// 纪元取「上次完成的」与「上次开始的」里大的那个 + 1：上一次回收做到一半被杀时，它标过的对象不能算作这次标过。
+    /// 别的进程可能死在开块 / 领入口的中途（游标加了、文件还没延长）：先把这两张表延长到游标处，扫的时候才不会碰到没有内存的页。
     fn collect_exclusive(&self) {
         let sup = self.sup();
-        let epoch = sup.epoch.load(Ordering::Acquire).checked_add(1).filter(|&e| e <= MAX_EPOCH).expect("纪元用完了");
+        let last = sup.epoch.load(Ordering::Acquire).max(sup.marking.load(Ordering::Acquire));
+        let epoch = last.checked_add(1).filter(|&e| e <= MAX_EPOCH).expect("纪元用完了");
+        sup.marking.store(epoch, Ordering::Release);
         let blocks = sup.blocks.load(Ordering::Acquire) as usize;
+        self.commit(Segment::States, self.layout.states + blocks * size_of::<BlockState>());
+        self.commit(Segment::Entries, self.layout.entries + sup.entries.load(Ordering::Acquire) as usize * size_of::<Entry>());
         let roots: Vec<usize> = (0..sup.entries.load(Ordering::Acquire))
             .filter_map(|i| {
                 let off = self.entry(i).ptr.load(Ordering::Acquire);
@@ -408,11 +545,13 @@ impl Inner {
         }
     }
 
-    /// 拆掉一个死掉的大对象：它占的块元数据清零、改成小对象块，压进可用栈。
+    /// 拆掉一个死掉的大对象：它占的块元数据清零、改成小对象块，压进可用栈。先拆后面的块、最后拆头：
+    /// 拆到一半进程被杀，头还在，下一次回收再拆一遍，已经拆过的（不再是 LargeTail）跳过，不会重复进栈。
     fn free_large(&self, head: u32) {
         // SAFETY: 大对象的头在第一块开头，还没拆
         let n = unsafe { &*self.block(head).line(0).cast::<Core>() }.bytes().div_ceil(BLOCK);
-        for j in head..head + u32::try_from(n).expect("块数") {
+        let tails = head + 1..head + u32::try_from(n).expect("块数");
+        for j in tails.filter(|&j| Kind::from(self.state(j).kind.load(Ordering::Acquire)) == Kind::LargeTail).chain([head]) {
             let b = self.block(j);
             // SAFETY: 对象已死（没有析构），块里没有别的对象
             unsafe { b.reset() };
@@ -425,6 +564,12 @@ impl Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
+        // 句柄都已析构（入口都还了），没有 mutator：空出挂接槽
+        if self.slot < ATTACH_CAP {
+            let a = self.attachment(self.slot);
+            a.start.store(0, Ordering::Relaxed);
+            a.pid.store(0, Ordering::Release);
+        }
         // SAFETY: 最后一个引用：没有 mutator、句柄都已析构
         unsafe { self.space.region().unmap(self.index) };
         self.space.release(self.index);
@@ -458,6 +603,8 @@ pub struct PublicStats {
     /// 开过的块数
     pub blocks: usize,
     pub collections: u64,
+    /// 回收方被杀（回收做到一半）、由别人接手重做的次数
+    pub takeovers: u64,
 }
 
 impl PublicHeap {
@@ -470,6 +617,11 @@ impl PublicHeap {
         Arc::ptr_eq(&self.0, inner)
     }
 
+    /// 挂接表里占着的槽数（映射着这个堆的地方：进程，或同一进程里的多个地址区；含已死、还没被收拾的）。
+    pub fn attached(&self) -> usize {
+        (0..ATTACH_CAP).filter(|&i| self.0.attachment(i).pid.load(Ordering::Acquire) != 0).count()
+    }
+
     /// 在堆上做事；可以在多个线程上同时调用。闭包里分配的对象只有挂到 [`Public`] 上（直接或间接）才能活过下一次回收。
     pub fn mutate<R>(&self, f: impl for<'p> FnOnce(&PublicMutator<'p>) -> R) -> R {
         let spare = self.0.spare.swap(null_mut(), Ordering::AcqRel);
@@ -480,7 +632,7 @@ impl PublicHeap {
             unsafe { Box::from_raw(spare) }
         };
         let r = {
-            let _gate = Gate::enter(self.0.sup());
+            let _gate = Gate::enter(&self.0);
             tlab.adopt(&self.0);
             // 回收只在没有 mutator 时进行，所以一次 mutate 里纪元不变
             let epoch = self.0.sup().epoch.load(Ordering::Acquire);
@@ -494,22 +646,11 @@ impl PublicHeap {
         r
     }
 
-    /// 暂停式回收：挂上请求、等所有地方的 mutate 走空，并行标记 + 并行清扫。别人正在回收就等它做完返回。
+    /// 暂停式回收：挂上请求、等所有挂着这个堆的地方（含别的进程）的 mutate 走空，并行标记 + 并行清扫。
+    /// 别人正在回收就等它做完返回；回收方被杀了就接手。死掉的进程不等，它持有的入口在这里还掉。
     /// 不要在这个堆的 mutate 里调用（会一直等自己走空）。
     pub fn collect(&self) {
-        let sup = self.0.sup();
-        let backoff = Backoff::new();
-        if sup.gate.fetch_or(REQUEST, Ordering::AcqRel) & REQUEST != 0 {
-            while sup.gate.load(Ordering::Acquire) & REQUEST != 0 {
-                backoff.snooze();
-            }
-            return;
-        }
-        while sup.gate.load(Ordering::Acquire) & !REQUEST != 0 {
-            backoff.snooze();
-        }
-        self.0.collect_exclusive();
-        sup.gate.fetch_and(!REQUEST, Ordering::AcqRel);
+        self.0.collect();
     }
 
     pub fn stats(&self) -> PublicStats {
@@ -519,34 +660,65 @@ impl PublicHeap {
             allocated: usize::try_from(sup.allocated.load(Ordering::Relaxed)).unwrap_or(usize::MAX),
             blocks: sup.blocks.load(Ordering::Relaxed) as usize,
             collections: sup.collections.load(Ordering::Relaxed),
+            takeovers: sup.takeovers.load(Ordering::Relaxed),
         }
     }
 }
 
-/// 在 mutate 里：超级块握手字进门计数加一（有回收请求就先等），出门减一（panic 也减）。
-struct Gate<'h>(&'h Super);
+/// 在 mutate 里：本挂接的计数加一，出门减一（panic 也减）。
+///
+/// 进门先加计数、再看回收请求，回收方先挂请求、再看计数（都是 SeqCst）：两边至少有一方看到对方，所以不会有
+/// mutator 在回收进行时溜进来。看到请求就退回去等；回收方死了（请求一直挂着）就自己接手把回收做完。
+struct Gate<'h> {
+    inside: &'h AtomicU32,
+    request: &'h AtomicU32,
+}
 
 impl<'h> Gate<'h> {
-    fn enter(sup: &'h Super) -> Self {
-        let backoff = Backoff::new();
-        let mut word = sup.gate.load(Ordering::Acquire);
+    fn enter(heap: &'h Inner) -> Self {
+        let request = &heap.sup().request;
+        let a = heap.attachment(heap.slot);
+        let (inside, waiting) = (&a.inside, &a.waiting);
+        // 挡在门口时记一笔，进了门再销掉（见 Attachment::waiting）
+        let mut queued = false;
+        let leave_queue = |queued: &mut bool| {
+            if core::mem::take(queued) && waiting.fetch_sub(1, Ordering::SeqCst) == 1 {
+                waiting.wake_all();
+            }
+        };
         loop {
-            if word & REQUEST != 0 {
-                backoff.snooze();
-                word = sup.gate.load(Ordering::Acquire);
+            let owner = request.load(Ordering::SeqCst);
+            if owner != 0 {
+                if heap.alive(owner as usize - 1) {
+                    if !queued {
+                        waiting.fetch_add(1, Ordering::SeqCst);
+                        queued = true;
+                    }
+                    request.wait(owner, POLL);
+                } else {
+                    // 回收方死了：自己接手（先销掉排队，回收方会等排队的人）
+                    leave_queue(&mut queued);
+                    heap.collect();
+                }
                 continue;
             }
-            match sup.gate.compare_exchange_weak(word, word + 1, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return Self(sup),
-                Err(now) => word = now,
+            inside.fetch_add(1, Ordering::SeqCst);
+            if request.load(Ordering::SeqCst) == 0 {
+                leave_queue(&mut queued);
+                return Self { inside, request };
             }
+            inside.fetch_sub(1, Ordering::SeqCst);
+            inside.wake_all();
         }
     }
 }
 
 impl Drop for Gate<'_> {
     fn drop(&mut self) {
-        self.0.gate.fetch_sub(1, Ordering::AcqRel);
+        self.inside.fetch_sub(1, Ordering::SeqCst);
+        if self.request.load(Ordering::SeqCst) != 0 {
+            self.inside.wake_all();
+        }
     }
 }
 
@@ -607,14 +779,25 @@ impl<'p> PublicMutator<'p> {
         let bytes = (PHEADER + size_of::<T>()).next_multiple_of(GRANULE);
         let ty = self.heap.type_of::<T>(self.tlab);
         let large = bytes > LARGE;
-        let p = if large { self.heap.alloc_large(bytes) } else { self.alloc_small(bytes) };
+        let (p, run) = if large {
+            let (p, first, n) = self.heap.alloc_large(bytes);
+            (p, Some((first, n)))
+        } else {
+            (self.alloc_small(bytes), None)
+        };
         // SAFETY: p 是 bytes 字节、按粒度对齐的新内存，归这次分配独有
-        unsafe {
+        let gc = unsafe {
             p.cast::<PHeader>().write(PHeader::new(bytes, large, ty));
             let data = PHeader::data(p.cast());
             data.cast::<T>().write(value);
             PublicGc::from_data(data)
+        };
+        // 写完才登记（小对象的起点位、大对象的块种类）：进程死在中间，清扫也不会去读一个没写完的对象
+        match run {
+            Some((first, n)) => self.heap.publish_large(first, n),
+            None => Block::containing(p).set_start(p),
         }
+        gc
     }
 
     /// 给对象建一个句柄（入口）。
@@ -652,7 +835,6 @@ impl<'p> PublicMutator<'p> {
             let cursor = t.cursor.get();
             if t.limit.get().addr() - cursor.addr() >= bytes {
                 t.cursor.set(cursor.wrapping_add(bytes));
-                Block::containing(cursor).set_start(cursor);
                 return cursor;
             }
             self.refill();

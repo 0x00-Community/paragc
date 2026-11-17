@@ -363,3 +363,17 @@ fn eight_threads_churn_public_heap() {
         assert_eq!(heap.stats().live, anchor_bytes + NODE * usize::try_from(live).unwrap(), "存活字节数恰好是各条链");
     }
 }
+
+#[test]
+#[cfg_attr(miri, ignore = "Miri 跑不了文件映射")]
+fn collect_fresh_file_heap_without_roots() {
+    // 新文件、一个入口都没有就回收（各段还一项都没用，不能去延长 0 长度），再只分配不挂根地回收
+    let path = shm_path("fresh");
+    let space = PublicSpace::reserve().unwrap();
+    let heap = space.create(&path, THREADS).unwrap();
+    heap.collect();
+    drop(list(&heap, 1_000));
+    heap.collect();
+    assert_eq!(heap.stats().live, 0);
+    assert_eq!(heap.stats().collections, 2);
+}

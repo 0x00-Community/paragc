@@ -2,6 +2,7 @@
 mod heap;
 mod layout;
 mod mark;
+mod process;
 mod ptr;
 mod region;
 mod space;
