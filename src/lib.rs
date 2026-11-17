@@ -8,6 +8,7 @@ mod gc;
 mod header;
 mod heap;
 mod layout;
+mod lockfree;
 mod mark;
 mod release;
 mod roots;

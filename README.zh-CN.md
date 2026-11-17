@@ -90,7 +90,7 @@ heap.collect();
 | 并发重新计数 | 握手时翻转奇偶，丢掉握手前的登记（记的是旧计数下的值；活着的所在对象会被重新扫描）。标记工人扫描的每条边 +1。标记期间槽本轮第一次被写同样登记；工人重新计数一个槽后再读一次，期间 mutator 改写过就替它登记（年轻对象的槽还不计数，mutator 不会登记）。黑分配的对象记进队列，收尾时补算它们的边；然后结算登记的槽（新值 +1、上次计入的值 −1，减量只留给本轮标记为活的对象——死的马上被清扫）。收尾一返回计数就可信 |
 
 工作窃取双端队列与退避来自 [crossbeam](https://github.com/crossbeam-rs/crossbeam)（`crossbeam-deque`、`crossbeam-utils`）；
-只追加分段向量与块库存来自 [j8lockfree](https://crates.io/crates/j8lockfree)。
+块表与根表用的只追加分段向量、只压入链是 paragc 自己的（`src/lockfree.rs`）。
 
 ## 📏 规则
 

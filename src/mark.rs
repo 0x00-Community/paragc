@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_utils::{Backoff, CachePadded};
 
-use j8lockfree::SegVec;
+use crate::lockfree::SegVec;
 
 use crate::block::Block;
 use crate::copy::Copier;

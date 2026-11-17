@@ -8,7 +8,7 @@ use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use j8lockfree::{PushList, SegVec};
+use crate::lockfree::{PushList, SegVec};
 
 use crate::header::Header;
 use crate::{Gc, Mutator, Trace};
@@ -94,8 +94,7 @@ impl RootTable {
     /// 句柄析构：清空槽、槽号挂回去（任何时候、任何线程）。
     pub(crate) fn release(&self, i: usize) {
         self.slot(i).store(null_mut());
-        // 这张表从不封口，压入不会被退回
-        let _ = self.returned.push(i);
+        self.returned.push(i);
     }
 
     /// 疏散回收：每个根交给 `f`（标记，必要时搬走），改成它返回的新地址。
