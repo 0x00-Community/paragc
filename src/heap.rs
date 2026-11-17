@@ -99,6 +99,8 @@ pub struct Heap {
     parallel_drop: AtomicBool,
     /// 年轻回收怎么搬存活的年轻对象（[`YoungEvacuation`] 的值）
     young_evacuation: AtomicU8,
+    /// [`Heap::shrink`] 进行中：本轮清扫不留备用空块、空行还给系统
+    shrinking: AtomicBool,
     /// 块的来源（析构时 Drop 里先把块都还回来，之后它才解除映射）
     pages: Pages,
     roots: Arc<RootTable>,
@@ -187,6 +189,7 @@ impl Heap {
             sweeper: Sweeper::default(),
             parallel_drop: AtomicBool::new(true),
             young_evacuation: AtomicU8::new(YoungEvacuation::default() as u8),
+            shrinking: AtomicBool::new(false),
             pages: Pages::default(),
             roots: Arc::default(),
             allocated: AtomicUsize::new(0),
@@ -570,7 +573,7 @@ impl Heap {
         self.blocks.extend(old);
         let large = self.large.take();
         let spare = (*self.allocated.get_mut() / BLOCK).max(MIN_SPARE_BLOCKS);
-        self.sweeper.start(epoch, young, large, spare);
+        self.sweeper.start(epoch, young, large, spare, false);
         self.evacuated = (0, moved.into_inner());
         *self.allocated.get_mut() = 0;
         self.collections += 1;
@@ -594,6 +597,15 @@ impl Heap {
     pub fn collect(&mut self) {
         self.finish_marking();
         self.sweep_concurrently();
+    }
+
+    /// 尽量把内存还给系统（像 cppgc 的减内存回收）：完整回收（带疏散），全空的块一个不留，
+    /// 有空行的块把凑满整页的空行 `madvise` 掉（之后再分配进去要重新缺页，所以平时的回收不做）。
+    /// 适合空闲时、或者进程收到内存压力时调用。
+    pub fn shrink(&mut self) {
+        *self.shrinking.get_mut() = true;
+        self.collect();
+        *self.shrinking.get_mut() = false;
     }
 
     /// 标记收尾：有并发标记在进行就清空写屏障攒下的灰对象把它标完，否则从全部 [`crate::Root`] 出发并行标记；
@@ -680,8 +692,9 @@ impl Heap {
         let large = self.large.take();
         // 留作备用的全空块：上一轮领用了多少块，下一轮大概还要这么多；多的还给系统。
         // 留少了每轮都要新开块（清零 + 缺页），比如临时对象多的负载每轮几乎全空
-        let spare = (*self.allocated.get_mut() / BLOCK).max(MIN_SPARE_BLOCKS);
-        self.sweeper.start(epoch, blocks, large, spare);
+        let shrinking = *self.shrinking.get_mut();
+        let spare = if shrinking { 0 } else { (*self.allocated.get_mut() / BLOCK).max(MIN_SPARE_BLOCKS) };
+        self.sweeper.start(epoch, blocks, large, spare, shrinking);
         self.evacuated = evacuated;
         self.epoch = epoch;
         *self.marking.get_mut() = 0;
@@ -797,7 +810,7 @@ impl Drop for Heap {
         let blocks = self.blocks.take();
         let large = self.large.take();
         while !matches!(self.available.steal(), Steal::Empty) {}
-        self.sweeper.start(epoch, blocks, large, 0);
+        self.sweeper.start(epoch, blocks, large, 0, false);
         self.sweeper.finish(&pool, self, parallel_drop);
         debug_assert!(self.blocks.is_empty() && self.large.is_empty());
         let spare = *self.spare.get_mut();

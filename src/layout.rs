@@ -512,6 +512,29 @@ impl Block {
         self.meta().starts[g / BITS].fetch_or(1 << (g % BITS), Ordering::Relaxed);
     }
 
+    /// 把凑满整页的空行（行标记早于 `epoch`）还给系统（`madvise(MADV_DONTNEED)`；第 0 页有元数据，不碰）。
+    /// 之后再分配进去会重新缺页（内容是零，分配不依赖内容）。只在 Linux（Miri 除外）。
+    /// SAFETY（调用方）：空行里没有还要用的东西（死对象已析构），没有 mutator 在用这个块。
+    pub unsafe fn discard_free_lines(self, epoch: u32) {
+        #[cfg(all(target_os = "linux", not(miri)))]
+        {
+            /// 一页几行
+            const PER_PAGE: usize = PAGE / LINE;
+            let mut from = PER_PAGE.max(Self::FIRST_LINE);
+            while let Some((start, end)) = self.hole(from, epoch) {
+                let first = start.next_multiple_of(PER_PAGE);
+                let last = end / PER_PAGE * PER_PAGE;
+                if first < last {
+                    // SAFETY: 整页落在本块的空行里；见上
+                    unsafe { libc::madvise(self.line(first).cast(), (last - first) * LINE, libc::MADV_DONTNEED) };
+                }
+                from = end;
+            }
+        }
+        #[cfg(not(all(target_os = "linux", not(miri))))]
+        let _ = epoch;
+    }
+
     /// 有没有放得下 `bytes` 字节的空洞（连续空行）。
     pub fn has_hole(self, bytes: usize, epoch: u32) -> bool {
         let need = bytes.div_ceil(LINE);

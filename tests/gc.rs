@@ -1233,7 +1233,7 @@ fn serial_drop_stays_on_the_caller() {
 /// 一行大（232 字节数据 + 24 字节头 = 256）
 #[derive(Trace)]
 struct Line {
-    _pad: [u64; 29],
+    fill: [u64; 29],
 }
 
 /// 五个正好填满一行（48 字节）
@@ -1265,7 +1265,7 @@ fn medium_objects_overflow_without_wasting_holes() {
     let mut heap = Heap::new(THREADS);
     // 连续分配一行大的对象，每三个扔一个：完整回收后每个死的都是单行空洞（块里存活 2/3，不会被疏散）
     let lines: Root<LinesB> = heap.mutate(|m| {
-        let all: Vec<_> = (0..3 * HOLES).map(|_| m.alloc(Line { _pad: [0; 29] })).collect();
+        let all: Vec<_> = (0..3 * HOLES).map(|_| m.alloc(Line { fill: [0; 29] })).collect();
         m.root(m.alloc(Lines { kept: all.iter().enumerate().filter(|(i, _)| i % 3 != 2).map(|(_, &l)| Slot::from(Some(l))).collect() }))
     });
     heap.collect();
@@ -1370,4 +1370,25 @@ fn young_evacuation_moves_survivors() {
         assert_eq!(drops.load(Ordering::Relaxed), 4 * n, "{mode:?}: 摘掉的链没收干净");
         drop(anchor);
     }
+}
+
+/// `shrink`：空行还给系统后对象完好，之后接着往那些空行里分配（重新缺页、内容是零）也对。
+#[test]
+fn shrink_keeps_objects_and_reuses_lines() {
+    const HOLES: usize = if cfg!(miri) { 100 } else { 3000 };
+    let mut heap = Heap::new(THREADS);
+    let lines: Root<LinesB> = heap.mutate(|m| {
+        let all: Vec<_> = (0..3 * HOLES).map(|i| m.alloc(Line { fill: [i as u64; 29] })).collect();
+        m.root(m.alloc(Lines { kept: all.iter().enumerate().filter(|(i, _)| i % 3 == 0).map(|(_, &l)| Slot::from(Some(l))).collect() }))
+    });
+    heap.shrink();
+    let check = |heap: &Heap| heap.mutate(|m| m.get(&lines).kept.iter().enumerate().all(|(k, s)| s.get().is_some_and(|l| l.fill.iter().all(|&x| x == 3 * k as u64))));
+    assert!(check(&heap), "shrink 之后存活对象的内容变了");
+    let drops = Arc::new(AtomicUsize::new(0));
+    let fresh = build_tree(&heap, &drops, if cfg!(miri) { 8 } else { 14 });
+    assert!(check(&heap));
+    assert_eq!(heap.mutate(|m| m.get(&fresh).count()), (1 << if cfg!(miri) { 8 } else { 14 }) - 1);
+    drop(fresh);
+    heap.shrink();
+    assert!(check(&heap));
 }

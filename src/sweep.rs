@@ -127,12 +127,16 @@ pub struct Sweeper {
     live: AtomicUsize,
     /// 只在调用方线程析构时：别的工人扫好、等调用方析构的项（处理完才算扫完）
     pending: Injector<Pending>,
+    /// 本轮有空行的块把凑满整页的空行还给系统
+    discard: bool,
 }
 
 impl Sweeper {
     /// 开始一轮（独占堆时）。上一轮必须已经扫完。
-    pub fn start(&mut self, epoch: u32, blocks: Vec<Block>, large: Vec<Large>, spare: usize) {
+    /// `discard`：有空行的块把凑满整页的空行还给系统（[`crate::Heap::shrink`]）。
+    pub fn start(&mut self, epoch: u32, blocks: Vec<Block>, large: Vec<Large>, spare: usize, discard: bool) {
         debug_assert!(self.is_done());
+        self.discard = discard;
         *self.unfinished.get_mut() = blocks.len() + large.len();
         *self.next_block.get_mut() = 0;
         *self.next_large.get_mut() = 0;
@@ -177,7 +181,13 @@ impl Sweeper {
     fn settle(&self, b: Block, state: State) -> Outcome {
         match state {
             State::Full => Outcome::Full(b),
-            State::Recyclable => Outcome::Usable(b),
+            State::Recyclable => {
+                if self.discard {
+                    // SAFETY: 死对象都已析构，空行里没有要用的东西；块还没交出去
+                    unsafe { b.discard_free_lines(self.epoch) };
+                }
+                Outcome::Usable(b)
+            }
             State::Empty if self.take_spare() => Outcome::Usable(b),
             State::Empty => Outcome::Release(b),
         }
