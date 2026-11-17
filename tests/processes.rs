@@ -655,11 +655,9 @@ impl Pair {
             }));
             // 集线器第 j 格指向 j 给本进程的礼物
             if let Some(h) = peer {
-                mine.mutate(|mi| {
-                    h.mutate(|mj| {
-                        let gift: Public<NodeB> = mj.find(infos[j].2[me]).expect("礼物");
-                        hub.get(mi).refs[j].set(mi, mj, Some(gift.get(mj)));
-                    });
+                mine.mutate_with(h, |mi, mj| {
+                    let gift: Public<NodeB> = mj.find(infos[j].2[me]).expect("礼物");
+                    hub.get(mi).refs[j].set(mi, mj, Some(gift.get(mj)));
                 });
             }
         }
@@ -702,8 +700,9 @@ impl Pair {
                 }
             });
             for (j, peer) in self.peers.iter().enumerate() {
-                let Some(h) = peer else { continue };
-                let _ = h.try_mutate(|mj| self.mine.mutate(|mi| self.hub.get(mi).refs[j].get(mj).map(|g| g.value)));
+                // 同时进两个公开堆用 mutate_with（按堆号顺序进门）；死了的不进
+                let Some(h) = peer.as_ref().filter(|h| h.is_alive()) else { continue };
+                self.mine.mutate_with(h, |mi, mj| self.hub.get(mi).refs[j].get(mj).map(|g| g.value));
             }
             if round.is_multiple_of(4) {
                 self.mine.collect();
@@ -729,7 +728,7 @@ impl Pair {
             }
             let h = h.expect("活着的都还开着");
             assert!(h.is_alive(), "进程 {j} 还活着");
-            let gift = h.try_mutate(|mj| self.mine.mutate(|mi| self.hub.get(mi).refs[j].get(mj).map(|g| g.value))).expect("活着的读得到");
+            let gift = self.mine.mutate_with(h, |mi, mj| self.hub.get(mi).refs[j].get(mj).map(|g| g.value));
             assert_eq!(gift, Some(gift_value(j, me)), "集线器指着 {j} 给的礼物");
             let card = self.cards[j].as_ref().expect("活着的卡片还在");
             let head = self.private.mutate(|m| h.try_mutate(|mj| m.get(card).chain.get(mj).value)).expect("活着的读得到");

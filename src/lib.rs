@@ -1,28 +1,22 @@
 #![doc = include_str!("../README.md")]
 extern crate self as paragc;
 
-mod block;
-mod copy;
-mod far;
-mod gc;
-mod header;
+mod handle;
 mod heap;
 mod layout;
-mod lockfree;
 mod mark;
 #[cfg(target_os = "linux")]
-mod public;
-mod release;
-mod roots;
+mod shm;
 mod sweep;
-mod trace;
-mod workers;
+mod sync;
 
-pub use far::Far;
-pub use gc::{Gc, Slot};
+pub use handle::{Brand, Far, Gc, Root, Slot};
+#[cfg(target_os = "linux")]
+pub use handle::{EdgeMap, Public, PublicBrand, PublicGc, PublicRef, PublicSlot, Shared};
 pub use heap::{Heap, Mutator, Stats, Tlab};
+#[cfg(target_os = "linux")]
+pub use heap::{HeapDead, PublicHeap, PublicMutator, PublicStats};
+pub use mark::{Trace, Tracer};
 pub use paragc_macros::{Shared, Trace};
 #[cfg(target_os = "linux")]
-pub use public::{EdgeMap, HeapDead, Public, PublicBrand, PublicGc, PublicHeap, PublicMutator, PublicRef, PublicSlot, PublicSpace, PublicStats, Shared};
-pub use roots::{Brand, Root};
-pub use trace::{Trace, Tracer};
+pub use shm::PublicSpace;
