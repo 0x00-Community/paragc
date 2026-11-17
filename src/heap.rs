@@ -18,7 +18,7 @@ use std::sync::{Arc, OnceLock};
 use crossbeam_deque::{Injector, Steal};
 use crossbeam_utils::{Backoff, CachePadded};
 
-use j8lockfree::SegVec;
+use crate::lockfree::SegVec;
 
 use crate::block::Block;
 use crate::gc::{Invariant, RawSlot};

@@ -4,7 +4,7 @@ use core::ptr::null_mut;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crossbeam_deque::{Injector, Steal};
-use j8lockfree::SegVec;
+use crate::lockfree::SegVec;
 
 use crate::block::Block;
 use crate::header::Header;

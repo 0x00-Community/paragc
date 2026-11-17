@@ -451,12 +451,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4754a1731458af0443709c9667302793d3f63cc90ec4ba4c8259f2b9515478e5"
 
 [[package]]
-name = "j8lockfree"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0d7fa0c3fb4436e99cefc546bab61024cb370a86af081f04a30212167850972"
-
-[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -594,7 +588,6 @@ version = "0.2.1"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
- "j8lockfree",
  "paragc-macros",
 ]
 

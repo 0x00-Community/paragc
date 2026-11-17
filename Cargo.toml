@@ -36,7 +36,6 @@ license.workspace = true
 
 [dependencies]
 paragc-macros.workspace = true
-j8lockfree = "0.1.2"
 crossbeam-deque = "0.8.8"
 crossbeam-utils = "0.8.23"
 

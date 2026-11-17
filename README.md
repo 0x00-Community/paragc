@@ -101,8 +101,8 @@ assert_eq!(sum, 999 * 1000 / 2);
 | Concurrent recount | The handshake flips the parity and drops the slots logged before it (their old values belong to the previous counts; live containers get rescanned). Markers count every edge they scan. A slot is logged on its first write in the round during marking too; a marker that recounts a slot rereads it afterwards and logs it itself if a mutator wrote it in between (a young object's slot is not counted yet, so the mutator would not have logged it). Objects allocated black are queued and their edges counted at the finish; logged slots are then settled (new value +1, value last counted −1, decrements only for objects marked this round, since the dead ones are about to be swept). Counts are trusted again as soon as the finish returns. |
 
 Work-stealing deques and backoff come from [crossbeam](https://github.com/crossbeam-rs/crossbeam) (`crossbeam-deque`,
-`crossbeam-utils`); the append-only segmented vector and the block stock come from
-[j8lockfree](https://crates.io/crates/j8lockfree).
+`crossbeam-utils`); the append-only segmented vector and the push-only list used for blocks and roots are paragc's own
+(`src/lockfree.rs`).
 
 ## 📏 Rules
 
