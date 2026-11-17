@@ -10,12 +10,13 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crossbeam_deque::{Injector, Steal, Worker};
 use crossbeam_utils::{Backoff, CachePadded};
 
+use crate::trace::TracerInternal;
 use crate::block::Block;
 use crate::header::Header;
 use crate::trace::Tracer;
 use crate::workers::Pool;
 
-pub(crate) struct Releaser<'h> {
+pub struct Releaser<'h> {
     /// 待减的对象（头地址）
     decs: &'h Injector<usize>,
     /// 释放过对象的块（下一次停顿时重算行）
@@ -29,11 +30,11 @@ pub(crate) struct Releaser<'h> {
 }
 
 impl<'h> Releaser<'h> {
-    pub(crate) fn new(decs: &'h Injector<usize>, dirty: &'h Injector<Block>, workers: usize, epoch: u32, parity: bool) -> Self {
+    pub fn new(decs: &'h Injector<usize>, dirty: &'h Injector<Block>, workers: usize, epoch: u32, parity: bool) -> Self {
         Self { decs, dirty, workers: workers.max(1), idle: CachePadded::new(AtomicUsize::new(0)), epoch, parity }
     }
 
-    pub(crate) fn run(&self, pool: &Pool) {
+    pub fn run(&self, pool: &Pool) {
         pool.run(self.workers, |_| self.work());
     }
 

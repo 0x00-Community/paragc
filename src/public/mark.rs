@@ -22,12 +22,12 @@ const MEMBER_SHIFT: u32 = 56;
 const ADDR_MASK: usize = (1 << MEMBER_SHIFT) - 1;
 
 /// 组里的一个堆：它和它这一轮的纪元。
-pub(crate) struct Member<'h> {
-    pub(crate) heap: &'h Inner,
-    pub(crate) epoch: u32,
+pub struct Member<'h> {
+    pub heap: &'h Inner,
+    pub epoch: u32,
 }
 
-pub(crate) struct Marker<'h> {
+pub struct Marker<'h> {
     members: &'h [Member<'h>],
     /// 堆号 → 组里第几个（不在组里是 None）
     by_heap: [Option<usize>; WINDOWS],
@@ -45,7 +45,7 @@ pub(crate) struct Marker<'h> {
 unsafe impl Sync for Marker<'_> {}
 
 impl<'h> Marker<'h> {
-    pub(crate) fn new(members: &'h [Member<'h>], found: Option<&'h Injector<(usize, u64)>>, workers: usize) -> Self {
+    pub fn new(members: &'h [Member<'h>], found: Option<&'h Injector<(usize, u64)>>, workers: usize) -> Self {
         let locals: Vec<Worker<usize>> = (0..workers).map(|_| Worker::new_lifo()).collect();
         let stealers = locals.iter().map(Worker::stealer).collect();
         let mut by_heap = [None; WINDOWS];
@@ -64,7 +64,7 @@ impl<'h> Marker<'h> {
     }
 
     /// 从 `roots`（组里第几个, 对象头地址）出发标记，直到全部工人空闲。
-    pub(crate) fn run(&self, pool: &Pool, roots: &[(usize, usize)]) {
+    pub fn run(&self, pool: &Pool, roots: &[(usize, usize)]) {
         for &(m, header) in roots {
             self.visit(m, header, |item| self.grey.push(item));
         }

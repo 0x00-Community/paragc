@@ -18,6 +18,7 @@ use std::sync::{Arc, OnceLock};
 use crossbeam_deque::{Injector, Steal};
 use crossbeam_utils::{Backoff, CachePadded};
 
+use crate::gc::GcInternal;
 use crate::lockfree::SegVec;
 
 use crate::block::Block;
@@ -137,15 +138,6 @@ impl Heap {
         }
     }
 
-    pub(crate) fn roots(&self) -> &Arc<RootTable> {
-        &self.roots
-    }
-
-    /// 堆的身份：根表的地址（堆本身可能被移动）；不会是 [`crate::roots::NO_HOLDER`]。
-    pub(crate) fn id(&self) -> usize {
-        Arc::as_ptr(&self.roots).addr()
-    }
-
     /// 在堆上做事；可以在多个线程上同时调用。闭包里分配的对象只有挂到 [`crate::Root`] 上（直接或间接）才能活过下一次回收。
     pub fn mutate<R>(&self, f: impl for<'gc> FnOnce(&Mutator<'gc>) -> R) -> R {
         let spare = self.spare.swap(null_mut(), Ordering::AcqRel);
@@ -263,7 +255,7 @@ impl Heap {
 
     /// 写屏障：并发标记中覆盖掉的旧值若还没标，就标上（连同它跨的行）并放进灰队列（保住初始快照）。
     /// 灰队列里的对象都已标过，取出来只追踪它的边，所以这里必须先标。
-    pub(crate) fn remember(&self, old: *const Header, epoch: u32) {
+    fn remember(&self, old: *const Header, epoch: u32) {
         // SAFETY: old 来自本堆的槽，初始快照时活着，本轮不会被回收
         let h = unsafe { &*old };
         if h.mark(epoch) {
@@ -612,6 +604,25 @@ impl Heap {
     }
 }
 
+/// 只给本 crate 用的操作：trait 在私有模块里、不导出，crate 外拿不到。
+pub trait HeapInternal {
+    fn roots(&self) -> &Arc<RootTable>;
+
+    /// 堆的身份：根表的地址（堆本身可能被移动）；不会是 [`crate::roots::NO_HOLDER`]。
+    fn id(&self) -> usize;
+}
+
+impl HeapInternal for Heap {
+    fn roots(&self) -> &Arc<RootTable> {
+        &self.roots
+    }
+
+    fn id(&self) -> usize {
+        Arc::as_ptr(&self.roots).addr()
+    }
+}
+
+
 /// 清扫器扫完一项交回堆：块进全部块表，可用的再放进 available；活着的大对象回到大对象表。
 impl Sink for Heap {
     fn block(&self, outcome: Outcome) {
@@ -734,36 +745,10 @@ pub struct Mutator<'gc> {
 }
 
 impl<'gc> Mutator<'gc> {
-    pub(crate) fn heap(&self) -> &'gc Heap {
-        self.heap
-    }
 
     /// 这次 mutate 是否落在并发标记期间（写屏障与黑分配生效）。
     pub fn is_marking(&self) -> bool {
         self.marking.is_some()
-    }
-
-    /// 写屏障。并发标记中：被覆盖的旧值若还没标就标上、进灰队列（初始快照）。
-    /// 平时：写进去的是年轻对象（标记纪元不是上次完成的那轮）就记下槽的地址——老对象指向年轻对象的边只能这样产生，
-    /// 年轻回收从这些槽出发。（并发标记期间新对象都是黑的、收尾后全是老对象，不用记。）
-    ///
-    /// 计数中的槽（老对象里的；年轻对象的槽不计数）本轮第一次被写还要登记，回收时结算。
-    pub(crate) fn written(&self, slot: &RawSlot, old: Option<*const Header>, new: Option<*const Header>) {
-        let addr = (&raw const *slot).expose_provenance();
-        if let Some(epoch) = self.marking {
-            if let Some(old) = old {
-                self.heap.remember(old, epoch.get());
-            }
-        } else if let Some(new) = new
-            // SAFETY: new 是刚写进槽的、活着的对象
-            && !unsafe { &*new }.is_marked(self.heap.epoch)
-        {
-            self.heap.remembered.push(addr);
-        }
-        // 引用计数登记：平时与并发标记期间都要（标记期间被改写的槽在收尾时结算）
-        if slot.log() {
-            self.heap.rc_log.push(addr);
-        }
     }
 
     /// 分配一个对象。
@@ -821,3 +806,40 @@ impl<'gc> Mutator<'gc> {
         t.limit.set(null_mut());
     }
 }
+
+/// 只给本 crate 用的操作：trait 在私有模块里、不导出，crate 外拿不到。
+pub trait MutatorInternal<'gc> {
+    fn heap(&self) -> &'gc Heap;
+
+    /// 写屏障。并发标记中：被覆盖的旧值若还没标就标上、进灰队列（初始快照）。
+    /// 平时：写进去的是年轻对象（标记纪元不是上次完成的那轮）就记下槽的地址——老对象指向年轻对象的边只能这样产生，
+    /// 年轻回收从这些槽出发。（并发标记期间新对象都是黑的、收尾后全是老对象，不用记。）
+    ///
+    /// 计数中的槽（老对象里的；年轻对象的槽不计数）本轮第一次被写还要登记，回收时结算。
+    fn written(&self, slot: &RawSlot, old: Option<*const Header>, new: Option<*const Header>);
+}
+
+impl<'gc> MutatorInternal<'gc> for Mutator<'gc> {
+    fn heap(&self) -> &'gc Heap {
+        self.heap
+    }
+
+    fn written(&self, slot: &RawSlot, old: Option<*const Header>, new: Option<*const Header>) {
+        let addr = (&raw const *slot).expose_provenance();
+        if let Some(epoch) = self.marking {
+            if let Some(old) = old {
+                self.heap.remember(old, epoch.get());
+            }
+        } else if let Some(new) = new
+            // SAFETY: new 是刚写进槽的、活着的对象
+            && !unsafe { &*new }.is_marked(self.heap.epoch)
+        {
+            self.heap.remembered.push(addr);
+        }
+        // 引用计数登记：平时与并发标记期间都要（标记期间被改写的槽在收尾时结算）
+        if slot.log() {
+            self.heap.rc_log.push(addr);
+        }
+    }
+}
+

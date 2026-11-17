@@ -96,14 +96,14 @@ impl Shared {
     }
 }
 
-pub(crate) struct Pool {
+pub struct Pool {
     shared: Arc<Shared>,
     workers: Vec<JoinHandle<()>>,
 }
 
 impl Pool {
     /// 起 `threads − 1` 个工人。
-    pub(crate) fn new(threads: NonZeroUsize) -> Self {
+    pub fn new(threads: NonZeroUsize) -> Self {
         let shared = Arc::new(Shared {
             task: CachePadded::new(AtomicU64::new(0)),
             remaining: CachePadded::new(AtomicUsize::new(0)),
@@ -124,17 +124,17 @@ impl Pool {
     }
 
     /// 线程总数（含调用方）。
-    pub(crate) fn threads(&self) -> usize {
+    pub fn threads(&self) -> usize {
         self.workers.len() + 1
     }
 
     /// 这么多活（块 + 大对象）该用几个线程：活少时少用。
-    pub(crate) fn sized(&self, units: usize) -> usize {
+    pub fn sized(&self, units: usize) -> usize {
         (units / UNITS_PER_WORKER).clamp(1, self.threads())
     }
 
     /// `n` 个线程（含调用方，工号 0..n）各跑一次 `f(工号)`，按工号收集结果。
-    pub(crate) fn run<R: Send>(&self, n: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
+    pub fn run<R: Send>(&self, n: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
         let n = n.clamp(1, self.threads());
         if n == 1 {
             return vec![f(0)];

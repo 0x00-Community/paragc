@@ -8,6 +8,8 @@ use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use crate::heap::{HeapInternal, MutatorInternal};
+use crate::gc::GcInternal;
 use crate::lockfree::{PushList, SegVec};
 
 use crate::header::Header;
@@ -33,28 +35,28 @@ macro_rules! brand {
 
 /// 根槽：对象头指针（空槽是 null）+ 持有方。
 #[derive(Default)]
-pub(crate) struct Entry {
+pub struct Entry {
     ptr: AtomicPtr<Header>,
     /// 持有这个根的堆（[`crate::Far`] 所在的堆的身份）；普通 [`Root`] 是 [`NO_HOLDER`]
     holder: AtomicUsize,
 }
 
 /// [`Entry::holder`]：不属于任何堆（普通 [`Root`]）
-pub(crate) const NO_HOLDER: usize = 0;
+pub const NO_HOLDER: usize = 0;
 
 impl Entry {
-    pub(crate) fn load(&self) -> *mut Header {
+    pub fn load(&self) -> *mut Header {
         self.ptr.load(Ordering::Acquire)
     }
 
-    pub(crate) fn store(&self, header: *mut Header) {
+    pub fn store(&self, header: *mut Header) {
         self.ptr.store(header, Ordering::Release);
     }
 }
 
 /// 根表，同时也是堆的入口表：别的堆经 [`crate::Far`] 直接指进来的对象在这里各占一个槽，记着持有方。
 #[derive(Default)]
-pub(crate) struct RootTable {
+pub struct RootTable {
     /// 每个根一个槽
     slots: SegVec<Entry>,
     /// 句柄析构时还回来的槽号（下次回收时并进 ready）
@@ -72,7 +74,7 @@ unsafe impl Send for RootTable {}
 
 impl RootTable {
     /// 领一个槽放 `header`（只在这个堆的 mutate 里调用）。`holder`：持有方堆，普通根是 [`NO_HOLDER`]。
-    pub(crate) fn claim(&self, header: *const Header, holder: usize) -> usize {
+    pub fn claim(&self, header: *const Header, holder: usize) -> usize {
         // SAFETY: mutate 期间 ready 不变
         let ready = unsafe { &*self.ready.get() };
         let i = self.cursor.fetch_add(1, Ordering::AcqRel);
@@ -87,12 +89,12 @@ impl RootTable {
         }
     }
 
-    pub(crate) fn slot(&self, i: usize) -> &Entry {
+    pub fn slot(&self, i: usize) -> &Entry {
         self.slots.get(i).expect("根槽号来自 claim")
     }
 
     /// 句柄析构：清空槽、槽号挂回去（任何时候、任何线程）。
-    pub(crate) fn release(&self, i: usize) {
+    pub fn release(&self, i: usize) {
         self.slot(i).store(null_mut());
         self.returned.push(i);
     }
@@ -100,7 +102,7 @@ impl RootTable {
     /// 疏散回收：每个根交给 `f`（标记，必要时搬走），改成它返回的新地址。
     /// 句柄可能同时在别的线程析构（槽被清空），所以用 CAS：清空了就不改回去。
     /// 入口（别的堆直接指着的）对象所在的块事先已经撤掉疏散（[`RootTable::pinned`]），不会动。
-    pub(crate) fn relocate(&self, mut f: impl FnMut(*const Header) -> *const Header) {
+    pub fn relocate(&self, mut f: impl FnMut(*const Header) -> *const Header) {
         for slot in self.slots.iter() {
             let old = slot.load();
             if old.is_null() {
@@ -114,7 +116,7 @@ impl RootTable {
     }
 
     /// 别的堆直接指着的对象，逐个交给 `f`。SAFETY（调用方）：没有 mutator。
-    pub(crate) unsafe fn pinned(&self, mut f: impl FnMut(*const Header)) {
+    pub unsafe fn pinned(&self, mut f: impl FnMut(*const Header)) {
         for slot in self.slots.iter() {
             let p = slot.load();
             if !p.is_null() && slot.holder.load(Ordering::Relaxed) != NO_HOLDER {
@@ -124,13 +126,13 @@ impl RootTable {
     }
 
     /// 回收时：整理空槽，返回全部根。SAFETY（调用方）：没有 mutator（独占堆）。
-    pub(crate) unsafe fn settle(&self) -> Vec<*const Header> {
+    pub unsafe fn settle(&self) -> Vec<*const Header> {
         // SAFETY: 见上
         unsafe { self.settle_outside(|_| false) }
     }
 
     /// 同 [`RootTable::settle`]，但持有方满足 `inside` 的入口不算根（一起回收的堆里的 Far，由追踪决定死活）。
-    pub(crate) unsafe fn settle_outside(&self, inside: impl Fn(usize) -> bool) -> Vec<*const Header> {
+    pub unsafe fn settle_outside(&self, inside: impl Fn(usize) -> bool) -> Vec<*const Header> {
         // SAFETY: 见 settle
         let ready = unsafe { &mut *self.ready.get() };
         let used = self.cursor.swap(0, Ordering::AcqRel).min(ready.len());
@@ -147,7 +149,7 @@ impl RootTable {
 
     /// 一起回收之后：持有方满足 `inside`、目标没标到的入口——持有它的 Far 已经死了（活的 Far 都被追踪到、把目标标上了）——
     /// 清空，免得在持有方清扫到那个 Far 之前，下一次回收拿它当根去碰已经回收的对象。SAFETY（调用方）：没有 mutator。
-    pub(crate) unsafe fn clear_dead(&self, inside: impl Fn(usize) -> bool, epoch: u32) {
+    pub unsafe fn clear_dead(&self, inside: impl Fn(usize) -> bool, epoch: u32) {
         for slot in self.slots.iter() {
             let p = slot.load();
             // SAFETY: 槽里非空的都是本堆的对象，回收还没清扫，内存都在

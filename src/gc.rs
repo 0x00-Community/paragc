@@ -6,11 +6,12 @@ use core::ops::Deref;
 use core::ptr::{NonNull, null_mut};
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
+use crate::heap::MutatorInternal;
 use crate::Mutator;
 use crate::header::Header;
 
 /// 品牌：`'gc` 不变（invariant），`Gc` 逃不出 [`crate::Heap::mutate`] 的闭包。
-pub(crate) type Invariant<'gc> = PhantomData<Cell<&'gc ()>>;
+pub type Invariant<'gc> = PhantomData<Cell<&'gc ()>>;
 
 /// Gc 的品牌：借着 `&'gc T`，再加上对 `'gc` 不变
 type Brand<'gc, T> = PhantomData<(&'gc T, fn(&'gc ()) -> &'gc ())>;
@@ -34,17 +35,31 @@ impl<T> Clone for Gc<'_, T> {
 
 impl<T> Copy for Gc<'_, T> {}
 
-impl<'gc, T> Gc<'gc, T> {
-    /// SAFETY（调用方）：`ptr` 是本堆里一个活对象的数据指针，品牌 `'gc` 正确。
-    pub(crate) unsafe fn from_data(ptr: *mut T) -> Self {
-        // SAFETY: 见上
+/// [`Gc`] 只给本 crate 用的操作：trait 在私有模块里、不导出，crate 外拿不到。
+pub trait GcInternal {
+    type Data;
+
+    /// # Safety
+    /// `ptr` 是本堆里一个活对象的数据指针，品牌正确。
+    unsafe fn from_data(ptr: *mut Self::Data) -> Self;
+
+    fn header(self) -> *const Header;
+}
+
+impl<T> GcInternal for Gc<'_, T> {
+    type Data = T;
+
+    unsafe fn from_data(ptr: *mut T) -> Self {
+        // SAFETY: 见 trait 上的说明
         Self { ptr: unsafe { NonNull::new_unchecked(ptr) }, _brand: PhantomData }
     }
 
-    pub(crate) fn header(self) -> *const Header {
+    fn header(self) -> *const Header {
         Header::of(self.ptr.as_ptr().cast())
     }
+}
 
+impl<'gc, T> Gc<'gc, T> {
     pub fn as_ptr(self) -> *const T {
         self.ptr.as_ptr()
     }
@@ -88,15 +103,15 @@ pub struct Slot<'gc, T> {
 }
 
 /// [`Slot::counted`]：这个槽不在引用计数里
-pub(crate) const UNCOUNTED: usize = usize::MAX;
+pub const UNCOUNTED: usize = usize::MAX;
 /// [`Slot::counted`] 的最低位：本轮已登记（地址按粒度对齐，最低位空着）
-pub(crate) const LOGGED: usize = 1;
+pub const LOGGED: usize = 1;
 
 /// 抹掉类型的槽：写屏障登记、回收时结算用（与 [`Slot`] 同布局）。
 #[repr(C)]
-pub(crate) struct RawSlot {
-    pub(crate) ptr: AtomicPtr<u8>,
-    pub(crate) counted: AtomicUsize,
+pub struct RawSlot {
+    pub ptr: AtomicPtr<u8>,
+    pub counted: AtomicUsize,
 }
 
 impl RawSlot {
@@ -109,30 +124,30 @@ impl RawSlot {
     }
 
     /// 本轮第一次被写：打上登记标志，返回 true（调用方把槽地址交给回收器）。不计数的槽返回 false。
-    pub(crate) fn log(&self) -> bool {
+    pub fn log(&self) -> bool {
         let c = self.counted.load(Ordering::Relaxed);
         c != UNCOUNTED && c & LOGGED == 0 && self.counted.compare_exchange(c, c | LOGGED, Ordering::AcqRel, Ordering::Relaxed).is_ok()
     }
 
     /// 清掉登记标志（计数不可信时丢弃登记）。
-    pub(crate) fn unlog(&self) {
+    pub fn unlog(&self) {
         self.counted.fetch_and(!LOGGED, Ordering::AcqRel);
     }
 
     /// 改成计入当前值；返回（当前值, 上次计入的值）。
-    pub(crate) fn recount(&self) -> (Option<*const Header>, Option<*const Header>) {
+    pub fn recount(&self) -> (Option<*const Header>, Option<*const Header>) {
         let p = self.ptr.load(Ordering::Acquire);
         let prev = self.counted.swap(p.expose_provenance(), Ordering::AcqRel);
         (Self::header(p), Self::from_counted(prev))
     }
 
     /// 这个槽当前的值。
-    pub(crate) fn current(&self) -> Option<*const Header> {
+    pub fn current(&self) -> Option<*const Header> {
         Self::header(self.ptr.load(Ordering::Acquire))
     }
 
     /// 上次计入的值（释放它所在的对象时 −1）。
-    pub(crate) fn counted(&self) -> Option<*const Header> {
+    pub fn counted(&self) -> Option<*const Header> {
         Self::from_counted(self.counted.load(Ordering::Acquire))
     }
 }
@@ -190,22 +205,35 @@ impl<'gc, T> Slot<'gc, T> {
         done.map(Self::wrap).map_err(Self::wrap)
     }
 
-    /// 独占时改写（疏散回收改成新地址）。
-    pub(crate) fn store_exclusive(&mut self, v: Option<Gc<'gc, T>>) {
-        *self.ptr.get_mut() = Self::raw(v);
-    }
-
-    /// 抹掉类型的视图。
-    pub(crate) fn raw_slot(&self) -> &RawSlot {
-        // SAFETY: Slot 与 RawSlot 都是 repr(C)，前两个字段同类型同顺序（AtomicPtr<T> 与 AtomicPtr<u8> 同布局）
-        unsafe { &*(&raw const *self).cast::<RawSlot>() }
-    }
-
     /// 写屏障：被覆盖的旧值（并发标记的初始快照）、写进去的新值（年轻对象 ⇒ 记下这个槽，年轻回收从它出发）、
     /// 引用计数登记（老对象里的槽本轮第一次被写）。
     fn barrier(&self, m: &Mutator<'gc>, old: *mut T, new: *mut T) {
         let header = |p: *mut T| (!p.is_null()).then(|| Header::of(p.cast()));
         m.written(self.raw_slot(), header(old), header(new));
+    }
+}
+
+/// [`Slot`] 只给本 crate 用的操作（同 [`GcInternal`]）。
+pub trait SlotInternal<'gc> {
+    type Data;
+
+    /// 独占时改写（疏散回收改成新地址）。
+    fn store_exclusive(&mut self, v: Option<Gc<'gc, Self::Data>>);
+
+    /// 抹掉类型的视图。
+    fn raw_slot(&self) -> &RawSlot;
+}
+
+impl<'gc, T> SlotInternal<'gc> for Slot<'gc, T> {
+    type Data = T;
+
+    fn store_exclusive(&mut self, v: Option<Gc<'gc, T>>) {
+        *self.ptr.get_mut() = Self::raw(v);
+    }
+
+    fn raw_slot(&self) -> &RawSlot {
+        // SAFETY: Slot 与 RawSlot 都是 repr(C)，前两个字段同类型同顺序（AtomicPtr<T> 与 AtomicPtr<u8> 同布局）
+        unsafe { &*(&raw const *self).cast::<RawSlot>() }
     }
 }
 

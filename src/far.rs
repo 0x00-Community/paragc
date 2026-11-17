@@ -9,6 +9,9 @@ use core::marker::PhantomData;
 use core::ptr::NonNull;
 use std::sync::Arc;
 
+use crate::trace::TracerInternal;
+use crate::heap::{HeapInternal, MutatorInternal};
+use crate::gc::GcInternal;
 use crate::gc::Invariant;
 use crate::header::Header;
 use crate::roots::RootTable;

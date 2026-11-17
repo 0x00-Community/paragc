@@ -10,6 +10,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicI8, AtomicI16, AtomicI32, AtomicI64, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use super::heap::{PublicHeapInternal, PublicMutatorInternal};
 use crate::block::Finalize;
 use crate::gc::Invariant;
 use crate::header::Core;
@@ -20,29 +21,29 @@ use super::region::Region;
 
 /// 公开堆的对象头（16 B）：两种堆共用的标记字 / 信息字，加类型号。
 #[repr(C)]
-pub(crate) struct PHeader {
-    pub(crate) core: Core,
+pub struct PHeader {
+    pub core: Core,
     /// 类型表里的序号
-    pub(crate) ty: u32,
+    pub ty: u32,
     _pad: u32,
 }
 
 /// 公开堆对象头的字节数；数据紧跟在后面
-pub(crate) const PHEADER: usize = size_of::<PHeader>();
+pub const PHEADER: usize = size_of::<PHeader>();
 
 const _: () = assert!(PHEADER == 16, "公开堆的对象头是 16 字节");
 
 impl PHeader {
-    pub(crate) fn new(bytes: usize, large: bool, ty: u32) -> Self {
+    pub fn new(bytes: usize, large: bool, ty: u32) -> Self {
         // 新对象的标记 0 不等于任何纪元（纪元从 1 开始）
         Self { core: Core::new(bytes, large, 0), ty, _pad: 0 }
     }
 
-    pub(crate) fn data(this: *const Self) -> *mut u8 {
+    pub fn data(this: *const Self) -> *mut u8 {
         this.cast::<u8>().cast_mut().wrapping_add(PHEADER)
     }
 
-    pub(crate) fn of(data: *const u8) -> *const Self {
+    pub fn of(data: *const u8) -> *const Self {
         data.wrapping_sub(PHEADER).cast()
     }
 }
@@ -66,11 +67,17 @@ pub unsafe trait Shared: Send + Sync {
 }
 
 /// 一个类型的指针图：对象数据里每个指针槽的字节偏移。
-pub struct EdgeMap(pub(crate) Vec<u32>);
+#[derive(Default)]
+pub struct EdgeMap(Vec<u32>);
 
 impl EdgeMap {
     pub fn edge(&mut self, at: u32) {
         self.0.push(at);
+    }
+
+    /// 报上来的全部偏移。
+    pub fn as_slice(&self) -> &[u32] {
+        &self.0
     }
 
     /// 字段偏移转成指针图里的偏移（derive 用）。
@@ -134,11 +141,6 @@ impl<T> Clone for PublicGc<'_, T> {
 impl<T> Copy for PublicGc<'_, T> {}
 
 impl<'p, T> PublicGc<'p, T> {
-    /// SAFETY（调用方）：`ptr` 是这个公开堆里一个活对象的数据指针，品牌 `'p` 正确。
-    pub(crate) unsafe fn from_data(ptr: *mut u8) -> Self {
-        // SAFETY: 见上
-        Self { ptr: unsafe { NonNull::new_unchecked(ptr.cast()) }, _brand: PhantomData }
-    }
 
     pub fn as_ptr(self) -> *const T {
         self.ptr.as_ptr()
@@ -154,12 +156,29 @@ impl<'p, T> PublicGc<'p, T> {
         a.ptr == b.ptr
     }
 
+}
+
+/// 只给本 crate 用的操作：trait 在私有模块里、不导出，crate 外拿不到。
+pub trait PublicGcInternal {
+    /// SAFETY（调用方）：`ptr` 是这个公开堆里一个活对象的数据指针，品牌 `'p` 正确。
+    unsafe fn from_data(ptr: *mut u8) -> Self;
+
     /// 公开偏移：相对公开地址区起点（每个进程里都一样）。
-    pub(crate) fn offset(self) -> u64 {
+    fn offset(self) -> u64;
+}
+
+impl<T> PublicGcInternal for PublicGc<'_, T> {
+    unsafe fn from_data(ptr: *mut u8) -> Self {
+        // SAFETY: 见上
+        Self { ptr: unsafe { NonNull::new_unchecked(ptr.cast()) }, _brand: PhantomData }
+    }
+
+    fn offset(self) -> u64 {
         let addr = self.ptr.as_ptr().addr();
         (addr - Region::base_of(addr)) as u64
     }
 }
+
 
 impl<T> Deref for PublicGc<'_, T> {
     type Target = T;
@@ -336,9 +355,6 @@ unsafe impl<B: PublicBrand> Send for Public<B> {}
 unsafe impl<B: PublicBrand> Sync for Public<B> {}
 
 impl<B: PublicBrand> Public<B> {
-    pub(crate) fn new(heap: Arc<Inner>, entry: u32, data: NonNull<u8>) -> Self {
-        Self { heap, entry, data, _brand: PhantomData }
-    }
 
     /// 取目标对象；`m` 必须是目标堆的 mutator。
     pub fn get<'p>(&self, m: &PublicMutator<'p>) -> PublicGc<'p, B::Of<'p>> {
@@ -368,6 +384,18 @@ impl<B: PublicBrand> Public<B> {
         entry
     }
 }
+
+/// 只给本 crate 用的操作：trait 在私有模块里、不导出，crate 外拿不到。
+pub trait PublicInternal {
+    fn new(heap: Arc<Inner>, entry: u32, data: NonNull<u8>) -> Self;
+}
+
+impl<B: PublicBrand> PublicInternal for Public<B> {
+    fn new(heap: Arc<Inner>, entry: u32, data: NonNull<u8>) -> Self {
+        Self { heap, entry, data, _brand: PhantomData }
+    }
+}
+
 
 impl<B: PublicBrand> Drop for Public<B> {
     fn drop(&mut self) {

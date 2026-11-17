@@ -18,7 +18,7 @@ use crate::workers::Pool;
 
 /// 单独分配的大对象（头指针）。
 #[derive(Clone, Copy)]
-pub(crate) struct Large(pub(crate) NonNull<Header>);
+pub struct Large(pub NonNull<Header>);
 
 // SAFETY: 独立的堆内存；对象内容跨线程由 Trace: Send + Sync 担保
 unsafe impl Send for Large {}
@@ -26,7 +26,7 @@ unsafe impl Send for Large {}
 unsafe impl Sync for Large {}
 
 impl Large {
-    pub(crate) fn layout(bytes: usize) -> Layout {
+    pub fn layout(bytes: usize) -> Layout {
         Layout::from_size_align(bytes, GRANULE).expect("对象太大")
     }
 
@@ -52,7 +52,7 @@ impl Large {
 }
 
 /// 扫完一个块的去向。
-pub(crate) enum Outcome {
+pub enum Outcome {
     /// 有空行（含全空），可以分配
     Usable(Block),
     /// 满了
@@ -62,13 +62,13 @@ pub(crate) enum Outcome {
 }
 
 /// 清扫完一项后交给谁。
-pub(crate) trait Sink {
+pub trait Sink {
     fn block(&self, outcome: Outcome);
     fn large(&self, survivor: Large);
 }
 
 #[derive(Default)]
-pub(crate) struct Sweeper {
+pub struct Sweeper {
     /// 本轮判活的纪元
     epoch: u32,
     blocks: Vec<Block>,
@@ -85,7 +85,7 @@ pub(crate) struct Sweeper {
 
 impl Sweeper {
     /// 开始一轮（独占堆时）。上一轮必须已经扫完。
-    pub(crate) fn start(&mut self, epoch: u32, blocks: Vec<Block>, large: Vec<Large>, spare: usize) {
+    pub fn start(&mut self, epoch: u32, blocks: Vec<Block>, large: Vec<Large>, spare: usize) {
         debug_assert!(self.is_done());
         *self.unfinished.get_mut() = blocks.len() + large.len();
         *self.next_block.get_mut() = 0;
@@ -97,22 +97,22 @@ impl Sweeper {
         self.large = large;
     }
 
-    pub(crate) fn is_done(&self) -> bool {
+    pub fn is_done(&self) -> bool {
         self.unfinished.load(Ordering::Acquire) == 0
     }
 
     /// 本轮到目前为止扫出的存活字节数（扫完才是全部）。
-    pub(crate) fn live(&self) -> usize {
+    pub fn live(&self) -> usize {
         self.live.load(Ordering::Relaxed)
     }
 
     /// 还没扫完的项数（估计回收线程数用）。
-    pub(crate) fn unfinished(&self) -> usize {
+    pub fn unfinished(&self) -> usize {
         self.unfinished.load(Ordering::Relaxed)
     }
 
     /// 领一个没扫的块并扫掉。没有可领的了返回 None。领到的扫完、交出结果后要调 [`Sweeper::finished`]。
-    pub(crate) fn sweep_next_block(&self) -> Option<Outcome> {
+    pub fn sweep_next_block(&self) -> Option<Outcome> {
         let i = self.next_block.fetch_add(1, Ordering::AcqRel);
         let b = *self.blocks.get(i)?;
         // SAFETY: 本轮标记已完成；这个块只分给了这一次领用，扫完前没人分配进去
@@ -144,7 +144,7 @@ impl Sweeper {
     }
 
     /// 一项扫完（交出结果之后调用）。
-    pub(crate) fn finished(&self) {
+    pub fn finished(&self) {
         self.unfinished.fetch_sub(1, Ordering::AcqRel);
     }
 
@@ -171,7 +171,7 @@ impl Sweeper {
     }
 
     /// 用回收线程把本轮扫完，并等别人（惰性清扫的 mutator）手里领走的也扫完。
-    pub(crate) fn finish(&self, pool: &Pool, sink: &(impl Sink + Sync)) {
+    pub fn finish(&self, pool: &Pool, sink: &(impl Sink + Sync)) {
         if self.is_done() {
             return;
         }
