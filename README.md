@@ -118,6 +118,10 @@ Work-stealing deques and backoff come from [crossbeam](https://github.com/crossb
 - Heap types implement `Trace` (use `#[derive(Trace)]`) and must be `Send + Sync`: objects are read from any thread
   and traced and dropped on collector threads. Mutable edges go in `Slot<'gc, T>` (an atomic pointer); writing one
   takes the `Mutator` (`slot.set(m, v)`), so the barrier can see concurrent marking.
+- `Gc<'gc, T>` is `#[repr(transparent)]` over `NonNull<T>`. `Gc::from_raw` turns a data pointer from `Gc::as_ptr`,
+  taken in the same `mutate`, back into a `Gc` (for example out of a NaN-boxed value). Raw addresses stored inside heap
+  objects are invisible to the collector: the type's `Trace` must rebuild them with `from_raw`, report them through
+  `Tracer::edge`, and in `relocate` pass them to `Tracer::relocate` and write the new address back.
 - A `Slot` is two words (the value and the value last counted). A single object's data is at most 128 MiB.
 - Objects can move during a stop-the-world collection. A `Gc` is only valid inside one `mutate`, so this is invisible,
   but `Gc::as_ptr` may differ from one `mutate` to the next. Hand-written `Trace` impls with edges must also implement
@@ -151,6 +155,7 @@ Work-stealing deques and backoff come from [crossbeam](https://github.com/crossb
 
 | Test | What it covers |
 | --- | --- |
+| `gc_from_raw_round_trip` | `Gc` and `Option<Gc>` are one pointer wide; a `Gc` taken apart with `as_ptr` and rebuilt with `from_raw` is the same object |
 | `rooted_list_survives` · `garbage_is_finalized` · `heap_drop_finalizes_everything` | Survival, exact finalization counts, dropping the heap drops everything |
 | `threads_mutate_at_once` · `blocks_are_reused` · `large_objects` | Concurrent mutators, line reuse keeps the block count flat, large objects |
 | `deep_binary_tree` | A 20-level complete binary tree (≈1M nodes): cut half, then all, exact counts |

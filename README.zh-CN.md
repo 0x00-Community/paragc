@@ -105,6 +105,9 @@ heap.collect();
 
 - 堆里的类型实现 `Trace`（用 `#[derive(Trace)]`），而且必须 `Send + Sync`：对象可能在任何线程上被读、在回收线程上被追踪和析构。
   要改的边放 `Slot<'gc, T>`（原子指针），写入要带 `Mutator`（`slot.set(m, v)`），写屏障才知道是否在并发标记。
+- `Gc<'gc, T>` 是 `#[repr(transparent)]` 的 `NonNull<T>`。`Gc::from_raw` 把同一次 `mutate` 里 `Gc::as_ptr` 得到的数据指针变回 `Gc`
+  （比如从 NaN-boxing 的值里解出来）。存进堆对象里的裸地址回收器看不见：类型的 `Trace` 要用 `from_raw` 把它变回来报给
+  `Tracer::edge`，并在 `relocate` 里交给 `Tracer::relocate`、把新地址写回去。
 - `Slot` 占两个字（值与上次计入的值）。单个对象的数据至多 128 MiB。
 - 暂停式回收会搬对象。`Gc` 只在一次 `mutate` 里有效，所以察觉不到，但 `Gc::as_ptr` 两次 `mutate` 之间可能不同。
   手写有边的 `Trace` 还要实现 `relocate`（derive 会生成）。
@@ -130,6 +133,7 @@ heap.collect();
 
 | 测试 | 覆盖什么 |
 | --- | --- |
+| `gc_from_raw_round_trip` | `Gc` 与 `Option<Gc>` 都是一个指针大小；`as_ptr` 拆开再 `from_raw` 取回的还是同一个对象 |
 | `rooted_list_survives` · `garbage_is_finalized` · `heap_drop_finalizes_everything` | 存活、析构数恰好、丢掉堆就析构全部 |
 | `threads_mutate_at_once` · `blocks_are_reused` · `large_objects` | 多 mutator 并发、行复用使块数不涨、大对象 |
 | `deep_binary_tree` | 20 层满二叉树（约 100 万节点）：剪半棵、全释放，析构数恰好 |
