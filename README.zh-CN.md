@@ -33,7 +33,7 @@ paragc 是**给多个线程共用一个堆的 Rust 程序用的追踪式垃圾�
 | 🧵 **多个 mutator** | `Heap::mutate(&self)` 可以在任意多个线程上同时调用；各自在自己的分配缓冲（`Tlab`）里碰撞分配，整块领用只要一次原子操作。 |
 | 🔒 **借用即独占** | `Heap::collect(&mut self)` 不可能和 `mutate` 重叠：借用检查器就是「停住世界」，没有安全点协议，也没有锁。 |
 | 🌊 **并发标记** | `Heap::mark_concurrently(&self)` 在 mutator 照常跑的同时标记（`Slot` 写入走初始快照写屏障、新对象黑分配）。mutator 只在开头短暂握手时等一下。 |
-| 🧹 **并发清扫** | `Heap::finish_marking(&mut self)` 只做标记收尾、把块交给清扫器；mutator 要块时顺手扫（惰性清扫），`Heap::sweep_concurrently(&self)` 在线程池上扫剩下的。两者都用上，停顿只剩清空灰队列。 |
+| 🧹 **并发清扫** | `Heap::finish_marking(&mut self)` 只做标记收尾、把块交给清扫器；mutator 要块时顺手扫（惰性清扫），`Heap::sweep_concurrently(&self)` 在线程池上扫剩下的。两者都用上，停顿只剩清空灰队列。析构缺省在全部回收线程上并行跑；`Heap::set_parallel_drop(false)` 改成只在调用回收 / `sweep_concurrently` 的线程上析构（判死、算行照旧并行），析构要释放 mutator 线程分配的内存时用它，免得跨线程释放让分配器争用。 |
 | 🏃 **并行回收** | 每个堆一个常驻线程池（两次回收之间线程挂起）。标记：每个工人一个 crossbeam 工作窃取双端队列、成批偷；清扫（含析构）：块按批分给同一批工人。 |
 | 🏷️ **带品牌的句柄** | `Gc<'gc, T>` 逃不出 `mutate` 的闭包；`Root<B>` 不带生命周期，可以存在任何地方、跨线程传。 |
 | 🔗 **堆之间直接引用** | `Far<'a, B>` 让一个堆的对象直接指着同一进程里另一个堆的对象：不复制、不经过间接表。每个堆仍然各自回收；`Heap::collect_group` 把几个堆一起追踪，收掉跨堆的环。 |
@@ -145,6 +145,7 @@ heap.collect();
 | `evacuation_compacts_sparse_blocks` | 只留 1/16：下一次回收疏散稀疏块；块数下降、值不变、地址变了、析构数恰好 |
 | `evacuation_with_shared_children` | 很多父节点共享少数子节点（一条 `Slot`、一条普通字段），多个工人争着认领同一个子节点；每个父节点的两条边都落到同一个新副本上，不会重复析构 |
 | `young_collection_frees_only_young_garbage` | 挂在老对象槽上、老节点之后、另一个年轻节点底下的年轻对象都活着；年轻回收恰好析构扔掉的年轻对象（追踪）与扔掉的老对象（引用计数） |
+| `serial_drop_stays_on_the_caller` | 关掉并行析构：引用计数后台释放、年轻 / 完整清扫、堆析构的死对象都在调用方线程上析构，一个不少 |
 | `promoted_slots_remember_young_values` | 第一次完整回收前被年轻回收晋升的持有者，之后写进去的年轻叶子在下一次年轻回收后还活着 |
 | `young_collections_while_relinking` | mutator 在老、年轻对象之间挪节点，轮流年轻回收、并发标记后年轻回收收尾、完整回收；每轮计数恰好 |
 | `background_release_while_mutating` | 整条老链一次扔掉：`finish_young` 返回时一个都还没析构；之后连锁释放在线程池上跑、mutator 同时照常挪，不析构还挂着的；下一次停顿空出的行被复用 |

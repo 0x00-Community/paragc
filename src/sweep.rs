@@ -15,6 +15,10 @@
 //! 被释放对象的行在重算前一直标着占用，所以不会被提前分配出去。
 //!
 //! 结束判定与标记相同：工人自己的队列空、也偷不到 ⇒ 空闲计数 +1；全部空闲 ⇒ 结束（只有工人会往队列里放）。
+//!
+//! 只在调用方线程上析构（[`crate::Heap::set_parallel_drop`] 关掉时）：别的工人照旧并行判死、清起点位、算行，
+//! 但死对象不析构，连同扫好的块一起放进待办；调用方（线程池的 0 号工人）析构完才把块交出去 / 还给系统。
+//! 析构里释放的内存多是 mutator 线程分配的，跨线程释放会让分配器（glibc 的 arena 锁）争用。
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::alloc::{Layout, dealloc};
@@ -22,7 +26,7 @@ use std::alloc::{Layout, dealloc};
 use crossbeam_deque::{Injector, Steal, Worker};
 use crossbeam_utils::{Backoff, CachePadded};
 
-use crate::layout::{Block, GRANULE, Header, State};
+use crate::layout::{Block, Core, Finalize, GRANULE, Header, State};
 use crate::mark::{Tracer, TracerInternal};
 use crate::sync::Pool;
 
@@ -45,20 +49,23 @@ impl Large {
         unsafe { self.0.as_ref() }
     }
 
-    /// 死了就析构并释放，返回 None；活着返回自己。
-    /// SAFETY（调用方）：本轮标记已经做完；死对象不可达，没人会再碰它。
-    unsafe fn sweep(self, epoch: u32) -> Option<Self> {
-        if self.header().is_marked(epoch) {
-            return Some(self);
-        }
+    /// 析构并释放。SAFETY（调用方）：死了，没人会再碰它。
+    unsafe fn free(self) {
         let layout = Self::layout(self.header().bytes());
         // SAFETY: 没标记 ⇒ 不可达；内存来自 Mutator 按同一 layout 的分配
         unsafe {
             Header::finalize(self.0.as_ptr());
             dealloc(self.0.as_ptr().cast(), layout);
         }
-        None
     }
+}
+
+/// 别的工人扫好、等调用方析构的项。
+enum Pending {
+    /// 扫好的块、它的状态、里面待析构的死对象（头地址）
+    Block(Block, State, Vec<usize>),
+    /// 死了的大对象
+    Large(Large),
 }
 
 /// 扫完一个块的去向。
@@ -91,6 +98,8 @@ pub struct Sweeper {
     spare: AtomicUsize,
     /// 本轮存活字节数（含头）
     live: AtomicUsize,
+    /// 只在调用方线程析构时：别的工人扫好、等调用方析构的项（处理完才算扫完）
+    pending: Injector<Pending>,
 }
 
 impl Sweeper {
@@ -123,12 +132,23 @@ impl Sweeper {
 
     /// 领一个没扫的块并扫掉。没有可领的了返回 None。领到的扫完、交出结果后要调 [`Sweeper::finished`]。
     pub fn sweep_next_block(&self) -> Option<Outcome> {
+        let (b, state) = self.sweep_claimed(None)?;
+        Some(self.settle(b, state))
+    }
+
+    /// 领一个没扫的块并扫掉（`deferred` 见 [`Block::sweep`]），返回块与状态。
+    fn sweep_claimed(&self, deferred: Option<&mut Vec<usize>>) -> Option<(Block, State)> {
         let i = self.next_block.fetch_add(1, Ordering::AcqRel);
         let b = *self.blocks.get(i)?;
         // SAFETY: 本轮标记已完成；这个块只分给了这一次领用，扫完前没人分配进去
-        let (state, live) = unsafe { b.sweep::<Header>(self.epoch) };
+        let (state, live) = unsafe { b.sweep::<Header>(self.epoch, deferred) };
         self.live.fetch_add(live, Ordering::Relaxed);
-        let outcome = match state {
+        Some((b, state))
+    }
+
+    /// 扫好（死对象都已析构）的块的去向。
+    fn settle(&self, b: Block, state: State) -> Outcome {
+        match state {
             State::Full => Outcome::Full(b),
             State::Recyclable => Outcome::Usable(b),
             State::Empty if self.take_spare() => Outcome::Usable(b),
@@ -137,8 +157,7 @@ impl Sweeper {
                 unsafe { b.release() };
                 Outcome::Released
             }
-        };
-        Some(outcome)
+        }
     }
 
     /// 还能留一个全空块作备用就占掉一个名额。
@@ -158,36 +177,75 @@ impl Sweeper {
         self.unfinished.fetch_sub(1, Ordering::AcqRel);
     }
 
-    /// 领一个没扫的大对象并扫掉；活着的交给 `sink`。没有可领的了返回 false。
-    fn sweep_next_large(&self, sink: &impl Sink) -> bool {
+    /// 领一个没扫的大对象并扫掉；活着的交给 `sink`。没有可领的了返回 false。`defer`：死了不析构，放进待办。
+    fn sweep_next_large(&self, sink: &impl Sink, defer: bool) -> bool {
         let i = self.next_large.fetch_add(1, Ordering::AcqRel);
         let Some(&l) = self.large.get(i) else { return false };
-        // SAFETY: 本轮标记已完成；这个大对象只分给了这一次领用
-        if let Some(l) = unsafe { l.sweep(self.epoch) } {
+        if l.header().is_marked(self.epoch) {
             self.live.fetch_add(l.header().bytes(), Ordering::Relaxed);
             sink.large(l);
+        } else if defer {
+            self.pending.push(Pending::Large(l));
+            return true;
+        } else {
+            // SAFETY: 本轮标记已完成、没标上 ⇒ 不可达；这个大对象只分给了这一次领用
+            unsafe { l.free() };
         }
         self.finished();
         true
     }
 
-    /// 回收线程：扫到没有可领的为止。
-    fn work(&self, sink: &impl Sink) {
-        while let Some(outcome) = self.sweep_next_block() {
-            sink.block(outcome);
+    /// 回收线程：扫到没有可领的为止。`defer`：死对象不析构，连同块放进待办（只在调用方线程析构时的其他工人）；
+    /// 调用方自己当场析构，每扫完一块顺手处理一批待办。
+    fn work(&self, sink: &impl Sink, defer: bool, caller: bool) {
+        let mut dead = Vec::new();
+        while let Some((b, state)) = self.sweep_claimed(defer.then_some(&mut dead)) {
+            if defer {
+                self.pending.push(Pending::Block(b, state, core::mem::take(&mut dead)));
+                continue;
+            }
+            sink.block(self.settle(b, state));
+            self.finished();
+            if caller {
+                self.drain(sink);
+            }
+        }
+        while self.sweep_next_large(sink, defer) {}
+    }
+
+    /// 调用方：析构待办里的死对象，再把块交出去。
+    fn drain(&self, sink: &impl Sink) {
+        loop {
+            match self.pending.steal() {
+                Steal::Success(Pending::Block(b, state, dead)) => {
+                    for addr in dead {
+                        // SAFETY: 扫块时判死的对象，还没析构；块交出去之前没人碰它
+                        unsafe { <Header as Finalize>::finalize(core::ptr::with_exposed_provenance::<Core>(addr)) };
+                    }
+                    sink.block(self.settle(b, state));
+                }
+                // SAFETY: 判死的大对象，只在待办里
+                Steal::Success(Pending::Large(l)) => unsafe { l.free() },
+                Steal::Retry => continue,
+                Steal::Empty => return,
+            }
             self.finished();
         }
-        while self.sweep_next_large(sink) {}
     }
 
     /// 用回收线程把本轮扫完，并等别人（惰性清扫的 mutator）手里领走的也扫完。
-    pub fn finish(&self, pool: &Pool, sink: &(impl Sink + Sync)) {
+    /// `parallel_drop` 为假时死对象只在调用方线程上析构（见模块说明）。
+    pub fn finish(&self, pool: &Pool, sink: &(impl Sink + Sync), parallel_drop: bool) {
         if self.is_done() {
             return;
         }
-        pool.run(pool.sized(self.unfinished()), |_| self.work(sink));
+        pool.run(pool.sized(self.unfinished()), |me| self.work(sink, !parallel_drop && me != 0, me == 0));
         let backoff = Backoff::new();
-        while !self.is_done() {
+        loop {
+            self.drain(sink);
+            if self.is_done() {
+                return;
+            }
             backoff.snooze();
         }
     }
@@ -204,25 +262,37 @@ pub struct Releaser<'h> {
     epoch: u32,
     /// 当前计数的奇偶
     parity: bool,
+    /// 只在调用方线程析构：别的工人归零、还没析构的对象（头地址）
+    pending: Option<Injector<usize>>,
 }
 
 impl<'h> Releaser<'h> {
-    pub fn new(decs: &'h Injector<usize>, dirty: &'h Injector<Block>, workers: usize, epoch: u32, parity: bool) -> Self {
-        Self { decs, dirty, workers: workers.max(1), idle: CachePadded::new(AtomicUsize::new(0)), epoch, parity }
+    /// `parallel_drop` 为假：归零的对象只在调用方线程上析构。
+    pub fn new(decs: &'h Injector<usize>, dirty: &'h Injector<Block>, workers: usize, epoch: u32, parity: bool, parallel_drop: bool) -> Self {
+        let pending = (!parallel_drop).then(Injector::new);
+        Self { decs, dirty, workers: workers.max(1), idle: CachePadded::new(AtomicUsize::new(0)), epoch, parity, pending }
     }
 
     pub fn run(&self, pool: &Pool) {
-        pool.run(self.workers, |_| self.work());
+        pool.run(self.workers, |me| self.work(if me == 0 { None } else { self.pending.as_ref() }));
+        let Some(pending) = &self.pending else { return };
+        loop {
+            match pending.steal() {
+                Steal::Success(addr) => self.free(core::ptr::with_exposed_provenance::<Header>(addr)),
+                Steal::Retry => {}
+                Steal::Empty => return,
+            }
+        }
     }
 
-    fn work(&self) {
+    fn work(&self, defer: Option<&Injector<usize>>) {
         let local = Worker::new_lifo();
         loop {
             while let Some(addr) = local.pop() {
-                self.one(addr, &local);
+                self.one(addr, &local, defer);
             }
             if let Some(addr) = self.steal(&local) {
-                self.one(addr, &local);
+                self.one(addr, &local, defer);
                 continue;
             }
             self.idle.fetch_add(1, Ordering::AcqRel);
@@ -233,7 +303,7 @@ impl<'h> Releaser<'h> {
                 }
                 if let Some(addr) = self.steal(&local) {
                     self.idle.fetch_sub(1, Ordering::AcqRel);
-                    self.one(addr, &local);
+                    self.one(addr, &local, defer);
                     break;
                 }
                 backoff.snooze();
@@ -252,8 +322,8 @@ impl<'h> Releaser<'h> {
     }
 
     /// 对一个对象 −1；减到 0 的块内老对象释放：它每条边的目标再 −1（放进本地队列），析构，清起点位。
-    /// 大对象、粘住的、年轻的不在这里释放（留给追踪 / 年轻清扫）。
-    fn one(&self, addr: usize, local: &Worker<usize>) {
+    /// 大对象、粘住的、年轻的不在这里释放（留给追踪 / 年轻清扫）。`defer`：边处理完后不析构，放进待办给调用方。
+    fn one(&self, addr: usize, local: &Worker<usize>, defer: Option<&Injector<usize>>) {
         let header = core::ptr::with_exposed_provenance::<Header>(addr);
         // SAFETY: 减量来自计入过的边，目标在计数归零前一直活着
         let h = unsafe { &*header };
@@ -268,7 +338,15 @@ impl<'h> Releaser<'h> {
         for child in children {
             local.push(child);
         }
-        // SAFETY: 计数归零 ⇒ 没有计入的引用、mutator 碰不到（见模块说明）
+        match defer {
+            Some(pending) => pending.push(addr),
+            None => self.free(header),
+        }
+    }
+
+    /// 析构归零的对象、清起点位、记下脏块。
+    fn free(&self, header: *const Header) {
+        // SAFETY: 计数归零 ⇒ 没有计入的引用、mutator 碰不到（见模块说明）；只有归零的那个线程（或它交给的调用方）碰它
         unsafe { Header::finalize(header) };
         let block = Block::containing(header.cast());
         block.clear_start(header.cast());
