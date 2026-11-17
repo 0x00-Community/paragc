@@ -1134,3 +1134,26 @@ fn gc_from_raw_round_trip() {
         assert_eq!(back.next.map(|n| n.value), Some(7));
     });
 }
+
+/// 年轻对象里的槽写屏障不记（年轻回收从对象本身追到）；被年轻回收晋升后就要记：
+/// 第一次完整回收之前（引用计数还不可信，晋升不重算计数）晋升的持有者，之后写进去的年轻叶子在下一次年轻回收后还活着。
+#[test]
+fn promoted_slots_remember_young_values() {
+    let heap = &mut Heap::new(THREADS);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let holder: Root<TreeB> = heap.mutate(|m| m.root(m.alloc(Tree::Branch { left: Slot::default(), right: Slot::default() })));
+    heap.collect_young();
+    heap.mutate(|m| {
+        let Tree::Branch { left, .. } = &*m.get(&holder) else { unreachable!() };
+        left.set(m, Some(m.alloc(Tree::Leaf(Counted(drops.clone())))));
+    });
+    heap.collect_young();
+    assert_eq!(drops.load(Ordering::Relaxed), 0, "晋升的持有者指着的年轻叶子被回收了");
+    heap.mutate(|m| {
+        let Tree::Branch { left, .. } = &*m.get(&holder) else { unreachable!() };
+        assert!(matches!(left.get().as_deref(), Some(Tree::Leaf(_))));
+    });
+    drop(holder);
+    heap.collect();
+    assert_eq!(drops.load(Ordering::Relaxed), 1);
+}
