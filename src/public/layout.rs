@@ -17,7 +17,7 @@ use crate::layout::BLOCK;
 use super::region::WINDOW;
 
 /// 超级块里的魔数：认出这是 paragc 的公开堆、布局版本对得上
-pub const MAGIC: u64 = u64::from_le_bytes(*b"paragcP2");
+pub const MAGIC: u64 = u64::from_le_bytes(*b"paragcP4");
 /// 页大小：各段按页对齐、按页延长文件
 pub const PAGE: usize = 4096;
 /// 类型表容量
@@ -67,11 +67,21 @@ pub struct Super {
     pub live: AtomicU64,
     /// 上次回收后新领用的字节数
     pub allocated: AtomicU64,
+    /// 堆身份：建堆时随机取的 64 位数。堆号会被重用，身份不会：指向这个堆的引用、登记都带着它，对不上就是指向一个已经死掉的旧堆
+    pub incarnation: AtomicU64,
+    /// 主人（建堆进程）的进程号与启动时间（见 [`super::process::Process`]）：主人不在了、又没有 [`Super::persist`]，堆就死了
+    pub owner_pid: AtomicU32,
+    /// 非 0：主人不在了堆也留着（[`crate::PublicHeap::persist`]）
+    pub persist: AtomicU32,
+    pub owner_start: AtomicU64,
+    /// 非 0：堆已经死了（主人走了），文件已经或正在删除；还映射着它的进程只能放手
+    pub dead: AtomicU32,
+    _pad_dead: u32,
 }
 
 impl Super {
     /// 新堆的超级块：纪元从 1 开始（新对象的标记 0、新块的行标记 0 都早于它）。
-    pub fn new(heap: u64) -> Self {
+    pub fn new(heap: u64, incarnation: u64, owner: super::process::Process) -> Self {
         Self {
             magic: AtomicU64::new(MAGIC),
             window: AtomicU64::new(WINDOW as u64),
@@ -91,6 +101,12 @@ impl Super {
             committed: core::array::from_fn(|_| AtomicU64::new(0)),
             live: AtomicU64::new(0),
             allocated: AtomicU64::new(0),
+            incarnation: AtomicU64::new(incarnation),
+            owner_pid: AtomicU32::new(owner.pid),
+            persist: AtomicU32::new(0),
+            owner_start: AtomicU64::new(owner.start),
+            dead: AtomicU32::new(0),
+            _pad_dead: 0,
         }
     }
 }
@@ -154,10 +170,12 @@ impl TypeEntry {
 pub struct Entry {
     /// 目标对象数据的公开偏移；0 = 空
     pub ptr: AtomicU64,
-    /// 持有方（0 = 普通句柄）
+    /// 持有方（0 = 不归任何人；挂接槽号 + 1；或 [`super::heap::HEAP_HOLDER`] | 堆号）
     pub holder: AtomicU32,
     /// 在还回来的入口栈里时：下一个（见 [`super::heap::Stack`]）
     pub next: AtomicU32,
+    /// 持有方是另一个公开堆时，那个堆的身份（[`Super::incarnation`]）：认出它已经死了、号被别人拿去了
+    pub holder_incarnation: AtomicU64,
 }
 
 /// 块状态表的一项。

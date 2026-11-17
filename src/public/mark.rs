@@ -13,7 +13,7 @@ use crate::block::Block;
 use crate::workers::Pool;
 
 use super::heap::Inner;
-use super::ptr::PHeader;
+use super::ptr::{FAR_EDGE, PHeader};
 use super::region::WINDOWS;
 
 /// 队列项里「组里第几个堆」放在高位（地址只用到低 48 位）
@@ -96,13 +96,19 @@ impl<'h> Marker<'h> {
         // SAFETY: 队列里只有本轮标记过的活对象
         let ty = unsafe { (*h).ty };
         let data = PHeader::data(h);
-        for &off in source.edges(ty) {
+        for &edge in source.edges(ty) {
+            let (far, off) = (edge & FAR_EDGE != 0, (edge & !FAR_EDGE) as usize);
             // SAFETY: 指针图里的偏移都是这个类型里指针槽（一个 AtomicU64）的位置
-            let v = unsafe { &*data.add(off as usize).cast::<AtomicU64>() }.load(Ordering::Acquire);
+            let v = unsafe { &*data.add(off).cast::<AtomicU64>() }.load(Ordering::Acquire);
             if v == 0 {
                 continue;
             }
             let Some(t) = Inner::heap_of(v).and_then(|k| self.by_heap[k]) else { continue };
+            // 指向的那个堆已经死了、号被组里这个新堆用上：不是它的对象，不跟
+            // SAFETY: 跨堆的槽是 PublicRef（repr(C)：偏移后面紧跟目标堆身份，也是一个 AtomicU64）
+            if far && unsafe { &*data.add(off + size_of::<AtomicU64>()).cast::<AtomicU64>() }.load(Ordering::Acquire) != self.members[t].heap.incarnation() {
+                continue;
+            }
             if t != m
                 && let Some(found) = self.found
             {

@@ -7,7 +7,7 @@ use core::cell::Cell;
 use core::marker::PhantomData;
 use core::num::NonZeroUsize;
 use core::ptr::{NonNull, null_mut};
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 use std::fs::File;
 use std::io;
@@ -30,6 +30,7 @@ use super::mark::{Marker, Member};
 use super::process::{FutexWord, Process};
 use super::ptr::{EdgeMap, PHEADER, PHeader, Public, PublicBrand, PublicGc, Shared};
 use super::region::{Region, WINDOW, WINDOWS};
+use super::registry::{Liveness, Registry};
 use super::space::Space;
 
 /// 等别人（回收方、mutate 里的线程）时每隔多久醒来查一次对方进程还在不在
@@ -41,8 +42,14 @@ const YIELD_ROUNDS: usize = 10;
 /// 回收方等 mutate 走空最多等这么久，等不到就先放开请求、过一会儿重来：一个线程在 A 的 mutate 里又去进 B 时，
 /// 两个回收方（或一起回收）分别挡着 A、B 会互相等死，放开请求就解开了
 const PATIENCE: Duration = Duration::from_millis(50);
-/// [`Entry::holder`] 的最高位：持有方是另一个公开堆（低位是它的堆号），不是某个挂接（槽号 + 1）
+/// [`Entry::holder`] 的最高位：持有方是另一个公开堆（低位是它的堆号，[`Entry::holder_incarnation`] 是它的身份），不是某个挂接（槽号 + 1）
 pub const HEAP_HOLDER: u32 = 1 << 31;
+/// [`Entry::holder`]：持有方堆和这个堆在同一个目录（同一份堆号登记），可以按目录判它死活、死了就还掉它的登记
+pub const SAME_DIR: u32 = 1 << 30;
+/// [`Entry::holder`] 里堆号那几位
+const HOLDER_INDEX: u32 = SAME_DIR - 1;
+/// `try_mutate` 隔多久才重新查一次主人还在不在（读 /proc）
+const ALIVE_RECHECK: Duration = Duration::from_millis(10);
 /// 清扫时每次领多少块
 const SWEEP_BATCH: usize = 16;
 /// 栈头低 32 位：栈顶序号 + 1（0 = 空）；高 32 位是改动次数（防 ABA）
@@ -86,8 +93,8 @@ impl Stack<'_> {
 
 /// 窗口背后是什么。
 pub enum Backing {
-    /// 共享内存文件系统上的文件；`marker` = 本句柄建的（堆号标记文件），析构时连同堆文件一起删（除非 persist）
-    File { file: File, path: PathBuf, marker: Option<PathBuf> },
+    /// 共享内存文件系统上的文件；`owner` = 本句柄建的（本进程是主人），析构时堆跟着死、删文件与标记（除非 persist）
+    File { file: File, path: PathBuf, owner: bool },
     /// 匿名共享内存（只在本进程）
     Anonymous,
 }
@@ -153,8 +160,10 @@ pub struct Inner {
     spare: AtomicPtr<Tlab>,
     /// 本句柄在挂接表里的槽号
     slot: usize,
-    /// 建堆的句柄析构时保留文件（[`PublicHeap::persist`]）
-    keep: AtomicBool,
+    /// 句柄建立的时刻：`checked` 从这里算
+    born: std::time::Instant,
+    /// 上次确认主人还在的时刻（距 `born` 的纳秒数）
+    checked: AtomicU64,
 }
 
 // SAFETY: 窗口里的状态都是原子量或由握手保护；其余是线程安全的
@@ -166,11 +175,13 @@ impl Inner {
     /// 窗口 `index` 已经映射上 `backing`；`fresh` 时写新的超级块，否则核对。出错时析构负责还窗口。
     pub fn new(space: Arc<Space>, index: usize, backing: Backing, threads: NonZeroUsize, fresh: bool) -> io::Result<Self> {
         let window = NonNull::new(space.region().window(index)).expect("窗口地址非空");
-        let mut me = Self { space, index, window, layout: Layout::new(), backing, threads, pool: OnceLock::new(), types: SegVec::default(), spare: AtomicPtr::new(null_mut()), slot: ATTACH_CAP, keep: AtomicBool::new(false) };
+        let mut me = Self { space, index, window, layout: Layout::new(), backing, threads, pool: OnceLock::new(), types: SegVec::default(), spare: AtomicPtr::new(null_mut()), slot: ATTACH_CAP, born: std::time::Instant::now(), checked: AtomicU64::new(0) };
         if fresh {
             me.backing.commit(0, PAGE);
             // SAFETY: 新堆，窗口开头一页刚有内存，还没人读
-            unsafe { me.window.as_ptr().cast::<Super>().write(Super::new(index as u64)) };
+            let incarnation = std::hash::BuildHasher::hash_one(&std::collections::hash_map::RandomState::new(), (index, Process::current().pid));
+            // SAFETY: 同上
+            unsafe { me.window.as_ptr().cast::<Super>().write(Super::new(index as u64, incarnation, Process::current())) };
         } else if me.sup().heap.load(Ordering::Acquire) != index as u64 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "超级块里的堆号与窗口不符"));
         }
@@ -347,6 +358,88 @@ impl Inner {
         usize::try_from(off).ok().map(|o| o / WINDOW).filter(|&k| k < WINDOWS)
     }
 
+    /// 堆身份（见 [`Super::incarnation`]）。
+    pub fn incarnation(&self) -> u64 {
+        self.sup().incarnation.load(Ordering::Acquire)
+    }
+
+    /// 堆文件的路径（匿名堆没有）。
+    fn path(&self) -> Option<&std::path::Path> {
+        match &self.backing {
+            Backing::File { path, .. } => Some(path),
+            Backing::Anonymous => None,
+        }
+    }
+
+    /// 本堆作为持有方、在 `target` 里登记时用的持有方字：同一个目录时带 [`SAME_DIR`]。
+    pub fn holder_word(&self, target: &Self) -> u32 {
+        let same_dir = self.path().zip(target.path()).is_some_and(|(a, b)| Registry::of(a).dir() == Registry::of(b).dir());
+        HEAP_HOLDER | if same_dir { SAME_DIR } else { 0 } | u32::try_from(self.index).expect("堆号")
+    }
+
+    /// 堆还活着：没标过死，并且主人还在（或 persist、或是匿名堆）。发现主人不在了就标死、删掉堆文件与标记。
+    pub fn is_alive(&self) -> bool {
+        let sup = self.sup();
+        if sup.dead.load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        let Some(path) = self.path() else { return true };
+        let owner = Process { pid: sup.owner_pid.load(Ordering::Acquire), start: sup.owner_start.load(Ordering::Acquire) };
+        if sup.persist.load(Ordering::Acquire) != 0 || owner.alive() {
+            return true;
+        }
+        sup.dead.store(1, Ordering::Release);
+        Registry::of(path).bury(path, self.index, self.incarnation());
+        false
+    }
+
+    /// 同 [`Inner::is_alive`]，但距上次确认不到 [`ALIVE_RECHECK`] 时只看「已死」标志（读 /proc 不便宜）。
+    fn alive_cached(&self) -> bool {
+        if self.sup().dead.load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        let now = u64::try_from(self.born.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let last = self.checked.load(Ordering::Relaxed);
+        if u128::from(now.saturating_sub(last)) < ALIVE_RECHECK.as_nanos() {
+            return true;
+        }
+        let alive = self.is_alive();
+        if alive {
+            self.checked.store(now, Ordering::Relaxed);
+        }
+        alive
+    }
+
+    /// 持有方字 + 身份是不是组里的某个堆（是组里的堆持有的登记，一起回收时由追踪决定）。
+    fn held_by(members: &[&Self], holder: u32, incarnation: u64) -> bool {
+        holder & HEAP_HOLDER != 0 && members.iter().any(|m| m.index == (holder & HOLDER_INDEX) as usize && m.incarnation() == incarnation)
+    }
+
+    /// 回收前：持有方是同目录里另一个堆、而那个堆已经死了（或号已经换了主）的登记，还掉。查不准的留着。
+    fn release_dead_holders(&self) {
+        let Some(path) = self.path() else { return };
+        let registry = Registry::of(path);
+        let mut verdicts: Vec<((usize, u64), Liveness)> = Vec::new();
+        for i in 0..self.sup().entries.load(Ordering::Acquire) {
+            let e = self.entry(i);
+            let holder = e.holder.load(Ordering::Acquire);
+            if e.ptr.load(Ordering::Acquire) == 0 || holder & (HEAP_HOLDER | SAME_DIR) != HEAP_HOLDER | SAME_DIR {
+                continue;
+            }
+            let key = ((holder & HOLDER_INDEX) as usize, e.holder_incarnation.load(Ordering::Acquire));
+            let verdict = if let Some(&(_, v)) = verdicts.iter().find(|(k, _)| *k == key) {
+                v
+            } else {
+                let v = registry.liveness(key.0, Some(key.1));
+                verdicts.push((key, v));
+                v
+            };
+            if matches!(verdict, Liveness::Dead | Liveness::Gone) {
+                self.release_entry(i);
+            }
+        }
+    }
+
     pub fn sup(&self) -> &Super {
         // SAFETY: 窗口开头一页在建堆时就有了，里面是超级块（全是原子量）
         unsafe { &*self.window.as_ptr().cast() }
@@ -468,11 +561,11 @@ impl Inner {
 
     /// 领一个入口放公开偏移 `off`，持有方是本挂接（只在这个堆的 mutate 里调用）。
     pub fn claim_entry(&self, off: u64) -> u32 {
-        self.claim_entry_for(off, u32::try_from(self.slot + 1).expect("挂接槽号"))
+        self.claim_entry_for(off, u32::try_from(self.slot + 1).expect("挂接槽号"), 0)
     }
 
-    /// 同 [`Inner::claim_entry`]，持有方是 `holder`（另一个公开堆：[`HEAP_HOLDER`] | 堆号）。
-    pub fn claim_entry_for(&self, off: u64, holder: u32) -> u32 {
+    /// 同 [`Inner::claim_entry`]，持有方是 `holder`（另一个公开堆：[`Inner::holder_word`]，`incarnation` 是它的身份）。
+    pub fn claim_entry_for(&self, off: u64, holder: u32, incarnation: u64) -> u32 {
         let sup = self.sup();
         let i = Stack { head: &sup.free_entries }.pop(|i| &self.entry(i).next).unwrap_or_else(|| {
             let i = sup.entries.fetch_add(1, Ordering::AcqRel);
@@ -482,6 +575,7 @@ impl Inner {
         });
         let e = self.entry(i);
         e.holder.store(holder, Ordering::Relaxed);
+        e.holder_incarnation.store(incarnation, Ordering::Relaxed);
         e.ptr.store(off, Ordering::Release);
         i
     }
@@ -560,8 +654,7 @@ impl Inner {
     /// 几个堆一起时：持有方是组里某个堆的入口不当根（由追踪决定死活），标完后按追踪到的跨堆边重建这些登记——先登记新的、
     /// 再还旧的，中间被杀也只多不少（接手的单独回收照样把它们当根）。
     fn collect_members(members: &[&Self]) {
-        let group: Vec<u32> = members.iter().map(|m| HEAP_HOLDER | u32::try_from(m.index).expect("堆号")).collect();
-        let in_group = |holder: u32| members.len() > 1 && group.contains(&holder);
+        let in_group = |e: &Entry| members.len() > 1 && Self::held_by(members, e.holder.load(Ordering::Acquire), e.holder_incarnation.load(Ordering::Acquire));
         let mut epochs = Vec::with_capacity(members.len());
         let mut roots = Vec::new();
         let mut blocks = 0;
@@ -575,10 +668,11 @@ impl Inner {
             blocks += n;
             heap.commit(Segment::States, heap.layout.states + n * size_of::<BlockState>());
             heap.commit(Segment::Entries, heap.layout.entries + sup.entries.load(Ordering::Acquire) as usize * size_of::<Entry>());
+            heap.release_dead_holders();
             for i in 0..sup.entries.load(Ordering::Acquire) {
                 let e = heap.entry(i);
                 let off = e.ptr.load(Ordering::Acquire);
-                if off != 0 && !in_group(e.holder.load(Ordering::Acquire)) {
+                if off != 0 && !in_group(e) {
                     roots.push((m, PHeader::of(heap.ptr(off)).expose_provenance()));
                 }
             }
@@ -588,7 +682,7 @@ impl Inner {
         let pool = members[0].pool();
         Marker::new(&marked, (members.len() > 1).then_some(&found), pool.sized(blocks)).run(pool, &roots);
         if members.len() > 1 {
-            Self::reregister(members, &group, &found);
+            Self::reregister(members, &found);
         }
         for (heap, epoch) in members.iter().zip(epochs) {
             heap.sweep_all(epoch);
@@ -596,10 +690,17 @@ impl Inner {
     }
 
     /// 一起回收标完之后：组内跨堆登记换成这次追踪到的（每对「来源堆, 目标」一项）。先登记新的、再还旧的。
-    fn reregister(members: &[&Self], group: &[u32], found: &Injector<(usize, u64)>) {
+    fn reregister(members: &[&Self], found: &Injector<(usize, u64)>) {
         let old: Vec<Vec<u32>> = members
             .iter()
-            .map(|heap| (0..heap.sup().entries.load(Ordering::Acquire)).filter(|&i| group.contains(&heap.entry(i).holder.load(Ordering::Acquire))).collect())
+            .map(|heap| {
+                (0..heap.sup().entries.load(Ordering::Acquire))
+                    .filter(|&i| {
+                        let e = heap.entry(i);
+                        e.ptr.load(Ordering::Acquire) != 0 && Self::held_by(members, e.holder.load(Ordering::Acquire), e.holder_incarnation.load(Ordering::Acquire))
+                    })
+                    .collect()
+            })
             .collect();
         let mut edges = Vec::new();
         loop {
@@ -613,7 +714,7 @@ impl Inner {
         edges.dedup();
         for (source, off) in edges {
             let target = members.iter().find(|m| m.owns(off)).expect("找到的边都指向组里的堆");
-            target.claim_entry_for(off, group[source]);
+            target.claim_entry_for(off, members[source].holder_word(target), members[source].incarnation());
         }
         for (heap, old) in members.iter().zip(old) {
             for i in old {
@@ -705,15 +806,17 @@ impl Drop for Inner {
             a.start.store(0, Ordering::Relaxed);
             a.pid.store(0, Ordering::Release);
         }
+        // 建堆的句柄（主人）放手、又没有 persist：堆跟着死——标死（还映射着它的进程就知道了），删掉文件与标记。
+        // 要在拆映射之前读写超级块
+        if let Backing::File { path, owner: true, .. } = &self.backing
+            && self.sup().persist.load(Ordering::Acquire) == 0
+        {
+            self.sup().dead.store(1, Ordering::Release);
+            Registry::of(path).bury(path, self.index, self.incarnation());
+        }
         // SAFETY: 最后一个引用：没有 mutator、句柄都已析构
         unsafe { self.space.region().unmap(self.index) };
         self.space.release(self.index);
-        if let Backing::File { path, marker: Some(marker), .. } = &self.backing
-            && !self.keep.load(Ordering::Acquire)
-        {
-            let _ = std::fs::remove_file(path);
-            let _ = std::fs::remove_file(marker);
-        }
         let spare = *self.spare.get_mut();
         if !spare.is_null() {
             // SAFETY: Box::into_raw 来的
@@ -730,6 +833,18 @@ impl From<Inner> for PublicHeap {
         Self(Arc::new(inner))
     }
 }
+
+/// 堆已经死了（主人不在了）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeapDead;
+
+impl core::fmt::Display for HeapDead {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("公开堆已经死了（建它的进程不在了）")
+    }
+}
+
+impl std::error::Error for HeapDead {}
 
 /// 公开堆的统计。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -753,7 +868,21 @@ impl PublicHeap {
 
     /// 建堆的句柄析构时保留堆文件与堆号标记（主进程退出或重启后，别的进程照样 [`crate::PublicSpace::open`] 回来接着用）。
     pub fn persist(&self) {
-        self.0.keep.store(true, Ordering::Release);
+        self.0.sup().persist.store(1, Ordering::Release);
+    }
+
+    /// 堆还活着：主人（建堆的进程）还在，或调过 [`PublicHeap::persist`]。主人不在了堆就死了：这里发现时标死、删掉堆文件与标记；
+    /// 之后本进程该放掉指向它的句柄（放掉最后一个，映射才拆、内存才还）。
+    pub fn is_alive(&self) -> bool {
+        self.0.is_alive()
+    }
+
+    /// 同 [`PublicHeap::mutate`]，但堆已经死了（主人不在了）时不进去，返回 [`HeapDead`]。别的进程建的堆用这个。
+    pub fn try_mutate<R>(&self, f: impl for<'p> FnOnce(&PublicMutator<'p>) -> R) -> Result<R, HeapDead> {
+        if !self.0.alive_cached() {
+            return Err(HeapDead);
+        }
+        Ok(self.mutate(f))
     }
 
     /// 挂接表里占着的槽数（映射着这个堆的地方：进程，或同一进程里的多个地址区；含已死、还没被收拾的）。
@@ -795,12 +924,18 @@ impl PublicHeap {
     /// 几个公开堆（都映射在本进程里）一起回收，收掉跨堆的环：持有方是组里某个堆的 [`crate::PublicRef`] 登记不当根，
     /// 由追踪决定死活；标完后组内的跨堆登记换成这次追踪到的。同一个堆不能出现两次。
     pub fn collect_group(heaps: &[&PublicHeap]) {
-        let mut members: Vec<&Inner> = heaps.iter().map(|h| &*h.0).collect();
+        // 已经死了的堆不参加：它持有的登记由各堆回收时按死活还掉
+        let mut members: Vec<&Inner> = heaps.iter().map(|h| &*h.0).filter(|m| m.is_alive()).collect();
         members.sort_by_key(|m| m.index);
         assert!(members.windows(2).all(|w| w[0].index != w[1].index), "同一个公开堆不能在组里出现两次");
         if !members.is_empty() {
             Inner::collect_group(&members);
         }
+    }
+
+    /// 堆身份（建堆时随机取的；堆号会被重用，身份不会）。
+    pub fn incarnation(&self) -> u64 {
+        self.0.incarnation()
     }
 
     pub fn stats(&self) -> PublicStats {
@@ -1037,8 +1172,11 @@ pub trait PublicMutatorInternal {
     /// 堆号。
     fn index(&self) -> usize;
 
-    /// 给别的堆持有的引用登记一个入口（持有方 `holder`）。
-    fn register(&self, off: u64, holder: u32);
+    /// 给 `holder` 堆持有的引用在本堆登记一个入口。
+    fn register(&self, off: u64, holder: &PublicMutator<'_>);
+
+    /// 堆身份。
+    fn incarnation(&self) -> u64;
 }
 
 impl PublicMutatorInternal for PublicMutator<'_> {
@@ -1054,8 +1192,12 @@ impl PublicMutatorInternal for PublicMutator<'_> {
         self.heap.index
     }
 
-    fn register(&self, off: u64, holder: u32) {
-        self.heap.claim_entry_for(off, holder);
+    fn register(&self, off: u64, holder: &PublicMutator<'_>) {
+        self.heap.claim_entry_for(off, holder.heap.holder_word(self.heap), holder.heap.incarnation());
+    }
+
+    fn incarnation(&self) -> u64 {
+        self.heap.incarnation()
     }
 }
 

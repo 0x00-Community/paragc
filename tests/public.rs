@@ -5,7 +5,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use paragc::{Heap, Public, PublicGc, PublicHeap, PublicRef, PublicSlot, PublicSpace, Root, Shared, Trace, brand, public_brand};
+use paragc::{HeapDead, Heap, Public, PublicGc, PublicHeap, PublicRef, PublicSlot, PublicSpace, Root, Shared, Trace, brand, public_brand};
 
 /// 每个堆的回收线程数（Miri 下减少）
 const THREADS: NonZeroUsize = NonZeroUsize::new(if cfg!(miri) { 2 } else { 4 }).unwrap();
@@ -407,6 +407,13 @@ fn linked(heaps: &[PublicHeap], handles: &[Public<LinkB>], i: usize) -> bool {
     heaps[i].mutate(|mi| heaps[j].mutate(|mj| handles[i].get(mi).next.get(mj).is_some_and(|n| PublicGc::ptr_eq(n, handles[j].get(mj)) && n.heap == j as u64)))
 }
 
+impl Link<'_> {
+    /// 一个还没指向谁的 Link。
+    fn alone(heap: u64) -> Self {
+        Self { heap, next: PublicRef::default() }
+    }
+}
+
 fn anonymous_heaps(space: &PublicSpace, n: usize) -> Vec<PublicHeap> {
     (0..n).map(|_| space.create_anonymous(THREADS).unwrap()).collect()
 }
@@ -548,4 +555,70 @@ fn nested_mutates_with_collectors_do_not_deadlock() {
     collect_all(&heaps);
     assert!(linked(&heaps, &handles, 0) && linked(&heaps, &handles, 1));
     assert_eq!(live(&heaps), [LINK, LINK]);
+}
+
+/// 一个单独的目录（里面的堆号标记只归一条测试）。
+struct Dir(std::path::PathBuf);
+
+impl Dir {
+    fn new(name: &str) -> Self {
+        let dir = std::path::PathBuf::from(format!("/dev/shm/paragc-pdir-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        Self(dir)
+    }
+
+    fn file(&self, name: &str) -> std::path::PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for Dir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "Miri 跑不了文件映射")]
+fn references_to_a_dead_heap_do_not_crash() {
+    let dir = Dir::new("dead");
+    let space = PublicSpace::reserve().unwrap();
+    let x = space.create(dir.file("x"), THREADS).unwrap();
+    let y = space.create(dir.file("y"), THREADS).unwrap();
+    // y_link（y 里、挂句柄）→ x_link（x 里）→ y_only（y 里、只被 x_link 指着：登记的持有方是 x）
+    let x_link = x.mutate(|m| m.root::<LinkB>(m.alloc(Link::alone(0))));
+    let y_link = y.mutate(|m| m.root::<LinkB>(m.alloc(Link::alone(1))));
+    x.mutate(|mx| y.mutate(|my| {
+        y_link.get(my).next.set(my, mx, Some(x_link.get(mx)));
+        x_link.get(mx).next.set(mx, my, Some(my.alloc(Link::alone(2))));
+    }));
+    let x_number = x.id();
+    // 同一个进程里另一个地址区也映射着 x
+    let other = PublicSpace::reserve().unwrap();
+    let x2 = other.open(dir.file("x"), THREADS).unwrap();
+    let held: Public<LinkB> = x2.mutate(|m| m.find(x_link.index())).expect("凭入口号找到");
+    // x 的主人（建堆的句柄与它建的句柄）放手：x 跟着死，文件删掉
+    drop(x_link);
+    drop(x);
+    assert!(!dir.file("x").exists() && !dir.file(&format!(".paragc-{x_number}")).exists(), "死堆的文件与标记删掉了");
+    assert!(!x2.is_alive());
+    assert_eq!(x2.try_mutate(|_| ()), Err(HeapDead));
+    // 还映射着它的一方，手里的句柄照样能用、能析构（内存等最后一个映射放手才还）
+    assert_eq!(x2.mutate(|m| held.get(m).heap), 0);
+    drop(held);
+    drop(x2);
+    // x 的号被新堆 z 用上：y_link 指向 x 的引用身份对不上，读出来是 None
+    let z = space.create(dir.file("z"), THREADS).unwrap();
+    assert_eq!(z.id(), x_number, "死堆的号收回重用");
+    let z_obj: Public<LinkB> = z.mutate(|m| m.root(m.alloc(Link::alone(7))));
+    let (points, read) = y.mutate(|my| z.mutate(|mz| (y_link.get(my).next.points_into(&z), y_link.get(my).next.get(mz).is_some())));
+    assert!(!points && !read, "指向死堆的引用不能读成新堆里的对象");
+    // 一起回收不跟这条旧引用（否则会把 z 里同一偏移处的东西当对象去标）
+    PublicHeap::collect_group(&[&y, &z]);
+    assert_eq!(z.stats().live, LINK, "z 里只有自己挂着的对象");
+    // y 回收：x 生前登记在 y 里的引用（持有方 x 已死）还掉，只被 x 指着的 y_only 收掉
+    y.collect();
+    assert_eq!(y.stats().live, LINK, "死堆持有的登记被还掉，y 里只剩挂着句柄的那个");
+    drop((y_link, z_obj));
 }

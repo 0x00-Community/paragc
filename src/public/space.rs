@@ -1,23 +1,17 @@
 //! [`PublicSpace`]：本进程的公开地址区；在它上面建、打开公开堆。
 use core::num::NonZeroUsize;
 use core::sync::atomic::{AtomicU64, Ordering};
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
 
 use super::heap::{Backing, Inner, PublicHeap};
-use super::layout::MAGIC;
-use super::process::Process;
-use super::region::{Region, WINDOW, WINDOWS};
+use super::region::{Region, WINDOWS};
+use super::registry::{FileHeader, Registry};
 
 const _: () = assert!(WINDOWS <= u64::BITS as usize, "窗口占用位图是一个 u64");
 
-/// 超级块开头三个字（魔数、窗口大小、堆号）的字节数：打开时先读它们，才知道映射到哪个窗口
-const PROLOGUE: usize = 3 * size_of::<u64>();
-/// 堆号标记文件名的前缀（放在堆文件所在目录：`.paragc-<堆号>`，内容是「建堆进程号 启动时间」一行 + 堆文件名）
-const MARKER_PREFIX: &str = ".paragc-";
 
 
 pub struct Space {
@@ -59,48 +53,44 @@ impl PublicSpace {
     /// 在 `path`（共享内存文件系统上的新文件，比如 `/dev/shm/…` 或自己挂的 tmpfs / hugetlbfs）建一个公开堆。
     /// 文件刚建时是空的，用到哪里延长到哪里；权限 0600，有文件权限的进程才能打开。
     ///
-    /// 堆号在同一个目录里跨进程唯一：用 `O_EXCL` 建 `.paragc-<堆号>` 标记文件领号（标记里的堆文件已经不在、或堆号对不上时收回重用）。
-    /// 这个句柄（连同它建出的 [`crate::Public`]）全部析构时删除堆文件与标记，除非调过 [`PublicHeap::persist`]。
+    /// 堆号在同一个目录里跨进程唯一：在 `.paragc-<堆号>` 标记文件的锁里领号（标记指着的堆已经死了时收回重用）。
+    /// 本进程是这个堆的主人：这个句柄（连同它建出的 [`crate::Public`]）全部析构、或本进程退出 / 被杀，堆就跟着死，
+    /// 除非调过 [`PublicHeap::persist`]。
     pub fn create(&self, path: impl AsRef<Path>, threads: NonZeroUsize) -> io::Result<PublicHeap> {
         use std::os::unix::fs::OpenOptionsExt;
         let path = path.as_ref();
-        let (k, marker) = self.claim_number(path)?;
+        let k = self.claim_number(path)?;
+        let abandon = || {
+            if let Some(name) = path.file_name() {
+                Registry::of(path).abandon(k, name);
+            }
+        };
         let file = match OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(path) {
             Ok(f) => f,
             Err(e) => {
-                let _ = std::fs::remove_file(&marker);
+                abandon();
                 self.0.release(k);
                 return Err(e);
             }
         };
-        let backing = Backing::File { file, path: path.to_path_buf(), marker: Some(marker.clone()) };
+        let backing = Backing::File { file, path: path.to_path_buf(), owner: true };
         self.attach(k, backing, threads, true).inspect_err(|_| {
             let _ = std::fs::remove_file(path);
-            let _ = std::fs::remove_file(&marker);
+            abandon();
         })
     }
 
-    /// 领一个堆号：本地址区的窗口空着，并且在堆文件所在目录建得出 `.paragc-<堆号>`。返回堆号与标记文件。
-    fn claim_number(&self, path: &Path) -> io::Result<(usize, std::path::PathBuf)> {
-        use std::io::Write;
-        let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    /// 领一个堆号：本地址区的窗口空着，并且在堆文件所在目录领得到 `.paragc-<堆号>`。
+    fn claim_number(&self, path: &Path) -> io::Result<usize> {
+        let registry = Registry::of(path);
         let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "堆文件路径没有文件名"))?;
         for k in 0..WINDOWS {
             if !self.0.claim(k) {
                 continue;
             }
-            let marker = dir.join(format!("{MARKER_PREFIX}{k}"));
-            if Self::stale(&marker, dir, k) {
-                let _ = std::fs::remove_file(&marker);
-            }
-            match OpenOptions::new().write(true).create_new(true).open(&marker) {
-                Ok(mut f) => {
-                    let me = Process::current();
-                    f.write_all(format!("{} {}\n", me.pid, me.start).as_bytes())?;
-                    f.write_all(name.as_encoded_bytes())?;
-                    return Ok((k, marker));
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => self.0.release(k),
+            match registry.claim(k, name) {
+                Ok(true) => return Ok(k),
+                Ok(false) => self.0.release(k),
                 Err(e) => {
                     self.0.release(k);
                     return Err(e);
@@ -108,21 +98,6 @@ impl PublicSpace {
             }
         }
         Err(io::Error::new(io::ErrorKind::OutOfMemory, "公开堆号用完了（这个目录里的标记或本地址区的窗口）"))
-    }
-
-    /// 标记文件过期了：它写的堆文件在、但堆号不是 `k`；或堆文件不在、建堆的进程也死了（进程还活着就当它还在建堆，不抢）。
-    fn stale(marker: &Path, dir: &Path, k: usize) -> bool {
-        let Ok(text) = std::fs::read(marker) else { return false };
-        let Some(split) = text.iter().position(|&b| b == b'\n') else { return false };
-        let (owner, name) = (&text[..split], &text[split + 1..]);
-        if let Ok(f) = File::open(dir.join(std::ffi::OsStr::from_bytes(name))) {
-            return Self::heap_number(&f).map_or(true, |n| n != k);
-        }
-        let mut words = std::str::from_utf8(owner).unwrap_or_default().split_whitespace().map(str::parse::<u64>);
-        match (words.next(), words.next()) {
-            (Some(Ok(pid)), Some(Ok(start))) => u32::try_from(pid).is_ok_and(|pid| !Process { pid, start }.alive()),
-            _ => true,
-        }
     }
 
     /// 没有文件的公开堆（只在本进程里用；测试与 Miri 用它）。
@@ -135,23 +110,16 @@ impl PublicSpace {
     pub fn open(&self, path: impl AsRef<Path>, threads: NonZeroUsize) -> io::Result<PublicHeap> {
         let path = path.as_ref();
         let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let k = Self::heap_number(&file)?;
+        let header = FileHeader::read(&file)?;
+        if header.is_dead() {
+            Registry::of(path).bury(path, header.heap, header.incarnation);
+            return Err(io::Error::new(io::ErrorKind::NotFound, "这个公开堆已经死了（主人不在了）"));
+        }
+        let k = header.heap;
         if !self.0.claim(k) {
             return Err(io::Error::new(io::ErrorKind::AddrInUse, "这个公开堆的窗口在本地址区已被占用"));
         }
-        self.attach(k, Backing::File { file, path: path.to_path_buf(), marker: None }, threads, false)
-    }
-
-    /// 读超级块开头，核对魔数与窗口大小，返回堆号。
-    fn heap_number(file: &File) -> io::Result<usize> {
-        use std::os::unix::fs::FileExt;
-        let mut head = [0; PROLOGUE];
-        file.read_exact_at(&mut head, 0)?;
-        let word = |i: usize| u64::from_le_bytes(head[i * size_of::<u64>()..(i + 1) * size_of::<u64>()].try_into().expect("8 字节"));
-        if word(0) != MAGIC || word(1) != WINDOW as u64 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "不是 paragc 公开堆，或布局版本不同"));
-        }
-        usize::try_from(word(2)).ok().filter(|&k| k < WINDOWS).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "堆号超出窗口数"))
+        self.attach(k, Backing::File { file, path: path.to_path_buf(), owner: false }, threads, false)
     }
 
     /// 把窗口 `k` 映射上 `backing`，`fresh` 时写新的超级块。失败时还掉窗口。

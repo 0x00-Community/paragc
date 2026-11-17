@@ -5,8 +5,9 @@ mod mark;
 mod process;
 mod ptr;
 mod region;
+mod registry;
 mod space;
 
-pub use heap::{PublicHeap, PublicMutator, PublicStats};
+pub use heap::{HeapDead, PublicHeap, PublicMutator, PublicStats};
 pub use ptr::{EdgeMap, Public, PublicBrand, PublicGc, PublicRef, PublicSlot, Shared};
 pub use space::PublicSpace;

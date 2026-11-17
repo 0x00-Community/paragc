@@ -16,7 +16,7 @@ use crate::gc::Invariant;
 use crate::header::Core;
 use crate::{Trace, Tracer};
 
-use super::heap::{HEAP_HOLDER, Inner, PublicHeap, PublicMutator};
+use super::heap::{Inner, PublicHeap, PublicMutator};
 use super::region::Region;
 
 /// 公开堆的对象头（16 B）：两种堆共用的标记字 / 信息字，加类型号。
@@ -66,6 +66,9 @@ pub unsafe trait Shared: Send + Sync {
     fn edges(map: &mut EdgeMap, at: u32);
 }
 
+/// 指针图里的偏移带这一位：那里是一个 [`PublicRef`]（偏移 + 目标堆身份），指向别的堆；不带的是同堆的 [`PublicSlot`]
+pub const FAR_EDGE: u32 = 1 << 31;
+
 /// 一个类型的指针图：对象数据里每个指针槽的字节偏移。
 #[derive(Default)]
 pub struct EdgeMap(Vec<u32>);
@@ -75,7 +78,12 @@ impl EdgeMap {
         self.0.push(at);
     }
 
-    /// 报上来的全部偏移。
+    /// 一个指向别的公开堆的 [`PublicRef`]（偏移后面还有目标堆的身份）。
+    pub fn far(&mut self, at: u32) {
+        self.0.push(at | FAR_EDGE);
+    }
+
+    /// 报上来的全部偏移（[`FAR_EDGE`] 那一位标着跨堆的）。
     pub fn as_slice(&self) -> &[u32] {
         &self.0
     }
@@ -259,14 +267,18 @@ unsafe impl<T: Send + Sync> Shared for PublicSlot<'_, T> {
     }
 }
 
-/// 公开堆 A（品牌 `'a`）对象里指向另一个公开堆 B 的对象的引用：存目标的公开偏移，直接指过去，不复制。
+/// 公开堆 A（品牌 `'a`）对象里指向另一个公开堆 B 的对象的引用：存目标的公开偏移与 B 的身份，直接指过去，不复制。
 ///
 /// 写入时在 B 的入口表登记一项、持有方记作「堆 A」，所以 B 单独回收时它是根（回收 B 的进程不需要能打开 A）；
 /// A 单独回收不跟进 B。跨堆的环、以及已经不用的登记，由 [`PublicHeap::collect_group`] 收。读要带 B 的 mutator。
 /// 品牌 `'a` 保证它只能放进 A 的对象里（登记的持有方才对）。
-#[repr(transparent)]
+///
+/// B 死了以后它的堆号可能被新堆用上：身份对不上的引用读出来是 None，回收时也不跟，不会被当成新堆里的地址。
+#[repr(C)]
 pub struct PublicRef<'a, B: PublicBrand> {
     off: AtomicU64,
+    /// 目标堆的身份（[`super::layout::Super::incarnation`]）
+    incarnation: AtomicU64,
     _brand: PhantomData<(HolderBrand<'a>, fn() -> B)>,
 }
 
@@ -275,7 +287,7 @@ type HolderBrand<'a> = fn(&'a ()) -> &'a ();
 
 impl<B: PublicBrand> Default for PublicRef<'_, B> {
     fn default() -> Self {
-        Self { off: AtomicU64::new(0), _brand: PhantomData }
+        Self { off: AtomicU64::new(0), incarnation: AtomicU64::new(0), _brand: PhantomData }
     }
 }
 
@@ -292,32 +304,33 @@ impl<'a, B: PublicBrand> PublicRef<'a, B> {
         assert!(holder.index() != target.index(), "同一个公开堆里的边用 PublicSlot");
         let off = v.map_or(0, PublicGc::offset);
         if off != 0 {
-            target.register(off, HEAP_HOLDER | u32::try_from(holder.index()).expect("堆号"));
+            target.register(off, holder);
         }
+        // 先写身份再写偏移：读的一方看到新偏移时身份也是新的（两个字被并发改写时，对不上的组合只会读成 None）
+        self.incarnation.store(target.incarnation(), Ordering::Release);
         self.off.store(off, Ordering::Release);
     }
 
-    /// 取目标对象；`target` 必须是目标堆的 mutator。
+    /// 取目标对象；`target` 是它指向的那个堆的 mutator。空的、指向别的堆的、指向一个已经死掉的旧堆（堆号被 `target` 重用了）的，都是 None。
     pub fn get<'b>(&self, target: &PublicMutator<'b>) -> Option<PublicGc<'b, B::Of<'b>>> {
         let off = self.off.load(Ordering::Acquire);
-        if off == 0 {
+        if off == 0 || Inner::heap_of(off) != Some(target.index()) || self.incarnation.load(Ordering::Acquire) != target.incarnation() {
             return None;
         }
-        assert!(Inner::heap_of(off) == Some(target.index()), "这个 PublicRef 不指向这个堆");
         // SAFETY: 目标堆的入口保活它（登记在写入时、一起回收时重建），公开堆不搬对象；target 证明在目标堆的 mutate 里
         Some(unsafe { PublicGc::from_data(target.at(off)) })
     }
 
-    /// 指向 `heap` 里的对象。
+    /// 指向 `heap` 里的对象（同一个身份的堆）。
     pub fn points_into(&self, heap: &PublicHeap) -> bool {
-        Inner::heap_of(self.off.load(Ordering::Acquire)) == Some(heap.id())
+        Inner::heap_of(self.off.load(Ordering::Acquire)) == Some(heap.id()) && self.incarnation.load(Ordering::Acquire) == heap.incarnation()
     }
 }
 
-// SAFETY: 它本身就是一个指针槽（回收时跨窗口的边由组外 / 组内规则处理）
+// SAFETY: 它本身就是一个跨堆的指针槽（回收时按身份认目标堆）
 unsafe impl<B: PublicBrand> Shared for PublicRef<'_, B> {
     fn edges(map: &mut EdgeMap, at: u32) {
-        map.edge(at);
+        map.far(at);
     }
 }
 
