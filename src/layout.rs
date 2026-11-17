@@ -517,6 +517,12 @@ impl Block {
         self.meta().starts[g / BITS].fetch_or(1 << (g % BITS), Ordering::Relaxed);
     }
 
+    /// `p` 处对象的起点位：所在的字（块活着就一直有效）与位。
+    pub fn start_bit(self, p: *const u8) -> (*const AtomicU64, u64) {
+        let g = self.offset(p) / GRANULE;
+        (&raw const self.meta().starts[g / BITS], 1 << (g % BITS))
+    }
+
     /// 把凑满整页的空行（行标记早于 `epoch`）还给系统（`madvise(MADV_DONTNEED)`；第 0 页有元数据，不碰）。
     /// 之后再分配进去会重新缺页（内容是零，分配不依赖内容）。只在 Linux（Miri 除外）。
     /// SAFETY（调用方）：空行里没有还要用的东西（死对象已析构），没有 mutator 在用这个块。

@@ -231,7 +231,9 @@ impl Heap {
         tlab.adopt((self.id(), self.collections));
         // 并发标记只在没有 mutator 时开始、只在独占堆时结束，所以一次 mutate 里它不变
         let marking = NonZeroU32::new(self.marking.load(Ordering::Acquire));
-        f(&Mutator { heap: self, tlab, marking, _brand: PhantomData })
+        // 闭包 panic 也要把攒着的起点位写进去：漏了，下一次停顿重算行时会把活对象占的行当空行
+        let tlab = FlushStarts(tlab);
+        f(&Mutator { heap: self, tlab: tlab.0, marking, _brand: PhantomData })
     }
 
     fn pool(&self) -> &Pool {
@@ -859,8 +861,16 @@ impl Drop for Heap {
     }
 }
 
+/// mutate 结束（含 panic）时把分配缓冲攒着的起点位写进块里。
+struct FlushStarts<'a>(&'a Tlab);
+
+impl Drop for FlushStarts<'_> {
+    fn drop(&mut self) {
+        self.0.flush_starts();
+    }
+}
+
 /// 线程的分配缓冲：主游标与溢出游标（各自的块、找到哪一行、当前空洞的游标与界）。块在两次回收之间只归它。
-#[derive(Default)]
 pub struct Tlab {
     /// (所属堆, 那时的回收次数)；对不上就作废
     owner: Cell<(usize, u64)>,
@@ -869,6 +879,16 @@ pub struct Tlab {
     overflow: Bump,
     /// 公开堆：上一次分配的（类型名的地址, 类型号）
     last: Cell<Option<(usize, u32)>>,
+    /// 还没写进块里的起点位：(起点位图里的一个字, 要置上的位)。连着分配的对象多半落在同一个字里，攒着换字时一次写进去，
+    /// 不必每个对象一次原子 RMW。块在两次回收之间只归这个缓冲；起点位只在停顿里读（那时 mutate 都已结束、写进去了），
+    /// 并发的引用计数释放只清别的（老对象的）位，所以晚写不碍事
+    starts: Cell<(*const AtomicU64, u64)>,
+}
+
+impl Default for Tlab {
+    fn default() -> Self {
+        Self { owner: Cell::default(), main: Bump::default(), overflow: Bump::default(), last: Cell::default(), starts: Cell::new((core::ptr::null(), 0)) }
+    }
 }
 
 // SAFETY: 指针指向它独占的块；移到别的线程后由那个线程独占使用
@@ -877,9 +897,32 @@ unsafe impl Send for Tlab {}
 impl Tlab {
     /// 换了堆或堆回收过（`owner` = (堆, 回收次数)）：之前的块已经被清扫重新分类，丢掉；同一个堆的类型号缓存留着。
     fn adopt(&mut self, owner: (usize, u64)) {
+        self.flush_starts();
         if self.owner.get() != owner {
             let last = if self.owner.get().0 == owner.0 { self.last.get() } else { None };
             *self = Self { owner: Cell::new(owner), last: Cell::new(last), ..Self::default() };
+        }
+    }
+
+    /// 记下 `p` 处有一个对象（见 [`Tlab::starts`]）。
+    #[inline]
+    fn note_start(&self, p: *const u8) {
+        let (word, bit) = Block::containing(p).start_bit(p);
+        let (cur, bits) = self.starts.get();
+        if core::ptr::eq(cur, word) {
+            self.starts.set((cur, bits | bit));
+        } else {
+            self.flush_starts();
+            self.starts.set((word, bit));
+        }
+    }
+
+    /// 攒着的起点位写进块里。
+    fn flush_starts(&self) {
+        let (word, bits) = self.starts.replace((core::ptr::null(), 0));
+        if bits != 0 {
+            // SAFETY: 字在本缓冲独占的块里，块在回收之前不会还回去（回收前 mutate 结束时已经写过）
+            unsafe { &*word }.fetch_or(bits, Ordering::Relaxed);
         }
     }
 
@@ -1018,7 +1061,7 @@ impl<'gc> Mutator<'gc> {
 
     fn alloc_small(&self, bytes: usize) -> *mut u8 {
         let p = self.tlab.bump(bytes, self.heap.epoch, || self.heap.acquire(), |need| self.heap.acquire_for(need));
-        Block::containing(p).set_start(p);
+        self.tlab.note_start(p);
         p
     }
 }
