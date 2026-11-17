@@ -3,6 +3,7 @@ extern crate self as paragc;
 
 mod block;
 mod copy;
+mod far;
 mod gc;
 mod header;
 mod heap;
@@ -14,6 +15,7 @@ mod sweep;
 mod trace;
 mod workers;
 
+pub use far::Far;
 pub use gc::{Gc, Slot};
 pub use heap::{Heap, Mutator, Stats, Tlab};
 pub use paragc_macros::Trace;
