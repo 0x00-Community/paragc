@@ -25,7 +25,6 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsiz
 use core::time::Duration;
 #[cfg(target_os = "linux")]
 use std::io;
-use std::alloc::{alloc, handle_alloc_error};
 #[cfg(target_os = "linux")]
 use std::fs::File;
 #[cfg(target_os = "linux")]
@@ -39,7 +38,7 @@ use crate::{Gc, Trace};
 use crate::handle::{GcInternal, Invariant, RawSlot, RootTable};
 #[cfg(target_os = "linux")]
 use crate::handle::{EdgeMap, Public, PublicBrand, PublicGc, PublicGcInternal, PublicInternal, Shared};
-use crate::layout::{BLOCK, Block, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, HEADER, Header, LARGE, MAX_EPOCH, MIN_SPARE_BLOCKS, MIN_TRIGGER, YOUNG_PER_FULL, YOUNG_PER_FULL_RC};
+use crate::layout::{BLOCK, Block, Pages, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, HEADER, Header, LARGE, MAX_EPOCH, MIN_SPARE_BLOCKS, MIN_TRIGGER, YOUNG_PER_FULL, YOUNG_PER_FULL_RC};
 #[cfg(target_os = "linux")]
 use crate::layout::{Core, State};
 #[cfg(target_os = "linux")]
@@ -98,6 +97,8 @@ pub struct Heap {
     sweeper: Sweeper,
     /// 死对象的析构在全部回收线程上并行跑（假：只在调用回收 / 清扫的线程上跑），见 [`Heap::set_parallel_drop`]
     parallel_drop: AtomicBool,
+    /// 块的来源（析构时 Drop 里先把块都还回来，之后它才解除映射）
+    pages: Pages,
     roots: Arc<RootTable>,
     /// 上次回收后新领用的字节数（按块 / 大对象计）
     allocated: AtomicUsize,
@@ -156,6 +157,7 @@ impl Heap {
             large: SegVec::default(),
             sweeper: Sweeper::default(),
             parallel_drop: AtomicBool::new(true),
+            pages: Pages::default(),
             roots: Arc::default(),
             allocated: AtomicUsize::new(0),
             evacuated: (0, 0),
@@ -318,7 +320,7 @@ impl Heap {
                 None => break,
             }
         }
-        let b = Block::new();
+        let b = Block::new(&self.pages);
         self.blocks.push(b);
         b
     }
@@ -348,9 +350,8 @@ impl Heap {
     }
 
     fn alloc_large(&self, bytes: usize) -> *mut u8 {
-        let layout = Large::layout(bytes);
-        // SAFETY: 大小非零（至少有头）
-        let p = NonNull::new(unsafe { alloc(layout) }).unwrap_or_else(|| handle_alloc_error(layout));
+        // SAFETY: Large::alloc 不返回空指针（失败走 handle_alloc_error）
+        let p = unsafe { NonNull::new_unchecked(Large::alloc(bytes)) };
         self.large.push(Large(p.cast()));
         self.allocated.fetch_add(bytes, Ordering::Relaxed);
         p.as_ptr()
@@ -530,7 +531,7 @@ impl Heap {
         let mark = Marking::new(workers, epoch, &self.grey).counting(count);
         let moved = AtomicUsize::new(0);
         if evacuate > 0 {
-            mark.evacuating(&self.roots, &targets, &self.blocks, &moved, self.epoch).run(pool);
+            mark.evacuating(&self.roots, &targets, &self.blocks, &self.pages, &moved, self.epoch).run(pool);
         } else {
             if marking == 0 {
                 Marking::seed(&self.grey, &roots, epoch);
@@ -670,7 +671,8 @@ impl Sink for Heap {
             Outcome::Full(b) => {
                 self.blocks.push(b);
             }
-            Outcome::Released => {}
+            // SAFETY: 全空的块（死对象已析构），来自本堆的 pages，之后不再使用
+            Outcome::Release(b) => unsafe { b.release(&self.pages) },
         }
     }
 

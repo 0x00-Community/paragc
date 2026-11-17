@@ -28,8 +28,12 @@
 use core::mem::needs_drop;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
+use std::alloc::{Layout, handle_alloc_error};
+#[cfg(any(not(target_os = "linux"), miri))]
+use std::alloc::{alloc, dealloc};
 
+#[cfg(all(target_os = "linux", not(miri)))]
+use crossbeam_deque::{Injector, Steal};
 use crossbeam_utils::Backoff;
 
 use crate::Trace;
@@ -51,6 +55,9 @@ pub const GRANULES: usize = BLOCK / GRANULE;
 pub const BITS: usize = u64::BITS as usize;
 /// 大对象阈值（含头的字节数）：超过就单独分配、不进块
 pub const LARGE: usize = 8 * 1024;
+/// 不小于它的大对象（Linux）单独 mmap：释放时 munmap 立刻还给系统（全局分配器释放的大块常常留着不还）
+#[cfg(all(target_os = "linux", not(miri)))]
+pub const LARGE_MMAP: usize = 64 * 1024;
 
 /// 回收线程数的估算：每个线程至少分到这么多个块 / 大对象才值得多开一个
 pub const UNITS_PER_WORKER: usize = 8;
@@ -356,13 +363,11 @@ impl Block {
     /// 元数据之后第一个能放对象的行
     pub const FIRST_LINE: usize = size_of::<Meta>().div_ceil(LINE);
 
-    /// 新块：只有元数据清零（行标记 0 早于任何纪元，全部是空行）；对象区不清——分配从不依赖内存是零，
+    /// 新块（从 `pages` 领）：只有元数据清零（行标记 0 早于任何纪元，全部是空行）；对象区不清——分配从不依赖内存是零，
     /// 不碰的页也就不缺页。
-    pub fn new() -> Self {
-        // SAFETY: LAYOUT 大小非零
-        let p = unsafe { alloc(Self::LAYOUT) };
-        let b = Self(NonNull::new(p.cast()).unwrap_or_else(|| handle_alloc_error(Self::LAYOUT)));
-        // SAFETY: 刚分配、独有；元数据全是原子量，全零是合法值
+    pub fn new(pages: &Pages) -> Self {
+        let b = Self(pages.take());
+        // SAFETY: 刚领到、独有；元数据全是原子量，全零是合法值
         unsafe { b.0.as_ptr().write_bytes(0, 1) };
         b.reused();
         b
@@ -456,10 +461,10 @@ impl Block {
         self.meta().evacuate.load(Ordering::Relaxed)
     }
 
-    /// 还给系统。SAFETY（调用方）：块里没有活对象（死的已析构），之后不再使用。
-    pub unsafe fn release(self) {
-        // SAFETY: 见上；指针来自 new
-        unsafe { dealloc(self.0.as_ptr().cast(), Self::LAYOUT) };
+    /// 还给 `pages`（物理内存还给系统）。SAFETY（调用方）：块来自同一个 `pages`，里面没有活对象（死的已析构），之后不再使用。
+    pub unsafe fn release(self, pages: &Pages) {
+        // SAFETY: 见上
+        unsafe { pages.give(self.0) };
     }
 
     /// 地址所在的块（地址必须在某个块里）。
@@ -554,6 +559,111 @@ impl Block {
         self.meta().live.store(u32::try_from(live).unwrap_or(REUSED - 1), Ordering::Relaxed);
         self.meta().evacuate.store(false, Ordering::Relaxed);
         (state, live)
+    }
+}
+
+/// 一次向系统映射多大的一段，切成块（Linux）
+#[cfg(all(target_os = "linux", not(miri)))]
+const CHUNK: usize = 2 * 1024 * 1024;
+
+/// 私有堆的块从这里领、还回这里（每个堆一份）。
+///
+/// Linux：自己 mmap 一段段（[`CHUNK`]），切成按 [`BLOCK`] 对齐的块放进空闲池；还回来的块先 `madvise(MADV_DONTNEED)`
+/// 把物理内存还给系统，地址进池复用（不经 glibc：对齐分配有额外开销，释放的内存它也不还给系统）。
+/// 映射的段在堆析构时一起解除。其他平台与 Miri 下走全局分配器。
+#[derive(Default)]
+pub struct Pages {
+    /// 空闲的块（地址）
+    #[cfg(all(target_os = "linux", not(miri)))]
+    free: Injector<usize>,
+    /// 映射过的段（起点地址），析构时解除
+    #[cfg(all(target_os = "linux", not(miri)))]
+    chunks: Injector<usize>,
+}
+
+impl Pages {
+    #[cfg(all(target_os = "linux", not(miri)))]
+    fn take(&self) -> NonNull<Meta> {
+        loop {
+            match self.free.steal() {
+                // SAFETY: 池里只有本对象切出来、非零的块地址
+                Steal::Success(addr) => return unsafe { NonNull::new_unchecked(core::ptr::with_exposed_provenance_mut(addr)) },
+                Steal::Retry => {}
+                Steal::Empty => break,
+            }
+        }
+        let base = self.map_chunk();
+        // 第一块自己用，其余进池
+        for i in 1..CHUNK / BLOCK {
+            self.free.push(base.wrapping_add(i * BLOCK).expose_provenance());
+        }
+        // SAFETY: mmap 成功的地址非零
+        unsafe { NonNull::new_unchecked(base.cast()) }
+    }
+
+    /// 映射一段按 [`BLOCK`] 对齐的 [`CHUNK`] 字节（多映射一块，对齐后把头尾解除）。
+    #[cfg(all(target_os = "linux", not(miri)))]
+    fn map_chunk(&self) -> *mut u8 {
+        let len = CHUNK + BLOCK;
+        // SAFETY: 匿名私有映射，参数合法
+        let raw = unsafe { libc::mmap(core::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0) };
+        if raw == libc::MAP_FAILED {
+            handle_alloc_error(Block::LAYOUT);
+        }
+        let raw = raw.cast::<u8>();
+        let head = raw.align_offset(BLOCK);
+        let base = raw.wrapping_add(head);
+        // SAFETY: 两段都在刚才的映射里、互不重叠；长度为 0 时不调
+        unsafe {
+            if head > 0 {
+                libc::munmap(raw.cast(), head);
+            }
+            let tail = BLOCK - head;
+            if tail > 0 {
+                libc::munmap(base.wrapping_add(CHUNK).cast(), tail);
+            }
+        }
+        self.chunks.push(base.expose_provenance());
+        base
+    }
+
+    /// SAFETY（调用方）：`p` 来自本对象的 [`Pages::take`]，之后不再使用。
+    #[cfg(all(target_os = "linux", not(miri)))]
+    unsafe fn give(&self, p: NonNull<Meta>) {
+        // SAFETY: 块在本对象映射的段里；DONTNEED 只丢内容，地址仍可用
+        unsafe { libc::madvise(p.as_ptr().cast(), BLOCK, libc::MADV_DONTNEED) };
+        self.free.push(p.as_ptr().expose_provenance());
+    }
+
+    #[cfg(any(not(target_os = "linux"), miri))]
+    #[expect(clippy::unused_self, reason = "与 Linux 版同签名")]
+    fn take(&self) -> NonNull<Meta> {
+        // SAFETY: LAYOUT 大小非零
+        let p = unsafe { alloc(Block::LAYOUT) };
+        NonNull::new(p.cast()).unwrap_or_else(|| handle_alloc_error(Block::LAYOUT))
+    }
+
+    #[cfg(any(not(target_os = "linux"), miri))]
+    #[expect(clippy::unused_self, reason = "与 Linux 版同签名")]
+    unsafe fn give(&self, p: NonNull<Meta>) {
+        // SAFETY: 来自 take 的同一 LAYOUT
+        unsafe { dealloc(p.as_ptr().cast(), Block::LAYOUT) };
+    }
+}
+
+#[cfg(all(target_os = "linux", not(miri)))]
+impl Drop for Pages {
+    fn drop(&mut self) {
+        loop {
+            match self.chunks.steal() {
+                // SAFETY: 段是 map_chunk 映射的 CHUNK 字节；堆析构时块都已还回，没人再用
+                Steal::Success(addr) => unsafe {
+                    libc::munmap(core::ptr::with_exposed_provenance_mut::<libc::c_void>(addr), CHUNK);
+                },
+                Steal::Retry => {}
+                Steal::Empty => return,
+            }
+        }
     }
 }
 
