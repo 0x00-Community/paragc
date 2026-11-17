@@ -30,16 +30,22 @@ const BUSY: u32 = 1 << 30;
 /// 纪元的上限（不能碰到 BUSY / FORWARDED 位）
 pub(crate) const MAX_EPOCH: u32 = BUSY - 1;
 
+/// 两种堆共用的头部前缀：标记字与信息字。块、行、清扫只看这一段，所以私有堆与公开堆共用块的代码。
 #[repr(C)]
-pub(crate) struct Header {
-    /// 访问对象数据里的边：追踪（只读）或重定位（独占改写），由 Tracer 的模式决定
-    visit: unsafe fn(*mut u8, &mut Tracer<'_>),
-    /// 析构对象数据；类型不需要析构时为 None。搬走后这个字改存新地址
-    drop: Option<unsafe fn(*mut u8)>,
+pub(crate) struct Core {
     /// 最后一次被标记时的纪元，或 BUSY / FORWARDED
     mark: AtomicU32,
     /// 粒度数（含头）、引用计数、计数奇偶、大对象位（见 [`SIZE_BITS`] 等）
     info: AtomicU32,
+}
+
+#[repr(C)]
+pub(crate) struct Header {
+    core: Core,
+    /// 访问对象数据里的边：追踪（只读）或重定位（独占改写），由 Tracer 的模式决定
+    visit: unsafe fn(*mut u8, &mut Tracer<'_>),
+    /// 析构对象数据；类型不需要析构时为 None。搬走后这个字改存新地址
+    drop: Option<unsafe fn(*mut u8)>,
 }
 
 /// 头的字节数；对象数据紧跟在后面
@@ -56,16 +62,21 @@ pub(crate) enum Claim {
     Moved(*const Header),
 }
 
+impl core::ops::Deref for Header {
+    type Target = Core;
+
+    fn deref(&self) -> &Core {
+        &self.core
+    }
+}
+
 impl Header {
     /// `mark`：初始标记纪元。
     pub(crate) fn new<T: Trace>(bytes: usize, large: bool, mark: u32) -> Self {
-        let granules = u32::try_from(bytes / GRANULE).expect("对象太大");
-        assert!(granules <= SIZE_MASK, "对象太大（单个对象至多 128 MiB）");
         Self {
+            core: Core::new(bytes, large, mark),
             visit: Self::visit_as::<T>,
             drop: needs_drop::<T>().then_some(Self::drop_as::<T> as unsafe fn(*mut u8)),
-            mark: AtomicU32::new(mark),
-            info: AtomicU32::new(granules | if large { LARGE_BIT } else { 0 }),
         }
     }
 
@@ -94,6 +105,14 @@ impl Header {
     /// 由数据指针找回头。
     pub(crate) fn of(data: *const u8) -> *const Self {
         data.wrapping_sub(HEADER).cast()
+    }
+}
+
+impl Core {
+    pub(crate) fn new(bytes: usize, large: bool, mark: u32) -> Self {
+        let granules = u32::try_from(bytes / GRANULE).expect("对象太大");
+        assert!(granules <= SIZE_MASK, "对象太大（单个对象至多 128 MiB）");
+        Self { mark: AtomicU32::new(mark), info: AtomicU32::new(granules | if large { LARGE_BIT } else { 0 }) }
     }
 
     pub(crate) fn bytes(&self) -> usize {
@@ -166,6 +185,13 @@ impl Header {
         self.mark.load(Ordering::Acquire) & FORWARDED != 0
     }
 
+    /// 复制出来的新头：标成本轮。
+    pub(crate) fn set_mark(&self, epoch: u32) {
+        self.mark.store(epoch, Ordering::Release);
+    }
+}
+
+impl Header {
     /// 疏散：认领复制权；别人在复制就等，别人搬完了就给新地址。
     pub(crate) fn claim(&self) -> Claim {
         let backoff = Backoff::new();
@@ -189,17 +215,12 @@ impl Header {
         // SAFETY: 认领后只有本线程写这个字；别的线程在看到 FORWARDED（Release / Acquire）之前不读它
         unsafe { (&raw const (*this).drop).cast_mut().cast::<*const Self>().write(to) };
         // SAFETY: this 有效
-        unsafe { &*this }.mark.store(FORWARDED, Ordering::Release);
+        unsafe { &*this }.core.mark.store(FORWARDED, Ordering::Release);
     }
 
     fn forwardee(&self) -> *const Self {
         // SAFETY: 只在看到 FORWARDED 之后调用，新地址已经写好
         unsafe { (&raw const self.drop).cast::<*const Self>().read() }
-    }
-
-    /// 复制出来的新头：标成本轮。
-    pub(crate) fn set_mark(&self, epoch: u32) {
-        self.mark.store(epoch, Ordering::Release);
     }
 
     /// 访问对象数据（追踪或重定位）。SAFETY（调用方）：对象活着；重定位时调用方独占它。

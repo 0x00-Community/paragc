@@ -9,5 +9,9 @@ Procedural macros for [paragc](https://github.com/0x00-Community/paragc). Use th
 - By default the derive also checks that the type does not implement `Drop` (destructors run in no particular order, so a
   `Drop` could see objects that were already dropped). `#[trace(unsafe_drop)]` turns the check off; you then guarantee
   that the `Drop` touches no `Gc`.
+- `#[derive(Shared)]`: types that can live in a public heap (shared memory that other processes may read and collect).
+  Requires `#[repr(C)]` so the layout is the same in every process; structs only. Generates the pointer map: the byte
+  offset of every `PublicSlot`, through nested types and fixed-size arrays. That the type has no destructor is checked at
+  compile time by `PublicMutator::alloc`.
 
 MIT © Jabberwocky238
