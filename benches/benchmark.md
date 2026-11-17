@@ -27,6 +27,7 @@ behind Blink), [gc-arena](https://crates.io/crates/gc-arena), [gc](https://crate
 | `pause-cm` / `pause-cs` / `pause-cms` | paragc only: the same heap, timing **only the time mutators are stopped**. `cm`: concurrent marking first (untimed), then the finishing collection. `cs`: marking in the pause, sweeping concurrent (untimed). `cms`: both concurrent. |
 | `gcbench` | Boehm's GCBench: a stretch tree of depth 18, a long-lived tree of depth 16, and for depths 4, 6, …, 16 enough short-lived trees to allocate twice the stretch tree each. Each collector collects on its own schedule. Total time. |
 | `alloc-mt` | 2048 short-lived trees of depth 10 in total, split over N allocating threads (16 rounds), next to a long-lived tree. Only for collectors that allow several mutator threads. Total time. |
+| `frag` | Fragmentation: objects of four sizes (24 / 240 / 1600 / 12000 data bytes, 70 / 20 / 8 / 2 % of allocations), 400k per round, randomly overwriting a holder's slots with probability 1/7, 1/5, 1/3, 1/2 by size (overwritten objects become garbage, so lifetimes are random and survivors are scattered), 30 rounds, about 80 MB live. Total time, RSS after a final full collection, and peak RSS after each round (both minus the starting RSS). paragc and cppgc only. |
 
 Every node is the same shape everywhere: two child pointers and a `u64`. After every timed region the benchmark checks
 that the live tree still has exactly 2^depth − 1 nodes.
@@ -86,6 +87,21 @@ Wall ms (CPU ÷ wall); best of 5.
 
 cppgc, gc-arena and rust-gc allow one thread per heap, so they have no entry here.
 
+### Fragmentation: time and memory
+
+| | threads | wall ms | RSS after MB | peak RSS MB |
+| --- | ---: | ---: | ---: | ---: |
+| **paragc** | 1 | **1668** | **110.5** | **415.7** |
+| **paragc** | 16 | **1457** | **111.2** | 416.5 |
+| cppgc (attached, V8 schedules) | 1 | 2052 | 445.1 | 1902.5 |
+| cppgc (attached, V8 schedules) | 16 | 1858 | 474.1 | 1985.3 |
+| cppgc-detached (paragc's trigger) | 1 | 4074 | 294.4 | 417.1 |
+| cppgc-detached (paragc's trigger) | 16 | 4145 | 294.2 | 417.0 |
+
+(Best wall time of 3; load about 5 at the start.) paragc 0.4.2 on the same workload ended at about 935 MB RSS with a peak of about 940 MB:
+blocks and large objects came from glibc, which kept freed memory; young collections promoted in place, so scattered survivors each pinned a line;
+medium objects threw away the rest of a hole; evacuation was capped at 1024 blocks per collection. What 0.5.0 does instead is under "Reading the numbers".
+
 ## Reading the numbers
 
 - **Throughput: young collections and reference counting.** GCBench on one thread takes 53.7 ms against 102–119 ms
@@ -115,6 +131,12 @@ cppgc, gc-arena and rust-gc allow one thread per heap, so they have no entry her
 - **cppgc pays for the Rust ⇄ C++ boundary.** Through rusty_v8 every allocation, every `Member` and every traced edge is
   an FFI call; attached to an isolate, V8's own (nearly empty) heap adds about 1.3–1.5 ms to each full collection. A C++
   embedder would see lower numbers.
+- **Fragmentation: own pages + overflow allocation + evacuation.** Blocks are cut from segments paragc maps itself, and returned blocks are
+  madvised away; objects larger than a line that do not fit the current hole go to an overflow cursor instead of discarding the hole; young
+  collections move survivors that only young objects and roots point at into compact blocks; full collections evacuate every block under half
+  live, sparsest first, with no block cap, and a full collection comes early once blocks exceed "live + one round of allowed allocation" by 1.5×.
+  RSS after collection is 38 % of cppgc's and the peak matches cppgc on the same trigger. For a lower peak, call `Heap::shrink` when idle (it also
+  returns whole pages of free lines, which then fault in again on reuse).
 - **dumpster is reference counting.** These trees have no cycles, so dead nodes are freed the moment their last reference
   goes; its `pause` is really the cost of dropping the dead tree.
 

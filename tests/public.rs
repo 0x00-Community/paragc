@@ -119,7 +119,7 @@ fn pointer_map_covers_nested_fields_and_arrays() {
     assert_eq!(heap.stats().live, holder_bytes + 2 * NODE);
 }
 
-/// 大对象（超过 8 KiB）：单独占一串块
+/// 大对象（超过半块）：单独占一串块
 #[repr(C)]
 #[derive(Shared)]
 struct Big<'p> {

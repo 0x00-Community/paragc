@@ -40,3 +40,27 @@ for lib in "${LIBS[@]}"; do
         echo "$best" | awk -F'\t' -v lib="$lib" '{printf "| %s | %s | %s | %.2f | %.2f | %.1f |\n", lib, $2, $3, $4, $5, $5 / $4}'
     done < <(configs "$lib" | tr ' ' '\n' | paste - -)
 done
+
+# 碎片负载（四种大小、随机寿命，存活约 80 MB）：耗时与回收后 / 峰值 RSS，单独一张表
+FRAG_LIBS=()
+for lib in "${LIBS[@]}"; do
+    case $lib in paragc | cppgc | cppgc-detached) FRAG_LIBS+=("$lib") ;; esac
+done
+if [ ${#FRAG_LIBS[@]} -gt 0 ]; then
+    echo
+    echo "| 库 | 线程 | 墙钟 ms（$REPS 次最小） | 回收后 RSS MB | 峰值 RSS MB |"
+    echo "|---|---:|---:|---:|---:|"
+    for lib in "${FRAG_LIBS[@]}"; do
+        for threads in 1 "$THREADS"; do
+            best=""
+            for _ in $(seq "$REPS"); do
+                case $lib in
+                    cppgc-detached) line=$(CPPGC_HEAP=detached timeout 300 ./target/release/bench-cppgc frag "$threads" 2>/dev/null) ;;
+                    *) line=$(timeout 300 "./target/release/bench-$lib" frag "$threads" 2>/dev/null) ;;
+                esac
+                best=$(printf '%s\n%s\n' "$best" "$line" | grep . | sort -t$'\t' -k4 -g | head -1)
+            done
+            echo "$best" | awk -F'\t' -v lib="$lib" '{printf "| %s | %s | %.2f | %.1f | %.1f |\n", lib, $3, $4, $6, $7}'
+        done
+    done
+fi

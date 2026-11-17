@@ -21,11 +21,13 @@
 //! 析构里释放的内存多是 mutator 线程分配的，跨线程释放会让分配器（glibc 的 arena 锁）争用。
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use std::alloc::{Layout, dealloc};
+use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 
 use crossbeam_deque::{Injector, Steal, Worker};
 use crossbeam_utils::{Backoff, CachePadded};
 
+#[cfg(all(target_os = "linux", not(miri)))]
+use crate::layout::LARGE_MMAP;
 use crate::layout::{Block, Core, Finalize, GRANULE, Header, State};
 use crate::mark::{Tracer, TracerInternal};
 use crate::sync::Pool;
@@ -44,6 +46,26 @@ impl Large {
         Layout::from_size_align(bytes, GRANULE).expect("对象太大")
     }
 
+    /// 分配 `bytes` 字节（至少有头）：不小于 [`LARGE_MMAP`] 的在 Linux 上单独映射（释放即还给系统），其余走全局分配器。
+    pub fn alloc(bytes: usize) -> *mut u8 {
+        #[cfg(all(target_os = "linux", not(miri)))]
+        if bytes >= LARGE_MMAP {
+            // SAFETY: 匿名私有映射，参数合法
+            let p = unsafe { libc::mmap(core::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+            if p == libc::MAP_FAILED {
+                handle_alloc_error(Self::layout(bytes));
+            }
+            return p.cast();
+        }
+        let layout = Self::layout(bytes);
+        // SAFETY: 大小非零（至少有头）
+        let p = unsafe { alloc(layout) };
+        if p.is_null() {
+            handle_alloc_error(layout);
+        }
+        p
+    }
+
     fn header(&self) -> &Header {
         // SAFETY: 大对象活着时头一直有效
         unsafe { self.0.as_ref() }
@@ -51,12 +73,17 @@ impl Large {
 
     /// 析构并释放。SAFETY（调用方）：死了，没人会再碰它。
     unsafe fn free(self) {
-        let layout = Self::layout(self.header().bytes());
-        // SAFETY: 没标记 ⇒ 不可达；内存来自 Mutator 按同一 layout 的分配
-        unsafe {
-            Header::finalize(self.0.as_ptr());
-            dealloc(self.0.as_ptr().cast(), layout);
+        let bytes = self.header().bytes();
+        // SAFETY: 没标记 ⇒ 不可达
+        unsafe { Header::finalize(self.0.as_ptr()) };
+        #[cfg(all(target_os = "linux", not(miri)))]
+        if bytes >= LARGE_MMAP {
+            // SAFETY: Large::alloc 按同样的字节数映射的
+            unsafe { libc::munmap(self.0.as_ptr().cast(), bytes) };
+            return;
         }
+        // SAFETY: 内存来自 Large::alloc 按同一 layout 的分配
+        unsafe { dealloc(self.0.as_ptr().cast(), Self::layout(bytes)) };
     }
 }
 
@@ -74,8 +101,8 @@ pub enum Outcome {
     Usable(Block),
     /// 满了
     Full(Block),
-    /// 全空且留够了备用，已还给系统
-    Released,
+    /// 全空且留够了备用：还给系统（死对象已析构，块里没有活对象）
+    Release(Block),
 }
 
 /// 清扫完一项后交给谁。
@@ -100,12 +127,16 @@ pub struct Sweeper {
     live: AtomicUsize,
     /// 只在调用方线程析构时：别的工人扫好、等调用方析构的项（处理完才算扫完）
     pending: Injector<Pending>,
+    /// 本轮有空行的块把凑满整页的空行还给系统
+    discard: bool,
 }
 
 impl Sweeper {
     /// 开始一轮（独占堆时）。上一轮必须已经扫完。
-    pub fn start(&mut self, epoch: u32, blocks: Vec<Block>, large: Vec<Large>, spare: usize) {
+    /// `discard`：有空行的块把凑满整页的空行还给系统（[`crate::Heap::shrink`]）。
+    pub fn start(&mut self, epoch: u32, blocks: Vec<Block>, large: Vec<Large>, spare: usize, discard: bool) {
         debug_assert!(self.is_done());
+        self.discard = discard;
         *self.unfinished.get_mut() = blocks.len() + large.len();
         *self.next_block.get_mut() = 0;
         *self.next_large.get_mut() = 0;
@@ -150,13 +181,15 @@ impl Sweeper {
     fn settle(&self, b: Block, state: State) -> Outcome {
         match state {
             State::Full => Outcome::Full(b),
-            State::Recyclable => Outcome::Usable(b),
-            State::Empty if self.take_spare() => Outcome::Usable(b),
-            State::Empty => {
-                // SAFETY: 全空 ⇒ 没有活对象，死的刚析构完；块只在这里，从此不再使用
-                unsafe { b.release() };
-                Outcome::Released
+            State::Recyclable => {
+                if self.discard {
+                    // SAFETY: 死对象都已析构，空行里没有要用的东西；块还没交出去
+                    unsafe { b.discard_free_lines(self.epoch) };
+                }
+                Outcome::Usable(b)
             }
+            State::Empty if self.take_spare() => Outcome::Usable(b),
+            State::Empty => Outcome::Release(b),
         }
     }
 

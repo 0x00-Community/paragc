@@ -37,7 +37,7 @@ use crate::handle::{GcInternal, RootTable, SlotInternal};
 use crate::handle::FAR_EDGE;
 #[cfg(target_os = "linux")]
 use crate::heap::Inner;
-use crate::layout::{Block, Claim, Header};
+use crate::layout::{Block, Claim, Header, Pages};
 #[cfg(target_os = "linux")]
 #[cfg(target_os = "linux")]
 use crate::layout::PHeader;
@@ -245,9 +245,11 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
     fn forward(&mut self, header: *const Header, no_edges: bool) -> *const Header {
         // SAFETY: header 来自本堆的 Gc / 根，对象活着
         let h = unsafe { &*header };
+        // 本轮已经原地标过的不搬（年轻疏散里老对象直接指着的、别的堆指着的年轻对象先原地标上了）
         if let Some(copier) = self.copier.as_deref_mut()
             && !h.is_large()
             && Block::containing(header.cast()).is_evacuating()
+            && !h.is_marked(self.epoch)
         {
             return match h.claim() {
                 Claim::Moved(to) => to,
@@ -495,6 +497,8 @@ pub struct Marking<'g> {
     log: Option<&'g Injector<usize>>,
     /// 一起回收：追踪到的 Far 报到这里
     group: Option<&'g Injector<(usize, usize)>>,
+    /// 年轻疏散（[`crate::YoungEvacuation::Full`]）：0 号工人把记忆集里这些槽改成搬走后的新地址
+    slots: &'g [usize],
 }
 
 // SAFETY: 每个工号的复制缓冲只被一个线程取走（工号互不相同）；其余是线程安全的
@@ -510,7 +514,14 @@ impl<'g> Marking<'g> {
             count: None,
             log: None,
             group: None,
+            slots: &[],
         }
+    }
+
+    /// 年轻疏散：记忆集里的槽（地址）由 0 号工人改成搬走后的新地址（同时把目标标灰）。
+    pub fn relocating_slots(mut self, slots: &'g [usize]) -> Self {
+        self.slots = slots;
+        self
     }
 
     /// 并发标记：给引用计数登记队列。
@@ -533,8 +544,8 @@ impl<'g> Marking<'g> {
 
     /// 疏散回收：每个工人带一个复制缓冲，候选块里被追踪到的对象搬进 `targets` 里的块（不够就开新块登记进 `blocks`）；
     /// 根由 0 号工人重定位。`last` 是上次完成的纪元（空行判定）。
-    pub fn evacuating(mut self, roots: &'g RootTable, targets: &Injector<Block>, blocks: &SegVec<Block>, moved: &AtomicUsize, last: u32) -> Self {
-        self.copiers = (0..self.crew.len()).map(|_| CachePadded::new(UnsafeCell::new(Some(Copier::new(targets, blocks, moved, last, self.epoch))))).collect();
+    pub fn evacuating(mut self, roots: &'g RootTable, targets: &Injector<Block>, blocks: &SegVec<Block>, pages: &Pages, moved: &AtomicUsize, last: u32) -> Self {
+        self.copiers = (0..self.crew.len()).map(|_| CachePadded::new(UnsafeCell::new(Some(Copier::new(targets, blocks, pages, moved, last, self.epoch))))).collect();
         self.roots = Some(roots);
         self
     }
@@ -583,6 +594,19 @@ impl<'g> Marking<'g> {
             && let Some(roots) = self.roots
         {
             roots.relocate(|h| t.forward(h, false));
+            for &slot in self.slots {
+                let slot = core::ptr::with_exposed_provenance::<AtomicPtr<u8>>(slot);
+                // SAFETY: 槽在写入它的老对象里，到这次回收前不会被释放（见 Mutator::written）；停顿里没有 mutator 写它
+                let slot = unsafe { &*slot };
+                let p = slot.load(Ordering::Acquire);
+                if !p.is_null() {
+                    let old = Header::of(p);
+                    let new = t.forward(old, false);
+                    if !core::ptr::eq(old, new) {
+                        slot.store(Header::data(new), Ordering::Release);
+                    }
+                }
+            }
         }
         self.crew.drain(me, &local, |item| t.scan(item));
     }
@@ -593,6 +617,8 @@ pub struct Copier {
     targets: *const Injector<Block>,
     /// 全部块表：新开的块登记进去，本轮清扫会扫到
     blocks: *const SegVec<Block>,
+    /// 新开的块从这里领
+    pages: *const Pages,
     /// 上次完成的纪元：行标记早于它的是空行
     last: u32,
     /// 本轮纪元
@@ -617,8 +643,8 @@ impl Drop for Copier {
 unsafe impl Send for Copier {}
 
 impl Copier {
-    pub fn new(targets: &Injector<Block>, blocks: &SegVec<Block>, total: &AtomicUsize, last: u32, epoch: u32) -> Self {
-        Self { targets, blocks, last, epoch, block: None, line: 0, cursor: null_mut(), limit: null_mut(), moved: 0, total }
+    pub fn new(targets: &Injector<Block>, blocks: &SegVec<Block>, pages: &Pages, total: &AtomicUsize, last: u32, epoch: u32) -> Self {
+        Self { targets, blocks, pages, last, epoch, block: None, line: 0, cursor: null_mut(), limit: null_mut(), moved: 0, total }
     }
 
     /// 把 `from` 整个抄到新地方，返回新头。SAFETY（调用方）：本线程认领了 `from`，它是块里的小对象。
@@ -659,14 +685,19 @@ impl Copier {
             self.limit = b.line(end);
             return;
         }
-        // SAFETY: 两个指针在本轮回收期间有效
-        let (targets, blocks) = unsafe { (&*self.targets, &*self.blocks) };
+        // SAFETY: 三个指针在本轮回收期间有效
+        let (targets, blocks, pages) = unsafe { (&*self.targets, &*self.blocks, &*self.pages) };
         let b = loop {
             match targets.steal() {
-                Steal::Success(b) => break b,
+                Steal::Success(b) => {
+                    // 年轻疏散直接从可用队列里拿：拿出来，标成用过（落进本次年轻清扫重新分类）
+                    b.unlist();
+                    b.reused();
+                    break b;
+                }
                 Steal::Retry => {}
                 Steal::Empty => {
-                    let b = Block::new();
+                    let b = Block::new(pages);
                     blocks.push(b);
                     break b;
                 }

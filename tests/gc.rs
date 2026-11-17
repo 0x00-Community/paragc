@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use paragc::{Gc, Heap, Root, Slot, Trace, Tracer, brand};
+use paragc::{Gc, Heap, Root, Slot, Trace, Tracer, YoungEvacuation, brand};
 
 #[derive(Trace)]
 struct Node<'gc> {
@@ -143,15 +143,20 @@ fn blocks_are_reused() {
 #[test]
 #[allow(clippy::large_stack_arrays)]
 fn large_objects() {
+    /// 单独 mmap 的那档（≥ 64 KiB）
     const BIG: usize = 64 * 1024;
+    /// 走全局分配器的那档（半块到 64 KiB）
+    const MID: usize = 20 * 1024;
     let mut heap = Heap::new(THREADS);
     let root: Root<TreeB> = heap.mutate(|m| {
         let big = m.alloc(vec![7u8; BIG]);
         let _garbage = m.alloc([0u64; BIG / 8]);
+        let mid = m.alloc([3u64; MID / 8]);
         assert_eq!(big.len(), BIG);
+        assert!(mid.iter().all(|&x| x == 3));
         m.root(m.alloc(Tree::Leaf(Counted(Arc::default()))))
     });
-    assert_eq!(heap.stats().large, 1);
+    assert_eq!(heap.stats().large, 2);
     heap.collect();
     assert_eq!(heap.stats().large, 0);
     drop(root);
@@ -168,7 +173,7 @@ struct Item<'gc> {
     tag: Counted,
 }
 
-/// 大对象（超过 8 KiB 单独分配），回指挂着它的节点（成环）。
+/// 大对象（超过半块单独分配），回指挂着它的节点（成环）。
 #[derive(Trace)]
 struct Ballast<'gc> {
     words: [u64; BALLAST_WORDS],
@@ -177,7 +182,7 @@ struct Ballast<'gc> {
 
 brand!(ItemB = for<'gc> Item<'gc>);
 
-const BALLAST_WORDS: usize = 1100;
+const BALLAST_WORDS: usize = 2100;
 /// Miri 下 8 × 8 超出单条 15 s，缩到 4 × 4
 const HEAPS: usize = if cfg!(miri) { 4 } else { 8 };
 const WORKERS: usize = HEAPS;
@@ -201,6 +206,7 @@ impl Ledger {
     }
 
     /// 在第 `h` 个堆上造一条链，链头带着 `guest`。
+    #[allow(clippy::large_stack_arrays, reason = "大对象就是要超过半块")]
     fn build(&self, heaps: &[Heap], h: usize, guest: Option<(usize, Root<ItemB>)>) -> Root<ItemB> {
         heaps[h].mutate(|m| {
             let mut guest = guest;
@@ -1228,4 +1234,167 @@ fn serial_drop_stays_on_the_caller() {
     drop(heap);
     assert_eq!(ledger.1.load(Ordering::Relaxed), 3 * nodes + 1);
     assert_eq!(ledger.2.load(Ordering::Relaxed), 0, "有对象在别的线程上析构");
+}
+
+/// 一行大（232 字节数据 + 24 字节头 = 256）
+#[derive(Trace)]
+struct Line {
+    fill: [u64; 29],
+}
+
+/// 五个正好填满一行（48 字节）
+#[derive(Trace)]
+struct Small {
+    _pad: [u64; 3],
+}
+
+/// 三行多一点（584 字节）
+#[derive(Trace)]
+struct Medium {
+    _pad: [u64; 70],
+}
+
+#[derive(Trace)]
+struct Lines<'gc> {
+    kept: Vec<Slot<'gc, Line>>,
+}
+
+brand!(LinesB = for<'gc> Lines<'gc>);
+
+/// 溢出分配：块里只剩单行的空洞时，交替分配小对象与中对象（放不进单行空洞），小对象照样填进旧空洞，
+/// 中对象另开溢出块——新开的块数只够放中对象（中对象把主游标带走的话，旧空洞全部作废，小对象也要开新块）。
+#[test]
+fn medium_objects_overflow_without_wasting_holes() {
+    const HOLES: usize = if cfg!(miri) { 300 } else { 6000 };
+    /// 块的大小（paragc::layout::BLOCK）
+    const BLOCK: usize = 32 * 1024;
+    let mut heap = Heap::new(THREADS);
+    // 连续分配一行大的对象，每三个扔一个：完整回收后每个死的都是单行空洞（块里存活 2/3，不会被疏散）
+    let lines: Root<LinesB> = heap.mutate(|m| {
+        let all: Vec<_> = (0..3 * HOLES).map(|_| m.alloc(Line { fill: [0; 29] })).collect();
+        m.root(m.alloc(Lines { kept: all.iter().enumerate().filter(|(i, _)| i % 3 != 2).map(|(_, &l)| Slot::from(Some(l))).collect() }))
+    });
+    heap.collect();
+    heap.collect();
+    let before = heap.stats().blocks;
+    heap.mutate(|m| {
+        for _ in 0..HOLES {
+            for _ in 0..5 {
+                m.alloc(Small { _pad: [1; 3] });
+            }
+            m.alloc(Medium { _pad: [2; 70] });
+        }
+    });
+    let grown = heap.stats().blocks - before;
+    let medium_blocks = (HOLES * size_of::<Medium>()).div_ceil(BLOCK * 9 / 10);
+    assert!(grown <= medium_blocks + 2, "新开 {grown} 块，只该够放中对象（约 {medium_blocks} 块）：小对象没填进旧空洞");
+    drop(lines);
+}
+
+/// 持有者（会变老）与它挂着的年轻链。
+#[derive(Trace)]
+struct Anchor<'gc> {
+    head: Slot<'gc, Bead<'gc>>,
+}
+
+brand!(AnchorB = for<'gc> Anchor<'gc>);
+
+#[derive(Trace)]
+struct Bead<'gc> {
+    value: u64,
+    next: Option<Gc<'gc, Bead<'gc>>>,
+    _counted: Counted,
+}
+
+brand!(BeadB = for<'gc> Bead<'gc>);
+
+/// 链上每个节点的（地址, 值）。
+fn beads<'gc>(head: Option<Gc<'gc, Bead<'gc>>>) -> Vec<(usize, u64)> {
+    let mut out = Vec::new();
+    let mut cur = head;
+    while let Some(b) = cur {
+        out.push((b.as_ptr().addr(), b.value));
+        cur = b.next;
+    }
+    out
+}
+
+/// 造一条 `len` 个节点的链（值从 `from` 起），节点之间夹着垃圾（存活对象散在块里）。
+fn chain<'gc>(m: &paragc::Mutator<'gc>, drops: &Arc<AtomicUsize>, from: u64, len: u64) -> Gc<'gc, Bead<'gc>> {
+    let mut top = None;
+    for value in from..from + len {
+        m.alloc(Bead { value: u64::MAX, next: None, _counted: Counted(drops.clone()) });
+        top = Some(m.alloc(Bead { value, next: top, _counted: Counted(drops.clone()) }));
+    }
+    top.expect("len > 0")
+}
+
+/// 年轻疏散：老持有者的槽挂一条年轻链、根也挂一条，年轻回收后——
+/// `Full`：两条链都搬了（地址全变）、值不变、槽与根都指到新地址；
+/// `SkipRemembered`：槽直接指着的头原地不动，链上其余的搬了；
+/// `Off`：都不动。之后摘掉链，引用计数照样收掉（析构数恰好）。
+#[test]
+fn young_evacuation_moves_survivors() {
+    const LEN: u64 = if cfg!(miri) { 50 } else { 5000 };
+    let n = usize::try_from(LEN).expect("链长");
+    for mode in [YoungEvacuation::Full, YoungEvacuation::SkipRemembered, YoungEvacuation::Off] {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut heap = Heap::new(THREADS);
+        heap.set_young_evacuation(mode);
+        let anchor: Root<AnchorB> = heap.mutate(|m| m.root(m.alloc(Anchor { head: Slot::default() })));
+        heap.collect();
+        heap.collect();
+        let (rooted, before_slot, before_root): (Root<BeadB>, _, _) = heap.mutate(|m| {
+            let a = m.get(&anchor);
+            a.head.set(m, Some(chain(m, &drops, 0, LEN)));
+            let r = chain(m, &drops, LEN, LEN);
+            (m.root(r), beads(a.head.get()), beads(Some(r)))
+        });
+        heap.collect_young();
+        assert_eq!(drops.load(Ordering::Relaxed), 2 * n, "{mode:?}: 夹着的垃圾应该都析构了");
+        let (after_slot, after_root) = heap.mutate(|m| (beads(m.get(&anchor).head.get()), beads(Some(m.get(&rooted)))));
+        let values = |v: &[(usize, u64)]| v.iter().map(|&(_, x)| x).collect::<Vec<_>>();
+        assert_eq!(values(&after_slot), values(&before_slot), "{mode:?}: 槽挂的链值变了");
+        assert_eq!(values(&after_root), values(&before_root), "{mode:?}: 根挂的链值变了");
+        let moved = |a: &[(usize, u64)], b: &[(usize, u64)]| a.iter().zip(b).filter(|(x, y)| x.0 != y.0).count();
+        let (slot_moved, root_moved) = (moved(&before_slot, &after_slot), moved(&before_root, &after_root));
+        match mode {
+            YoungEvacuation::Full => {
+                assert_eq!((slot_moved, root_moved), (n, n), "Full：全都该搬");
+            }
+            YoungEvacuation::SkipRemembered => {
+                assert_eq!(after_slot[0].0, before_slot[0].0, "SkipRemembered：老对象直接指着的不该搬");
+                assert_eq!((slot_moved, root_moved), (n - 1, n), "SkipRemembered：其余的该搬");
+            }
+            YoungEvacuation::Off => assert_eq!((slot_moved, root_moved), (0, 0), "Off：不该搬"),
+        }
+        // 摘掉两条链：引用计数（槽那条）与年轻 / 完整回收（根那条）收掉，析构数恰好
+        heap.mutate(|m| m.get(&anchor).head.set(m, None));
+        drop(rooted);
+        heap.collect_young();
+        heap.collect();
+        assert_eq!(drops.load(Ordering::Relaxed), 4 * n, "{mode:?}: 摘掉的链没收干净");
+        drop(anchor);
+    }
+}
+
+/// `shrink`：空行还给系统后对象完好，之后接着往那些空行里分配（重新缺页、内容是零）也对。
+#[test]
+fn shrink_keeps_objects_and_reuses_lines() {
+    const HOLES: usize = if cfg!(miri) { 100 } else { 3000 };
+    let mut heap = Heap::new(THREADS);
+    let lines: Root<LinesB> = heap.mutate(|m| {
+        let all: Vec<_> = (0..3 * HOLES).map(|i| m.alloc(Line { fill: [i as u64; 29] })).collect();
+        m.root(m.alloc(Lines { kept: all.iter().enumerate().filter(|(i, _)| i % 3 == 0).map(|(_, &l)| Slot::from(Some(l))).collect() }))
+    });
+    heap.shrink();
+    let check = |heap: &Heap| heap.mutate(|m| m.get(&lines).kept.iter().enumerate().all(|(k, s)| s.get().is_some_and(|l| l.fill.iter().all(|&x| x == 3 * k as u64))));
+    assert!(check(&heap), "shrink 之后存活对象的内容变了");
+    let drops = Arc::new(AtomicUsize::new(0));
+    let fresh = build_tree(&heap, &drops, if cfg!(miri) { 8 } else { 14 });
+    assert!(check(&heap));
+    assert_eq!(heap.mutate(|m| m.get(&fresh).count()), (1 << if cfg!(miri) { 8 } else { 14 }) - 1);
+    drop(fresh);
+    heap.shrink();
+    assert!(check(&heap));
 }

@@ -13,7 +13,7 @@ mod sync;
 pub use handle::{Brand, Far, Gc, Root, Slot};
 #[cfg(target_os = "linux")]
 pub use handle::{EdgeMap, Public, PublicBrand, PublicGc, PublicRef, PublicSlot, Shared};
-pub use heap::{Heap, Mutator, Stats, Tlab};
+pub use heap::{Heap, Mutator, Stats, Tlab, YoungEvacuation};
 #[cfg(target_os = "linux")]
 pub use heap::{HeapDead, PublicHeap, PublicMutator, PublicStats};
 pub use mark::{Trace, Tracer};
