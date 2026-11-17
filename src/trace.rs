@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use crossbeam_deque::{Injector, Worker};
 
+use crate::gc::{GcInternal, SlotInternal};
 use crate::block::Block;
 use crate::copy::Copier;
 use crate::header::{Claim, Header};
@@ -53,42 +54,7 @@ pub struct Tracer<'t> {
     group: Option<&'t Injector<(usize, usize)>>,
 }
 
-impl<'t> Tracer<'t> {
-    pub(crate) fn new(work: &'t Worker<usize>, epoch: u32, copier: Option<&'t mut Copier>) -> Self {
-        Self { work, epoch, copier, count: None, decs: None, exclusive: false, log: None, group: None }
-    }
-
-    /// 计数模式：扫描时每条边给目标 +1（种子——根与记忆集——直接走 visit，不计）。
-    /// `exclusive`：只有这一个线程在改计数。
-    pub(crate) fn counting(mut self, parity: Option<bool>, exclusive: bool) -> Self {
-        self.count = parity;
-        self.exclusive = exclusive;
-        self
-    }
-
-    /// 释放模式：访问一个死对象时把它每条边的目标（槽取上次计入的值）放进 `decs`。
-    pub(crate) fn releasing(work: &'t Worker<usize>, decs: &'t mut Vec<usize>) -> Self {
-        Self { work, epoch: 0, copier: None, count: None, decs: Some(decs), exclusive: false, log: None, group: None }
-    }
-
-    /// 并发标记：给登记队列（见 [`Tracer::log`]）。
-    pub(crate) fn logging(mut self, log: Option<&'t Injector<usize>>) -> Self {
-        self.log = log;
-        self
-    }
-
-    /// 一起回收：给报告 Far 目标的队列。
-    pub(crate) fn grouping(mut self, group: Option<&'t Injector<(usize, usize)>>) -> Self {
-        self.group = group;
-        self
-    }
-
-    /// 追踪到一个 [`crate::Far`]：一起回收时报上去（由目标堆接着标），平时什么都不做（目标堆的入口就是根）。
-    pub(crate) fn far(&mut self, table: usize, header: *const Header) {
-        if let Some(group) = self.group {
-            group.push((table, header.expose_provenance()));
-        }
-    }
+impl Tracer<'_> {
 
     fn inc(&self, header: *const Header) {
         if let Some(parity) = self.count {
@@ -100,11 +66,6 @@ impl<'t> Tracer<'t> {
                 h.rc_inc(parity);
             }
         }
-    }
-
-    /// 重定位模式（疏散回收）：取出来的对象走 `relocate` 而不是 `trace`。
-    pub(crate) fn relocating(&self) -> bool {
-        self.copier.is_some()
     }
 
     /// 一条边（只读：并发标记、不疏散的回收）。
@@ -131,8 +92,83 @@ impl<'t> Tracer<'t> {
         if core::ptr::eq(old, new) { gc } else { unsafe { Gc::from_data(Header::data(new).cast()) } }
     }
 
+}
+
+/// 只给本 crate 用的操作：trait 在私有模块里、不导出，crate 外拿不到。
+pub trait TracerInternal<'t> {
+    fn new(work: &'t Worker<usize>, epoch: u32, copier: Option<&'t mut Copier>) -> Self;
+
+    /// 计数模式：扫描时每条边给目标 +1（种子——根与记忆集——直接走 visit，不计）。
+    /// `exclusive`：只有这一个线程在改计数。
+    fn counting(self, parity: Option<bool>, exclusive: bool) -> Self;
+
+    /// 释放模式：访问一个死对象时把它每条边的目标（槽取上次计入的值）放进 `decs`。
+    fn releasing(work: &'t Worker<usize>, decs: &'t mut Vec<usize>) -> Self;
+
+    /// 并发标记：给登记队列（见 [`Tracer::log`]）。
+    fn logging(self, log: Option<&'t Injector<usize>>) -> Self;
+
+    /// 一起回收：给报告 Far 目标的队列。
+    fn grouping(self, group: Option<&'t Injector<(usize, usize)>>) -> Self;
+
+    /// 追踪到一个 [`crate::Far`]：一起回收时报上去（由目标堆接着标），平时什么都不做（目标堆的入口就是根）。
+    fn far(&mut self, table: usize, header: *const Header);
+
+    /// 重定位模式（疏散回收）：取出来的对象走 `relocate` 而不是 `trace`。
+    fn relocating(&self) -> bool;
+
     /// 一个槽（只读）：平时等于一条边；计数模式下改成计入当前值并 +1；释放模式下把上次计入的值交出去 −1。
-    pub(crate) fn slot<T: Trace>(&mut self, slot: &Slot<'_, T>) {
+    fn slot<T: Trace>(&mut self, slot: &Slot<'_, T>);
+
+    /// 一个可改写的槽（疏散回收）：搬走了就改成新地址；计数模式下计入新值并 +1。
+    fn slot_mut<T: Trace>(&mut self, slot: &mut Slot<'_, T>);
+
+    /// 标记对象，它在疏散候选块里就搬走；返回对象现在的头。
+    fn forward(&mut self, header: *const Header, no_edges: bool) -> *const Header;
+
+    /// 标记对象；本轮第一次见到且它有边时压进工作队列。
+    fn visit(&mut self, header: *const Header, no_edges: bool);
+
+    /// 追踪（或重定位）工作队列里取出来的一个对象。
+    fn scan(&mut self, item: usize);
+}
+
+impl<'t> TracerInternal<'t> for Tracer<'t> {
+    fn new(work: &'t Worker<usize>, epoch: u32, copier: Option<&'t mut Copier>) -> Self {
+        Self { work, epoch, copier, count: None, decs: None, exclusive: false, log: None, group: None }
+    }
+
+    fn counting(mut self, parity: Option<bool>, exclusive: bool) -> Self {
+        self.count = parity;
+        self.exclusive = exclusive;
+        self
+    }
+
+    fn releasing(work: &'t Worker<usize>, decs: &'t mut Vec<usize>) -> Self {
+        Self { work, epoch: 0, copier: None, count: None, decs: Some(decs), exclusive: false, log: None, group: None }
+    }
+
+    fn logging(mut self, log: Option<&'t Injector<usize>>) -> Self {
+        self.log = log;
+        self
+    }
+
+    fn grouping(mut self, group: Option<&'t Injector<(usize, usize)>>) -> Self {
+        self.group = group;
+        self
+    }
+
+    fn far(&mut self, table: usize, header: *const Header) {
+        if let Some(group) = self.group {
+            group.push((table, header.expose_provenance()));
+        }
+    }
+
+    fn relocating(&self) -> bool {
+        self.copier.is_some()
+    }
+
+    fn slot<T: Trace>(&mut self, slot: &Slot<'_, T>) {
         let raw = slot.raw_slot();
         if let Some(decs) = self.decs.as_deref_mut() {
             if let Some(h) = raw.counted() {
@@ -159,8 +195,7 @@ impl<'t> Tracer<'t> {
         }
     }
 
-    /// 一个可改写的槽（疏散回收）：搬走了就改成新地址；计数模式下计入新值并 +1。
-    pub(crate) fn slot_mut<T: Trace>(&mut self, slot: &mut Slot<'_, T>) {
+    fn slot_mut<T: Trace>(&mut self, slot: &mut Slot<'_, T>) {
         if let Some(gc) = slot.get() {
             let new = self.forward_gc(gc);
             slot.store_exclusive(Some(new));
@@ -172,8 +207,7 @@ impl<'t> Tracer<'t> {
         }
     }
 
-    /// 标记对象，它在疏散候选块里就搬走；返回对象现在的头。
-    pub(crate) fn forward(&mut self, header: *const Header, no_edges: bool) -> *const Header {
+    fn forward(&mut self, header: *const Header, no_edges: bool) -> *const Header {
         // SAFETY: header 来自本堆的 Gc / 根，对象活着
         let h = unsafe { &*header };
         if let Some(copier) = self.copier.as_deref_mut()
@@ -198,8 +232,7 @@ impl<'t> Tracer<'t> {
         header
     }
 
-    /// 标记对象；本轮第一次见到且它有边时压进工作队列。
-    pub(crate) fn visit(&mut self, header: *const Header, no_edges: bool) {
+    fn visit(&mut self, header: *const Header, no_edges: bool) {
         // SAFETY: header 来自本堆的 Gc / 根，对象活着
         let h = unsafe { &*header };
         if !h.mark(self.epoch) {
@@ -213,13 +246,13 @@ impl<'t> Tracer<'t> {
         }
     }
 
-    /// 追踪（或重定位）工作队列里取出来的一个对象。
-    pub(crate) fn scan(&mut self, item: usize) {
+    fn scan(&mut self, item: usize) {
         let header = core::ptr::with_exposed_provenance::<Header>(item);
         // SAFETY: 队列里只有本轮标记过的活对象；重定位模式时它只被这一个线程取出（独占）
         unsafe { Header::visit(header, self) };
     }
 }
+
 
 // SAFETY: Gc 本身就是一条边
 unsafe impl<T: Trace> Trace for Gc<'_, T> {

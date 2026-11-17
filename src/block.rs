@@ -25,7 +25,7 @@ struct Meta {
 }
 
 /// 清扫时怎么析构死对象：私有堆调对象自己的析构函数，公开堆的对象没有析构。
-pub(crate) trait Finalize {
+pub trait Finalize {
     /// SAFETY（调用方）：`object` 是死对象的头，之后不再使用。
     unsafe fn finalize(object: *const Core);
 }
@@ -41,7 +41,7 @@ impl Finalize for Header {
 const REUSED: u32 = u32::MAX;
 
 /// 清扫一个块的结果。
-pub(crate) enum State {
+pub enum State {
     /// 没有活对象
     Empty,
     /// 还有空行
@@ -51,7 +51,7 @@ pub(crate) enum State {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Block(NonNull<Meta>);
+pub struct Block(NonNull<Meta>);
 
 // SAFETY: 块是一段独立的堆内存；元数据都是原子量，对象数据的跨线程访问由 Trace: Send + Sync 担保
 unsafe impl Send for Block {}
@@ -64,10 +64,10 @@ impl Block {
         Err(_) => panic!("块的大小 / 对齐不合法"),
     };
     /// 元数据之后第一个能放对象的行
-    pub(crate) const FIRST_LINE: usize = size_of::<Meta>().div_ceil(LINE);
+    pub const FIRST_LINE: usize = size_of::<Meta>().div_ceil(LINE);
 
     /// 新块：全零（行标记 0 早于任何纪元，全部是空行）。
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         // SAFETY: LAYOUT 大小非零
         let p = unsafe { alloc_zeroed(Self::LAYOUT) };
         let b = Self(NonNull::new(p.cast()).unwrap_or_else(|| handle_alloc_error(Self::LAYOUT)));
@@ -77,40 +77,40 @@ impl Block {
 
     /// 公开堆窗口里的块。SAFETY（调用方）：`p` 按块大小对齐、有 [`BLOCK`] 字节可读写；
     /// 第一次用时内存是零（新延长的文件页）或已经 [`Block::reset`] 过。
-    pub(crate) unsafe fn at(p: *mut u8) -> Self {
+    pub unsafe fn at(p: *mut u8) -> Self {
         // SAFETY: 见上
         Self(unsafe { NonNull::new_unchecked(p.cast()) })
     }
 
     /// 元数据清零（大对象占过的块还回来时）。SAFETY（调用方）：块里没有对象，没人在用它。
-    pub(crate) unsafe fn reset(self) {
+    pub unsafe fn reset(self) {
         // SAFETY: 见上；元数据全是原子量，全零是合法值
         unsafe { self.0.as_ptr().write_bytes(0, 1) };
     }
 
     /// 交给分配缓冲：上次清扫的存活量不再作数。
-    pub(crate) fn reused(self) {
+    pub fn reused(self) {
         self.meta().live.store(REUSED, Ordering::Relaxed);
     }
 
     /// 上次清扫后没再分配过时的存活字节数。
-    pub(crate) fn live_since_sweep(self) -> Option<usize> {
+    pub fn live_since_sweep(self) -> Option<usize> {
         let live = self.meta().live.load(Ordering::Relaxed);
         (live != REUSED).then_some(live as usize)
     }
 
     /// 要放进可用队列：之前不在里面才返回 true。
-    pub(crate) fn list(self) -> bool {
+    pub fn list(self) -> bool {
         !self.meta().listed.swap(true, Ordering::AcqRel)
     }
 
     /// 从可用队列里拿出来了。
-    pub(crate) fn unlist(self) {
+    pub fn unlist(self) {
         self.meta().listed.store(false, Ordering::Release);
     }
 
     /// 清掉 `p` 处的对象起点（引用计数释放了它）。
-    pub(crate) fn clear_start(self, p: *const u8) {
+    pub fn clear_start(self, p: *const u8) {
         let g = self.offset(p) / GRANULE;
         self.meta().starts[g / BITS].fetch_and(!(1 << (g % BITS)), Ordering::Relaxed);
     }
@@ -120,7 +120,7 @@ impl Block {
     /// 块上次清扫后被拿去分配过（里面可能有还没扫的死年轻对象）：保留这个状态、返回 false，交给年轻清扫分类；
     /// 否则记下存活字节数，返回是否有空行（可以直接放回可用队列）。
     /// SAFETY（调用方）：没有 mutator（独占堆），起点位标着的对象都还没析构。
-    pub(crate) unsafe fn recompute_lines(self, epoch: u32) -> bool {
+    pub unsafe fn recompute_lines(self, epoch: u32) -> bool {
         let meta = self.meta();
         let reused = meta.live.load(Ordering::Relaxed) == REUSED;
         for line in &meta.lines {
@@ -148,27 +148,27 @@ impl Block {
         meta.lines[Self::FIRST_LINE..].iter().any(|l| l.load(Ordering::Relaxed) != epoch)
     }
 
-    pub(crate) fn set_evacuate(self) {
+    pub fn set_evacuate(self) {
         self.meta().evacuate.store(true, Ordering::Relaxed);
     }
 
     /// 不疏散这个块（里面有别的堆直接指着的对象）；原来要疏散返回 true。
-    pub(crate) fn pin(self) -> bool {
+    pub fn pin(self) -> bool {
         self.meta().evacuate.swap(false, Ordering::Relaxed)
     }
 
-    pub(crate) fn is_evacuating(self) -> bool {
+    pub fn is_evacuating(self) -> bool {
         self.meta().evacuate.load(Ordering::Relaxed)
     }
 
     /// 还给系统。SAFETY（调用方）：块里没有活对象（死的已析构），之后不再使用。
-    pub(crate) unsafe fn release(self) {
+    pub unsafe fn release(self) {
         // SAFETY: 见上；指针来自 new
         unsafe { dealloc(self.0.as_ptr().cast(), Self::LAYOUT) };
     }
 
     /// 地址所在的块（地址必须在某个块里）。
-    pub(crate) fn containing(p: *const u8) -> Self {
+    pub fn containing(p: *const u8) -> Self {
         let base = p.map_addr(|a| a & !(BLOCK - 1)).cast_mut().cast::<Meta>();
         // SAFETY: 块起点不会是 0
         Self(unsafe { NonNull::new_unchecked(base) })
@@ -184,7 +184,7 @@ impl Block {
     }
 
     /// 第 `i` 行的起点（`i == LINES` 是块尾）。
-    pub(crate) fn line(self, i: usize) -> *mut u8 {
+    pub fn line(self, i: usize) -> *mut u8 {
         self.base().wrapping_add(i * LINE)
     }
 
@@ -193,7 +193,7 @@ impl Block {
     }
 
     /// 标记 `[p, p + bytes)` 跨过的行。
-    pub(crate) fn mark_lines(self, p: *const u8, bytes: usize, epoch: u32) {
+    pub fn mark_lines(self, p: *const u8, bytes: usize, epoch: u32) {
         let first = self.offset(p) / LINE;
         let last = (self.offset(p) + bytes - 1) / LINE;
         for line in &self.meta().lines[first..=last] {
@@ -202,14 +202,14 @@ impl Block {
     }
 
     /// 记下 `p` 处有一个对象。
-    pub(crate) fn set_start(self, p: *const u8) {
+    pub fn set_start(self, p: *const u8) {
         let g = self.offset(p) / GRANULE;
         self.meta().starts[g / BITS].fetch_or(1 << (g % BITS), Ordering::Relaxed);
     }
 
     /// 从第 `from` 行起的第一个空洞（一段连续空行），返回 `[起, 止)` 行号。
     /// 空行 = 行标记早于上次完成的纪元 `epoch`：并发标记期间标记方会把活行写成更新的纪元，那些也不是空行。
-    pub(crate) fn hole(self, from: usize, epoch: u32) -> Option<(usize, usize)> {
+    pub fn hole(self, from: usize, epoch: u32) -> Option<(usize, usize)> {
         let lines = &self.meta().lines;
         let free = |i: usize| lines[i].load(Ordering::Relaxed) < epoch;
         let start = (from..LINES).find(|&i| free(i))?;
@@ -219,7 +219,7 @@ impl Block {
 
     /// 清扫：析构（按 `K`）没标上本轮纪元的对象（搬走了的不析构）、清掉它们的起点位，返回块的状态与存活字节数。
     /// SAFETY（调用方）：标记已经做完，没有 mutator 在用这个块；块里对象的头是 `K` 认识的那种。
-    pub(crate) unsafe fn sweep<K: Finalize>(self, epoch: u32) -> (State, usize) {
+    pub unsafe fn sweep<K: Finalize>(self, epoch: u32) -> (State, usize) {
         let mut live = 0;
         for (w, word) in self.meta().starts.iter().enumerate() {
             let mut bits = word.load(Ordering::Relaxed);

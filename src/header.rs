@@ -7,6 +7,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crossbeam_utils::Backoff;
 
+use crate::trace::TracerInternal;
 use crate::Trace;
 use crate::layout::GRANULE;
 use crate::trace::Tracer;
@@ -28,11 +29,11 @@ const FORWARDED: u32 = 1 << 31;
 /// 标记字：某个回收线程认领了它、正在复制
 const BUSY: u32 = 1 << 30;
 /// 纪元的上限（不能碰到 BUSY / FORWARDED 位）
-pub(crate) const MAX_EPOCH: u32 = BUSY - 1;
+pub const MAX_EPOCH: u32 = BUSY - 1;
 
 /// 两种堆共用的头部前缀：标记字与信息字。块、行、清扫只看这一段，所以私有堆与公开堆共用块的代码。
 #[repr(C)]
-pub(crate) struct Core {
+pub struct Core {
     /// 最后一次被标记时的纪元，或 BUSY / FORWARDED
     mark: AtomicU32,
     /// 粒度数（含头）、引用计数、计数奇偶、大对象位（见 [`SIZE_BITS`] 等）
@@ -40,7 +41,7 @@ pub(crate) struct Core {
 }
 
 #[repr(C)]
-pub(crate) struct Header {
+pub struct Header {
     core: Core,
     /// 访问对象数据里的边：追踪（只读）或重定位（独占改写），由 Tracer 的模式决定
     visit: unsafe fn(*mut u8, &mut Tracer<'_>),
@@ -49,13 +50,13 @@ pub(crate) struct Header {
 }
 
 /// 头的字节数；对象数据紧跟在后面
-pub(crate) const HEADER: usize = size_of::<Header>();
+pub const HEADER: usize = size_of::<Header>();
 
 const _: () = assert!(HEADER.is_multiple_of(GRANULE), "对象数据要按粒度对齐");
 const _: () = assert!(size_of::<Option<unsafe fn(*mut u8)>>() == size_of::<*const Header>(), "转发地址要放得进 drop 那个字");
 
 /// 认领疏散的结果。
-pub(crate) enum Claim {
+pub enum Claim {
     /// 归我复制
     Mine,
     /// 别人已经搬走了，新头在这
@@ -72,7 +73,7 @@ impl core::ops::Deref for Header {
 
 impl Header {
     /// `mark`：初始标记纪元。
-    pub(crate) fn new<T: Trace>(bytes: usize, large: bool, mark: u32) -> Self {
+    pub fn new<T: Trace>(bytes: usize, large: bool, mark: u32) -> Self {
         Self {
             core: Core::new(bytes, large, mark),
             visit: Self::visit_as::<T>,
@@ -98,42 +99,42 @@ impl Header {
     }
 
     /// 数据指针（头之后）。
-    pub(crate) fn data(this: *const Self) -> *mut u8 {
+    pub fn data(this: *const Self) -> *mut u8 {
         this.cast::<u8>().cast_mut().wrapping_add(HEADER)
     }
 
     /// 由数据指针找回头。
-    pub(crate) fn of(data: *const u8) -> *const Self {
+    pub fn of(data: *const u8) -> *const Self {
         data.wrapping_sub(HEADER).cast()
     }
 }
 
 impl Core {
-    pub(crate) fn new(bytes: usize, large: bool, mark: u32) -> Self {
+    pub fn new(bytes: usize, large: bool, mark: u32) -> Self {
         let granules = u32::try_from(bytes / GRANULE).expect("对象太大");
         assert!(granules <= SIZE_MASK, "对象太大（单个对象至多 128 MiB）");
         Self { mark: AtomicU32::new(mark), info: AtomicU32::new(granules | if large { LARGE_BIT } else { 0 }) }
     }
 
-    pub(crate) fn bytes(&self) -> usize {
+    pub fn bytes(&self) -> usize {
         (self.info.load(Ordering::Relaxed) & SIZE_MASK) as usize * GRANULE
     }
 
-    pub(crate) fn is_large(&self) -> bool {
+    pub fn is_large(&self) -> bool {
         self.info.load(Ordering::Relaxed) & LARGE_BIT != 0
     }
 
     /// 这一轮第一次标记它时返回 true（只有一个线程会拿到 true）。
-    pub(crate) fn mark(&self, epoch: u32) -> bool {
+    pub fn mark(&self, epoch: u32) -> bool {
         self.mark.load(Ordering::Relaxed) != epoch && self.mark.swap(epoch, Ordering::AcqRel) != epoch
     }
 
-    pub(crate) fn is_marked(&self, epoch: u32) -> bool {
+    pub fn is_marked(&self, epoch: u32) -> bool {
         self.mark.load(Ordering::Acquire) == epoch
     }
 
     /// 引用计数加一（`parity` 是当前计数的奇偶：对不上说明是上一代的旧计数，从 1 起算）。粘住了就不变。
-    pub(crate) fn rc_inc(&self, parity: bool) {
+    pub fn rc_inc(&self, parity: bool) {
         let parity = if parity { PARITY_BIT } else { 0 };
         let mut word = self.info.load(Ordering::Relaxed);
         loop {
@@ -151,7 +152,7 @@ impl Core {
 
     /// 同 [`Header::rc_inc`]，但调用方保证此刻只有自己在改计数（单线程标记：mutator 不碰计数、减量队列为空）：
     /// 用普通的读、算、写，不用带锁的原子读改写（重新计数时每条边一次，单线程省下的就是这个）。
-    pub(crate) fn rc_inc_exclusive(&self, parity: bool) {
+    pub fn rc_inc_exclusive(&self, parity: bool) {
         let parity = if parity { PARITY_BIT } else { 0 };
         let word = self.info.load(Ordering::Relaxed);
         let rc = if word & PARITY_BIT == parity { (word & RC_MASK) >> RC_SHIFT } else { 0 };
@@ -161,7 +162,7 @@ impl Core {
     }
 
     /// 引用计数减一；减到 0 返回 true。粘住的、旧一代的、已经是 0 的都不变，返回 false。
-    pub(crate) fn rc_dec(&self, parity: bool) -> bool {
+    pub fn rc_dec(&self, parity: bool) -> bool {
         let parity = if parity { PARITY_BIT } else { 0 };
         let mut word = self.info.load(Ordering::Relaxed);
         loop {
@@ -181,19 +182,19 @@ impl Core {
     }
 
     /// 已经被搬走（清扫时不析构、不算存活）。
-    pub(crate) fn is_forwarded(&self) -> bool {
+    pub fn is_forwarded(&self) -> bool {
         self.mark.load(Ordering::Acquire) & FORWARDED != 0
     }
 
     /// 复制出来的新头：标成本轮。
-    pub(crate) fn set_mark(&self, epoch: u32) {
+    pub fn set_mark(&self, epoch: u32) {
         self.mark.store(epoch, Ordering::Release);
     }
 }
 
 impl Header {
     /// 疏散：认领复制权；别人在复制就等，别人搬完了就给新地址。
-    pub(crate) fn claim(&self) -> Claim {
+    pub fn claim(&self) -> Claim {
         let backoff = Backoff::new();
         loop {
             let word = self.mark.load(Ordering::Acquire);
@@ -211,7 +212,7 @@ impl Header {
     }
 
     /// 复制完：写下新地址并发布。SAFETY（调用方）：本线程认领了它（[`Claim::Mine`]）。
-    pub(crate) unsafe fn forward(this: *const Self, to: *const Self) {
+    pub unsafe fn forward(this: *const Self, to: *const Self) {
         // SAFETY: 认领后只有本线程写这个字；别的线程在看到 FORWARDED（Release / Acquire）之前不读它
         unsafe { (&raw const (*this).drop).cast_mut().cast::<*const Self>().write(to) };
         // SAFETY: this 有效
@@ -224,13 +225,13 @@ impl Header {
     }
 
     /// 访问对象数据（追踪或重定位）。SAFETY（调用方）：对象活着；重定位时调用方独占它。
-    pub(crate) unsafe fn visit(this: *const Self, t: &mut Tracer<'_>) {
+    pub unsafe fn visit(this: *const Self, t: &mut Tracer<'_>) {
         // SAFETY: 见上；visit 是按对象自己的类型生成的
         unsafe { ((*this).visit)(Self::data(this), t) };
     }
 
     /// 析构对象数据。SAFETY（调用方）：对象已死、之后不再使用，而且没被搬走。
-    pub(crate) unsafe fn finalize(this: *const Self) {
+    pub unsafe fn finalize(this: *const Self) {
         // SAFETY: 见上；drop 是按对象自己的类型生成的
         if let Some(drop) = unsafe { (*this).drop } {
             unsafe { drop(Self::data(this)) };

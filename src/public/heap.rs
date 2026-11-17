@@ -16,6 +16,7 @@ use std::sync::{Arc, OnceLock};
 
 use crossbeam_deque::{Injector, Steal};
 
+use super::ptr::{PublicGcInternal, PublicInternal};
 use crate::lockfree::SegVec;
 
 use crate::block::{Block, State};
@@ -41,7 +42,7 @@ const YIELD_ROUNDS: usize = 10;
 /// 两个回收方（或一起回收）分别挡着 A、B 会互相等死，放开请求就解开了
 const PATIENCE: Duration = Duration::from_millis(50);
 /// [`Entry::holder`] 的最高位：持有方是另一个公开堆（低位是它的堆号），不是某个挂接（槽号 + 1）
-pub(crate) const HEAP_HOLDER: u32 = 1 << 31;
+pub const HEAP_HOLDER: u32 = 1 << 31;
 /// 清扫时每次领多少块
 const SWEEP_BATCH: usize = 16;
 /// 栈头低 32 位：栈顶序号 + 1（0 = 空）；高 32 位是改动次数（防 ABA）
@@ -50,12 +51,12 @@ const STACK_TOP: u64 = u32::MAX as u64;
 const STACK_TAG_SHIFT: u32 = u32::BITS;
 
 /// 窗口里的无锁栈（可用块、还回来的入口）：头在超级块里，每个元素的「下一个」在它自己的表项里。
-pub(crate) struct Stack<'a> {
+pub struct Stack<'a> {
     head: &'a AtomicU64,
 }
 
 impl Stack<'_> {
-    pub(crate) fn push(&self, i: u32, next: &AtomicU32) {
+    pub fn push(&self, i: u32, next: &AtomicU32) {
         let mut head = self.head.load(Ordering::Acquire);
         loop {
             next.store((head & STACK_TOP) as u32, Ordering::Relaxed);
@@ -67,7 +68,7 @@ impl Stack<'_> {
         }
     }
 
-    pub(crate) fn pop<'n>(&self, next_of: impl Fn(u32) -> &'n AtomicU32) -> Option<u32> {
+    pub fn pop<'n>(&self, next_of: impl Fn(u32) -> &'n AtomicU32) -> Option<u32> {
         let mut head = self.head.load(Ordering::Acquire);
         loop {
             let top = (head & STACK_TOP) as u32;
@@ -84,7 +85,7 @@ impl Stack<'_> {
 }
 
 /// 窗口背后是什么。
-pub(crate) enum Backing {
+pub enum Backing {
     /// 共享内存文件系统上的文件；`marker` = 本句柄建的（堆号标记文件），析构时连同堆文件一起删（除非 persist）
     File { file: File, path: PathBuf, marker: Option<PathBuf> },
     /// 匿名共享内存（只在本进程）
@@ -116,9 +117,9 @@ impl Fnv {
 
     /// 类型 `T` 的指针图与类型键。
     fn of<T: Shared>() -> (EdgeMap, [u64; 2]) {
-        let mut map = EdgeMap(Vec::new());
+        let mut map = EdgeMap::default();
         T::edges(&mut map, 0);
-        let key = Self::key(type_name::<T>(), size_of::<T>(), &map.0);
+        let key = Self::key(type_name::<T>(), size_of::<T>(), map.as_slice());
         (map, key)
     }
 
@@ -137,7 +138,7 @@ impl Fnv {
 }
 
 /// 进程这一侧的公开堆：窗口在哪、怎么延长文件、回收线程池、类型号缓存。
-pub(crate) struct Inner {
+pub struct Inner {
     /// 地址区：窗口在它里面，Arc 让它比堆活得久
     space: Arc<Space>,
     index: usize,
@@ -163,7 +164,7 @@ unsafe impl Sync for Inner {}
 
 impl Inner {
     /// 窗口 `index` 已经映射上 `backing`；`fresh` 时写新的超级块，否则核对。出错时析构负责还窗口。
-    pub(crate) fn new(space: Arc<Space>, index: usize, backing: Backing, threads: NonZeroUsize, fresh: bool) -> io::Result<Self> {
+    pub fn new(space: Arc<Space>, index: usize, backing: Backing, threads: NonZeroUsize, fresh: bool) -> io::Result<Self> {
         let window = NonNull::new(space.region().window(index)).expect("窗口地址非空");
         let mut me = Self { space, index, window, layout: Layout::new(), backing, threads, pool: OnceLock::new(), types: SegVec::default(), spare: AtomicPtr::new(null_mut()), slot: ATTACH_CAP, keep: AtomicBool::new(false) };
         if fresh {
@@ -337,16 +338,16 @@ impl Inner {
         }
     }
 
-    pub(crate) fn index(&self) -> usize {
+    pub fn index(&self) -> usize {
         self.index
     }
 
     /// 公开偏移落在哪个堆（窗口）里。
-    pub(crate) fn heap_of(off: u64) -> Option<usize> {
+    pub fn heap_of(off: u64) -> Option<usize> {
         usize::try_from(off).ok().map(|o| o / WINDOW).filter(|&k| k < WINDOWS)
     }
 
-    pub(crate) fn sup(&self) -> &Super {
+    pub fn sup(&self) -> &Super {
         // SAFETY: 窗口开头一页在建堆时就有了，里面是超级块（全是原子量）
         unsafe { &*self.window.as_ptr().cast() }
     }
@@ -356,12 +357,12 @@ impl Inner {
     }
 
     /// 公开偏移在本进程里的地址。
-    pub(crate) fn ptr(&self, off: u64) -> *mut u8 {
+    pub fn ptr(&self, off: u64) -> *mut u8 {
         self.space.region().base().as_ptr().wrapping_add(usize::try_from(off).expect("公开偏移"))
     }
 
     /// 公开偏移落在这个堆的窗口里。
-    pub(crate) fn owns(&self, off: u64) -> bool {
+    pub fn owns(&self, off: u64) -> bool {
         usize::try_from(off).is_ok_and(|o| o / WINDOW == self.index)
     }
 
@@ -393,14 +394,14 @@ impl Inner {
     }
 
     /// 类型 `ty` 的指针图。
-    pub(crate) fn edges(&self, ty: u32) -> &[u32] {
+    pub fn edges(&self, ty: u32) -> &[u32] {
         let e = self.type_entry(ty);
         let (map, n) = (e.map.load(Ordering::Relaxed) as usize, e.edges.load(Ordering::Relaxed) as usize);
         // SAFETY: 写完指针图才置 ready，读的一侧（分配过这个类型的对象之后的回收）在它之后
         unsafe { core::slice::from_raw_parts(self.at::<u32>(self.layout.map).add(map), n) }
     }
 
-    pub(crate) fn has_edges(&self, ty: u32) -> bool {
+    pub fn has_edges(&self, ty: u32) -> bool {
         self.type_entry(ty).edges.load(Ordering::Relaxed) != 0
     }
 
@@ -435,13 +436,14 @@ impl Inner {
         }
         let ty = sup.types.fetch_add(1, Ordering::AcqRel);
         assert!((ty as usize) < TYPE_CAP, "公开堆的类型表满了");
-        let n = u32::try_from(map.0.len()).expect("指针槽个数");
+        let edges = map.as_slice();
+        let n = u32::try_from(edges.len()).expect("指针槽个数");
         let start = sup.map.fetch_add(n, Ordering::AcqRel);
         assert!((start + n) as usize <= MAP_CAP, "公开堆的指针图满了");
         self.commit(Segment::Types, self.layout.types + (ty as usize + 1) * size_of::<TypeEntry>());
         self.commit(Segment::Map, self.layout.map + (start + n) as usize * size_of::<u32>());
         // SAFETY: [start, start + n) 是本线程刚领的、已经有内存的指针图区
-        unsafe { self.at::<u32>(self.layout.map).add(start as usize).copy_from_nonoverlapping(map.0.as_ptr(), map.0.len()) };
+        unsafe { self.at::<u32>(self.layout.map).add(start as usize).copy_from_nonoverlapping(edges.as_ptr(), edges.len()) };
         let e = self.type_entry(ty);
         e.edges.store(n, Ordering::Relaxed);
         e.map.store(start, Ordering::Relaxed);
@@ -465,12 +467,12 @@ impl Inner {
     }
 
     /// 领一个入口放公开偏移 `off`，持有方是本挂接（只在这个堆的 mutate 里调用）。
-    pub(crate) fn claim_entry(&self, off: u64) -> u32 {
+    pub fn claim_entry(&self, off: u64) -> u32 {
         self.claim_entry_for(off, u32::try_from(self.slot + 1).expect("挂接槽号"))
     }
 
     /// 同 [`Inner::claim_entry`]，持有方是 `holder`（另一个公开堆：[`HEAP_HOLDER`] | 堆号）。
-    pub(crate) fn claim_entry_for(&self, off: u64, holder: u32) -> u32 {
+    pub fn claim_entry_for(&self, off: u64, holder: u32) -> u32 {
         let sup = self.sup();
         let i = Stack { head: &sup.free_entries }.pop(|i| &self.entry(i).next).unwrap_or_else(|| {
             let i = sup.entries.fetch_add(1, Ordering::AcqRel);
@@ -485,12 +487,12 @@ impl Inner {
     }
 
     /// 入口改成不归任何人（持有方 0）：收拾死进程、一起回收重建登记都不碰它。
-    pub(crate) fn disown_entry(&self, i: u32) {
+    pub fn disown_entry(&self, i: u32) {
         self.entry(i).holder.store(0, Ordering::Release);
     }
 
     /// 句柄析构：清空入口、还回栈里（任何时候、任何线程）。
-    pub(crate) fn release_entry(&self, i: u32) {
+    pub fn release_entry(&self, i: u32) {
         let e = self.entry(i);
         // 先清持有方：收拾死进程时按持有方认它没还的入口，还过的不能再还一次
         e.holder.store(0, Ordering::Release);
@@ -749,10 +751,6 @@ impl PublicHeap {
         self.0.index
     }
 
-    pub(crate) fn is(&self, inner: &Arc<Inner>) -> bool {
-        Arc::ptr_eq(&self.0, inner)
-    }
-
     /// 建堆的句柄析构时保留堆文件与堆号标记（主进程退出或重启后，别的进程照样 [`crate::PublicSpace::open`] 回来接着用）。
     pub fn persist(&self) {
         self.0.keep.store(true, Ordering::Release);
@@ -817,6 +815,18 @@ impl PublicHeap {
     }
 }
 
+/// 只给本 crate 用的操作：trait 在私有模块里、不导出，crate 外拿不到。
+pub trait PublicHeapInternal {
+    fn is(&self, inner: &Arc<Inner>) -> bool;
+}
+
+impl PublicHeapInternal for PublicHeap {
+    fn is(&self, inner: &Arc<Inner>) -> bool {
+        Arc::ptr_eq(&self.0, inner)
+    }
+}
+
+
 /// 在 mutate 里：本挂接的计数加一，出门减一（panic 也减）。
 ///
 /// 进门先加计数、再看回收请求，回收方先挂请求、再看计数（都是 SeqCst）：两边至少有一方看到对方，所以不会有
@@ -875,7 +885,7 @@ impl Drop for Gate<'_> {
 }
 
 /// 线程的分配缓冲：当前块、在块里找到哪一行、当前空洞的游标与界，外加上一次分配的类型号。
-pub(crate) struct Tlab {
+pub struct Tlab {
     /// (所属堆, 那时的回收次数)；对不上就作废
     owner: Cell<(usize, u64)>,
     block: Cell<Option<Block>>,
@@ -913,24 +923,6 @@ pub struct PublicMutator<'p> {
 }
 
 impl<'p> PublicMutator<'p> {
-    pub(crate) fn is(&self, inner: &Arc<Inner>) -> bool {
-        Arc::ptr_eq(self.heap, inner)
-    }
-
-    /// 公开偏移在本进程里的地址。
-    pub(crate) fn at(&self, off: u64) -> *mut u8 {
-        self.heap.ptr(off)
-    }
-
-    /// 堆号。
-    pub(crate) fn index(&self) -> usize {
-        self.heap.index
-    }
-
-    /// 给别的堆持有的引用登记一个入口（持有方 `holder`）。
-    pub(crate) fn register(&self, off: u64, holder: u32) {
-        self.heap.claim_entry_for(off, holder);
-    }
 
     /// 分配一个对象。类型不能有析构（编译期检查）。
     pub fn alloc<T: Shared>(&self, value: T) -> PublicGc<'p, T> {
@@ -1034,3 +1026,36 @@ impl<'p> PublicMutator<'p> {
         t.limit.set(null_mut());
     }
 }
+
+/// 只给本 crate 用的操作：trait 在私有模块里、不导出，crate 外拿不到。
+pub trait PublicMutatorInternal {
+    fn is(&self, inner: &Arc<Inner>) -> bool;
+
+    /// 公开偏移在本进程里的地址。
+    fn at(&self, off: u64) -> *mut u8;
+
+    /// 堆号。
+    fn index(&self) -> usize;
+
+    /// 给别的堆持有的引用登记一个入口（持有方 `holder`）。
+    fn register(&self, off: u64, holder: u32);
+}
+
+impl PublicMutatorInternal for PublicMutator<'_> {
+    fn is(&self, inner: &Arc<Inner>) -> bool {
+        Arc::ptr_eq(self.heap, inner)
+    }
+
+    fn at(&self, off: u64) -> *mut u8 {
+        self.heap.ptr(off)
+    }
+
+    fn index(&self) -> usize {
+        self.heap.index
+    }
+
+    fn register(&self, off: u64, holder: u32) {
+        self.heap.claim_entry_for(off, holder);
+    }
+}
+

@@ -7,15 +7,15 @@ use std::fs::File;
 use std::io;
 
 /// 一个窗口的大小（一个公开堆的全部地址）
-pub(crate) const WINDOW: usize = if cfg!(miri) { 16 << 20 } else { 16 << 30 };
+pub const WINDOW: usize = if cfg!(miri) { 16 << 20 } else { 16 << 30 };
 /// 窗口数（公开堆号的上限）
-pub(crate) const WINDOWS: usize = if cfg!(miri) { 4 } else { 64 };
+pub const WINDOWS: usize = if cfg!(miri) { 4 } else { 64 };
 /// 整个公开地址区；按它对齐，所以从区内任意地址抹低位就是区的起点
-pub(crate) const REGION: usize = WINDOW * WINDOWS;
+pub const REGION: usize = WINDOW * WINDOWS;
 
 const _: () = assert!(REGION.is_power_of_two() && WINDOW.is_power_of_two());
 
-pub(crate) struct Region {
+pub struct Region {
     base: NonNull<u8>,
 }
 
@@ -26,16 +26,16 @@ unsafe impl Sync for Region {}
 
 impl Region {
     /// 区内地址 `p` 所在区的起点（抹掉低位）。
-    pub(crate) fn base_of(p: usize) -> usize {
+    pub fn base_of(p: usize) -> usize {
         p & !(REGION - 1)
     }
 
-    pub(crate) fn base(&self) -> NonNull<u8> {
+    pub fn base(&self) -> NonNull<u8> {
         self.base
     }
 
     /// 第 `k` 个窗口的起点。
-    pub(crate) fn window(&self, k: usize) -> *mut u8 {
+    pub fn window(&self, k: usize) -> *mut u8 {
         self.base.as_ptr().wrapping_add(k * WINDOW)
     }
 }
@@ -43,7 +43,7 @@ impl Region {
 #[cfg(not(miri))]
 impl Region {
     /// 保留整个区：先多保留一倍找到对齐的起点，再把两头多出来的还掉。
-    pub(crate) fn reserve() -> io::Result<Self> {
+    pub fn reserve() -> io::Result<Self> {
         // SAFETY: 匿名、不可访问的新映射，不碰已有内存
         let raw = unsafe { libc::mmap(core::ptr::null_mut(), 2 * REGION, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0) };
         if raw == libc::MAP_FAILED {
@@ -64,7 +64,7 @@ impl Region {
 
     /// 把文件映射到第 `k` 个窗口（整个窗口一次映射；文件比窗口短，只访问已经延长过的部分）。
     /// SAFETY（调用方）：窗口 `k` 没被占用。
-    pub(crate) unsafe fn map_file(&self, k: usize, file: &File) -> io::Result<()> {
+    pub unsafe fn map_file(&self, k: usize, file: &File) -> io::Result<()> {
         use std::os::fd::AsRawFd;
         let at = self.window(k);
         // SAFETY: 见上；MAP_FIXED 只覆盖本区保留的这一段
@@ -73,7 +73,7 @@ impl Region {
     }
 
     /// 没有文件的公开堆：窗口换成共享的匿名内存（同一进程内可用）。SAFETY 同 [`Region::map_file`]。
-    pub(crate) unsafe fn map_anonymous(&self, k: usize) -> io::Result<()> {
+    pub unsafe fn map_anonymous(&self, k: usize) -> io::Result<()> {
         let at = self.window(k);
         // SAFETY: 同上
         let p = unsafe { libc::mmap(at.cast(), WINDOW, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_FIXED | libc::MAP_NORESERVE, -1, 0) };
@@ -81,14 +81,14 @@ impl Region {
     }
 
     /// 窗口不用了：换回不可访问的保留（地址仍归本区）。SAFETY（调用方）：之后没人再访问这个窗口。
-    pub(crate) unsafe fn unmap(&self, k: usize) {
+    pub unsafe fn unmap(&self, k: usize) {
         let at = self.window(k);
         // SAFETY: 见上
         unsafe { libc::mmap(at.cast(), WINDOW, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED | libc::MAP_NORESERVE, -1, 0) };
     }
 
     /// 把文件延长到至少覆盖 `[offset, offset + len)`（只会变长；多个线程同时调也安全）。
-    pub(crate) fn commit(file: &File, offset: usize, len: usize) -> io::Result<()> {
+    pub fn commit(file: &File, offset: usize, len: usize) -> io::Result<()> {
         use std::os::fd::AsRawFd;
         let (offset, len) = (i64::try_from(offset).expect("窗口内偏移"), i64::try_from(len).expect("窗口内长度"));
         // SAFETY: 只改文件长度与分配
@@ -111,26 +111,26 @@ impl Region {
         Err(_) => panic!("区的大小 / 对齐不合法"),
     };
 
-    pub(crate) fn reserve() -> io::Result<Self> {
+    pub fn reserve() -> io::Result<Self> {
         // SAFETY: 大小非零
         let p = unsafe { std::alloc::alloc_zeroed(Self::LAYOUT) };
         Ok(Self { base: NonNull::new(p).unwrap_or_else(|| std::alloc::handle_alloc_error(Self::LAYOUT)) })
     }
 
-    pub(crate) unsafe fn map_file(&self, _: usize, _: &File) -> io::Result<()> {
+    pub unsafe fn map_file(&self, _: usize, _: &File) -> io::Result<()> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 
-    pub(crate) unsafe fn map_anonymous(&self, _: usize) -> io::Result<()> {
+    pub unsafe fn map_anonymous(&self, _: usize) -> io::Result<()> {
         Ok(())
     }
 
-    pub(crate) unsafe fn unmap(&self, k: usize) {
+    pub unsafe fn unmap(&self, k: usize) {
         // SAFETY: 窗口在区内；之后没人再访问
         unsafe { self.window(k).write_bytes(0, WINDOW) };
     }
 
-    pub(crate) fn commit(_: &File, _: usize, _: usize) -> io::Result<()> {
+    pub fn commit(_: &File, _: usize, _: usize) -> io::Result<()> {
         Ok(())
     }
 }

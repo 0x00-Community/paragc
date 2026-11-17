@@ -9,7 +9,7 @@ use crate::lockfree::SegVec;
 use crate::block::Block;
 use crate::header::Header;
 
-pub(crate) struct Copier {
+pub struct Copier {
     /// 可搬入的块（只在本轮回收期间有效）
     targets: *const Injector<Block>,
     /// 全部块表：新开的块登记进去，本轮清扫会扫到
@@ -38,12 +38,12 @@ impl Drop for Copier {
 unsafe impl Send for Copier {}
 
 impl Copier {
-    pub(crate) fn new(targets: &Injector<Block>, blocks: &SegVec<Block>, total: &AtomicUsize, last: u32, epoch: u32) -> Self {
+    pub fn new(targets: &Injector<Block>, blocks: &SegVec<Block>, total: &AtomicUsize, last: u32, epoch: u32) -> Self {
         Self { targets, blocks, last, epoch, block: None, line: 0, cursor: null_mut(), limit: null_mut(), moved: 0, total }
     }
 
     /// 把 `from` 整个抄到新地方，返回新头。SAFETY（调用方）：本线程认领了 `from`，它是块里的小对象。
-    pub(crate) unsafe fn copy(&mut self, from: *const Header) -> *const Header {
+    pub unsafe fn copy(&mut self, from: *const Header) -> *const Header {
         // SAFETY: from 有效
         let bytes = unsafe { &*from }.bytes();
         let to = self.alloc(bytes);

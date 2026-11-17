@@ -4,9 +4,9 @@ use core::time::Duration;
 
 /// 一个进程：进程号 + 启动时间（开机以来的时钟滴答，`/proc/<pid>/stat` 第 22 个字段）。
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Process {
-    pub(crate) pid: u32,
-    pub(crate) start: u64,
+pub struct Process {
+    pub pid: u32,
+    pub start: u64,
 }
 
 /// `/proc/<pid>/stat` 里右括号之后：第 3 个字段（状态）是第 0 个，第 22 个字段（启动时间）是第 19 个
@@ -15,7 +15,7 @@ const START_FIELD: usize = 19;
 
 impl Process {
     /// 本进程。
-    pub(crate) fn current() -> Self {
+    pub fn current() -> Self {
         let pid = std::process::id();
         Self { pid, start: Self::stat(pid).map_or(0, |(_, start)| start) }
     }
@@ -36,7 +36,7 @@ impl Process {
     }
 
     /// 还活着：/proc 里有它、不是僵尸、启动时间对得上。启动时间记成 0（还在登记，或读不到 /proc）时一律当活着。
-    pub(crate) fn alive(self) -> bool {
+    pub fn alive(self) -> bool {
         if self.start == 0 || cfg!(miri) {
             return true;
         }
@@ -45,7 +45,7 @@ impl Process {
 }
 
 /// 共享内存上的 32 位字当 futex 用（不带 FUTEX_PRIVATE_FLAG，跨进程有效）。Miri 下退化成让出时间片。
-pub(crate) trait FutexWord {
+pub trait FutexWord {
     /// 字还等于 `expected` 就睡，最多 `timeout`（醒来不保证字变了，调用方自己再查）。
     fn wait(&self, expected: u32, timeout: Duration);
     /// 叫醒在这个字上睡的全部线程（任何进程里的）。

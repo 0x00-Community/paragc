@@ -16,7 +16,7 @@ struct Cell<T> {
 }
 
 /// 只追加的分段向量：段一旦分配就不动，所以元素地址不变、`push` 与读可以并发，不加锁。
-pub(crate) struct SegVec<T> {
+pub struct SegVec<T> {
     segments: [AtomicPtr<Cell<T>>; SEGMENTS],
     /// 领出去的格子数（含还没写完的）
     len: AtomicUsize,
@@ -72,7 +72,7 @@ impl<T> SegVec<T> {
     }
 
     /// 追加，返回下标。
-    pub(crate) fn push(&self, value: T) -> usize {
+    pub fn push(&self, value: T) -> usize {
         let i = self.len.fetch_add(1, Ordering::AcqRel);
         let (k, at) = Self::locate(i);
         // SAFETY: 段有 capacity(k) 个格子；下标 i 只归本线程写
@@ -83,28 +83,28 @@ impl<T> SegVec<T> {
         i
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.len.load(Ordering::Acquire)
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// 第 `i` 个；还没写完返回 None。
-    pub(crate) fn get(&self, i: usize) -> Option<&T> {
+    pub fn get(&self, i: usize) -> Option<&T> {
         let cell = self.cell(i)?;
         // SAFETY: ready 之后值已初始化、不再改
         cell.ready.load(Ordering::Acquire).then(|| unsafe { (*cell.value.get()).assume_init_ref() })
     }
 
     /// 已经写完的元素（跳过还在写的）。
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
         (0..self.len()).filter_map(|i| self.get(i))
     }
 
     /// 独占时取走全部元素，容器变空（段保留下来接着用）。
-    pub(crate) fn take(&mut self) -> Vec<T> {
+    pub fn take(&mut self) -> Vec<T> {
         let n = core::mem::replace(self.len.get_mut(), 0);
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
@@ -147,7 +147,7 @@ struct Node<T> {
 }
 
 /// 只压入、整体取走的无锁链（Treiber 栈的头只被换成空，所以没有 ABA）。
-pub(crate) struct PushList<T> {
+pub struct PushList<T> {
     head: AtomicPtr<Node<T>>,
 }
 
@@ -163,7 +163,7 @@ impl<T> Default for PushList<T> {
 }
 
 impl<T> PushList<T> {
-    pub(crate) fn push(&self, value: T) {
+    pub fn push(&self, value: T) {
         let node = Box::into_raw(Box::new(Node { value, next: null_mut() }));
         let mut head = self.head.load(Ordering::Acquire);
         loop {
@@ -177,7 +177,7 @@ impl<T> PushList<T> {
     }
 
     /// 取走全部（后压入的在前）。
-    pub(crate) fn take(&self) -> Vec<T> {
+    pub fn take(&self) -> Vec<T> {
         let mut p = self.head.swap(null_mut(), Ordering::AcqRel);
         let mut out = Vec::new();
         while !p.is_null() {

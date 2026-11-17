@@ -12,6 +12,7 @@ use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_utils::{Backoff, CachePadded};
 
+use crate::trace::TracerInternal;
 use crate::lockfree::SegVec;
 
 use crate::block::Block;
@@ -21,7 +22,7 @@ use crate::roots::RootTable;
 use crate::trace::Tracer;
 use crate::workers::Pool;
 
-pub(crate) struct Marking<'g> {
+pub struct Marking<'g> {
     /// 每个工号一个本地队列，由那个工号的线程取走（只取一次）
     locals: Vec<CachePadded<UnsafeCell<Option<Worker<usize>>>>>,
     stealers: Vec<Stealer<usize>>,
@@ -45,7 +46,7 @@ pub(crate) struct Marking<'g> {
 unsafe impl Sync for Marking<'_> {}
 
 impl<'g> Marking<'g> {
-    pub(crate) fn new(workers: usize, epoch: u32, grey: &'g Injector<usize>) -> Self {
+    pub fn new(workers: usize, epoch: u32, grey: &'g Injector<usize>) -> Self {
         let locals: Vec<Worker<usize>> = (0..workers).map(|_| Worker::new_lifo()).collect();
         let stealers = locals.iter().map(Worker::stealer).collect();
         Self {
@@ -63,33 +64,33 @@ impl<'g> Marking<'g> {
     }
 
     /// 并发标记：给引用计数登记队列。
-    pub(crate) fn logging(mut self, log: &'g Injector<usize>) -> Self {
+    pub fn logging(mut self, log: &'g Injector<usize>) -> Self {
         self.log = Some(log);
         self
     }
 
     /// 一起回收几个堆：追踪到的 Far 报到 `group`。
-    pub(crate) fn grouping(mut self, group: &'g Injector<(usize, usize)>) -> Self {
+    pub fn grouping(mut self, group: &'g Injector<(usize, usize)>) -> Self {
         self.group = Some(group);
         self
     }
 
     /// 计数模式（年轻回收的晋升、停顿式完整回收的重新计数）。
-    pub(crate) fn counting(mut self, parity: Option<bool>) -> Self {
+    pub fn counting(mut self, parity: Option<bool>) -> Self {
         self.count = parity;
         self
     }
 
     /// 疏散回收：每个工人带一个复制缓冲，候选块里被追踪到的对象搬进 `targets` 里的块（不够就开新块登记进 `blocks`）；
     /// 根由 0 号工人重定位。`last` 是上次完成的纪元（空行判定）。
-    pub(crate) fn evacuating(mut self, roots: &'g RootTable, targets: &Injector<Block>, blocks: &SegVec<Block>, moved: &AtomicUsize, last: u32) -> Self {
+    pub fn evacuating(mut self, roots: &'g RootTable, targets: &Injector<Block>, blocks: &SegVec<Block>, moved: &AtomicUsize, last: u32) -> Self {
         self.copiers = (0..self.locals.len()).map(|_| CachePadded::new(UnsafeCell::new(Some(Copier::new(targets, blocks, moved, last, self.epoch))))).collect();
         self.roots = Some(roots);
         self
     }
 
     /// 标记根（顺带写行标记），需要追踪的放进灰队列。
-    pub(crate) fn seed(grey: &Injector<usize>, roots: &[*const Header], epoch: u32) {
+    pub fn seed(grey: &Injector<usize>, roots: &[*const Header], epoch: u32) {
         let seed = Worker::new_lifo();
         let mut t = Tracer::new(&seed, epoch, None);
         for &root in roots {
@@ -101,7 +102,7 @@ impl<'g> Marking<'g> {
     }
 
     /// 年轻回收：记忆集里的槽（地址）当前指向的对象当作根（年轻的标上、进灰队列；老的碰到就停）。
-    pub(crate) fn seed_slots(grey: &Injector<usize>, slots: &[usize], epoch: u32) {
+    pub fn seed_slots(grey: &Injector<usize>, slots: &[usize], epoch: u32) {
         let seed = Worker::new_lifo();
         let mut t = Tracer::new(&seed, epoch, None);
         for &slot in slots {
@@ -118,7 +119,7 @@ impl<'g> Marking<'g> {
     }
 
     /// 从灰队列出发标记，直到全部工人空闲。
-    pub(crate) fn run(&self, pool: &Pool) {
+    pub fn run(&self, pool: &Pool) {
         pool.run(self.locals.len(), |me| self.work(me));
     }
 

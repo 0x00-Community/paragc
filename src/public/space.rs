@@ -20,14 +20,14 @@ const PROLOGUE: usize = 3 * size_of::<u64>();
 const MARKER_PREFIX: &str = ".paragc-";
 
 
-pub(crate) struct Space {
+pub struct Space {
     region: Region,
     /// 窗口占用位图
     used: AtomicU64,
 }
 
 impl Space {
-    pub(crate) fn region(&self) -> &Region {
+    pub fn region(&self) -> &Region {
         &self.region
     }
 
@@ -41,7 +41,7 @@ impl Space {
         (0..WINDOWS).find(|&k| self.claim(k))
     }
 
-    pub(crate) fn release(&self, k: usize) {
+    pub fn release(&self, k: usize) {
         self.used.fetch_and(!(1 << k), Ordering::AcqRel);
     }
 }
