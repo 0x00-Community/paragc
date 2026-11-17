@@ -15,7 +15,7 @@ use crate::gc::Invariant;
 use crate::header::Core;
 use crate::{Trace, Tracer};
 
-use super::heap::{Inner, PublicHeap, PublicMutator};
+use super::heap::{HEAP_HOLDER, Inner, PublicHeap, PublicMutator};
 use super::region::Region;
 
 /// 公开堆的对象头（16 B）：两种堆共用的标记字 / 信息字，加类型号。
@@ -240,6 +240,68 @@ unsafe impl<T: Send + Sync> Shared for PublicSlot<'_, T> {
     }
 }
 
+/// 公开堆 A（品牌 `'a`）对象里指向另一个公开堆 B 的对象的引用：存目标的公开偏移，直接指过去，不复制。
+///
+/// 写入时在 B 的入口表登记一项、持有方记作「堆 A」，所以 B 单独回收时它是根（回收 B 的进程不需要能打开 A）；
+/// A 单独回收不跟进 B。跨堆的环、以及已经不用的登记，由 [`PublicHeap::collect_group`] 收。读要带 B 的 mutator。
+/// 品牌 `'a` 保证它只能放进 A 的对象里（登记的持有方才对）。
+#[repr(transparent)]
+pub struct PublicRef<'a, B: PublicBrand> {
+    off: AtomicU64,
+    _brand: PhantomData<(HolderBrand<'a>, fn() -> B)>,
+}
+
+/// 持有方堆的品牌：对 `'a` 不变；用 fn 指针形式是为了能跨线程（[`Invariant`] 用的 Cell 不行）
+type HolderBrand<'a> = fn(&'a ()) -> &'a ();
+
+impl<B: PublicBrand> Default for PublicRef<'_, B> {
+    fn default() -> Self {
+        Self { off: AtomicU64::new(0), _brand: PhantomData }
+    }
+}
+
+impl<'a, B: PublicBrand> PublicRef<'a, B> {
+    /// 指向 `gc`（在 `target` 堆里）的新引用，放进 `holder` 堆的对象里。
+    pub fn to<'b>(holder: &PublicMutator<'a>, target: &PublicMutator<'b>, gc: PublicGc<'b, B::Of<'b>>) -> Self {
+        let r = Self::default();
+        r.set(holder, target, Some(gc));
+        r
+    }
+
+    /// 改指向（`None` 清空）。旧值的登记留到下一次一起回收再还。
+    pub fn set<'b>(&self, holder: &PublicMutator<'a>, target: &PublicMutator<'b>, v: Option<PublicGc<'b, B::Of<'b>>>) {
+        assert!(holder.index() != target.index(), "同一个公开堆里的边用 PublicSlot");
+        let off = v.map_or(0, PublicGc::offset);
+        if off != 0 {
+            target.register(off, HEAP_HOLDER | u32::try_from(holder.index()).expect("堆号"));
+        }
+        self.off.store(off, Ordering::Release);
+    }
+
+    /// 取目标对象；`target` 必须是目标堆的 mutator。
+    pub fn get<'b>(&self, target: &PublicMutator<'b>) -> Option<PublicGc<'b, B::Of<'b>>> {
+        let off = self.off.load(Ordering::Acquire);
+        if off == 0 {
+            return None;
+        }
+        assert!(Inner::heap_of(off) == Some(target.index()), "这个 PublicRef 不指向这个堆");
+        // SAFETY: 目标堆的入口保活它（登记在写入时、一起回收时重建），公开堆不搬对象；target 证明在目标堆的 mutate 里
+        Some(unsafe { PublicGc::from_data(target.at(off)) })
+    }
+
+    /// 指向 `heap` 里的对象。
+    pub fn points_into(&self, heap: &PublicHeap) -> bool {
+        Inner::heap_of(self.off.load(Ordering::Acquire)) == Some(heap.id())
+    }
+}
+
+// SAFETY: 它本身就是一个指针槽（回收时跨窗口的边由组外 / 组内规则处理）
+unsafe impl<B: PublicBrand> Shared for PublicRef<'_, B> {
+    fn edges(map: &mut EdgeMap, at: u32) {
+        map.edge(at);
+    }
+}
+
 /// 把带 `'p` 的公开堆类型换个品牌：[`Public<B>`] 不带生命周期，取出来时再套上当次 mutate 的 `'p`。用 [`public_brand!`](crate::public_brand) 声明。
 pub trait PublicBrand {
     type Of<'p>: Shared + 'p;
@@ -293,6 +355,17 @@ impl<B: PublicBrand> Public<B> {
     /// 入口号：在每个映射这个堆的地方都一样，别处可以用 [`PublicMutator::find`] 凭它拿到同一个对象。
     pub fn index(&self) -> u32 {
         self.entry
+    }
+
+    /// 把这个入口变成不归任何进程的根，返回入口号：本进程退出（或被杀）也不还，主进程重启后凭入口号
+    /// （[`PublicMutator::find`]）接着用；不要了用 [`PublicMutator::release`] 还掉。
+    pub fn persist(self) -> u32 {
+        let me = core::mem::ManuallyDrop::new(self);
+        me.heap.disown_entry(me.entry);
+        let entry = me.entry;
+        // SAFETY: me 不会再析构，Arc 只在这里取出一次、随即放掉
+        drop(unsafe { core::ptr::read(&raw const me.heap) });
+        entry
     }
 }
 

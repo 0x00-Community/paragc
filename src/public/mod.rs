@@ -8,5 +8,5 @@ mod region;
 mod space;
 
 pub use heap::{PublicHeap, PublicMutator, PublicStats};
-pub use ptr::{EdgeMap, Public, PublicBrand, PublicGc, PublicSlot, Shared};
+pub use ptr::{EdgeMap, Public, PublicBrand, PublicGc, PublicRef, PublicSlot, Shared};
 pub use space::PublicSpace;

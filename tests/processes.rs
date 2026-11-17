@@ -25,6 +25,12 @@ const ROUNDS: &str = "PARAGC_ROUNDS";
 const READY: &str = "PARAGC-READY";
 /// 子进程跑完时打印这个前缀 + 链长
 const DONE: &str = "PARAGC-LEN ";
+/// 建堆的子进程打印这个前缀 + 链头的入口号 + 堆号
+const CREATED: &str = "PARAGC-CREATED ";
+/// 建堆的子进程：调 persist 后正常退出（不设就一直等着被杀）
+const PERSIST: &str = "PARAGC_PERSIST";
+/// 建堆的子进程挂的链长
+const CREATED_LEN: u64 = 5_000;
 /// 每轮在链头压入的节点数
 const PUSH: u64 = 200;
 /// 杀掉的进程最迟这么久内要被收拾、回收要能做完
@@ -62,6 +68,8 @@ enum Role {
     Hold,
     /// 不停地回收，直到被杀
     CollectForever,
+    /// 在 [`PATH`] 建一个堆、挂一条 [`CREATED_LEN`] 节点的链，打印入口号与堆号；然后 persist 后退出，或一直等着被杀
+    Create,
 }
 
 impl Role {
@@ -71,6 +79,7 @@ impl Role {
             Self::ChurnForever => "churn-forever",
             Self::Hold => "hold",
             Self::CollectForever => "collect-forever",
+            Self::Create => "create",
         }
     }
 }
@@ -79,7 +88,7 @@ impl FromStr for Role {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, String> {
-        [Self::Churn, Self::ChurnForever, Self::Hold, Self::CollectForever].into_iter().find(|r| r.name() == s).ok_or_else(|| format!("未知的子进程角色 {s}"))
+        [Self::Churn, Self::ChurnForever, Self::Hold, Self::CollectForever, Self::Create].into_iter().find(|r| r.name() == s).ok_or_else(|| format!("未知的子进程角色 {s}"))
     }
 }
 
@@ -157,18 +166,7 @@ impl Parent {
 
     /// 起一个子进程。
     fn spawn(&self, role: Role, chain: usize, rounds: u64) -> Kid {
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "child", "--nocapture", "--test-threads", "1", "-q"])
-            .env(ROLE, role.name())
-            .env(PATH, &self.path)
-            .env(ANCHOR, self.anchor.index().to_string())
-            .env(CHAIN, chain.to_string())
-            .env(ROUNDS, rounds.to_string())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let out = BufReader::new(child.stdout.take().unwrap());
-        Kid { child, out }
+        Kid::spawn(role, &self.path, self.anchor.index(), chain, rounds, false)
     }
 
     /// 等 `f` 成立，最多 [`DEADLINE`]。
@@ -188,6 +186,25 @@ struct Kid {
 }
 
 impl Kid {
+    fn spawn(role: Role, path: &Path, anchor: u32, chain: usize, rounds: u64, persist: bool) -> Self {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        if persist {
+            cmd.env(PERSIST, "1");
+        }
+        let mut child = cmd
+            .args(["--exact", "child", "--nocapture", "--test-threads", "1", "-q"])
+            .env(ROLE, role.name())
+            .env(PATH, path)
+            .env(ANCHOR, anchor.to_string())
+            .env(CHAIN, chain.to_string())
+            .env(ROUNDS, rounds.to_string())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = BufReader::new(child.stdout.take().unwrap());
+        Self { child, out }
+    }
+
     /// 读输出直到某一行以 `prefix` 开头，返回这一行剩下的部分。
     fn line(&mut self, prefix: &str) -> String {
         let mut line = String::new();
@@ -222,6 +239,28 @@ fn child() {
     let path = PathBuf::from(env(PATH));
     let (chain, rounds): (usize, u64) = (env(CHAIN).parse().unwrap(), env(ROUNDS).parse().unwrap());
     let space = PublicSpace::reserve().unwrap();
+    if let Role::Create = role {
+        let heap = space.create(&path, THREADS).unwrap();
+        let chain = heap.mutate(|m| {
+            let mut top = None;
+            for value in 0..CREATED_LEN {
+                top = Some(m.alloc(Node { value, next: top.into() }));
+            }
+            m.root::<NodeB>(top.unwrap())
+        });
+        if std::env::var(PERSIST).is_ok() {
+            // 链头变成不归任何进程的根；堆文件留着。正常退出：挂接槽空出
+            println!("{CREATED}{} {}", chain.persist(), heap.id());
+            heap.persist();
+            return;
+        }
+        // 被 kill -9（主进程崩溃）：它的句柄持有的入口在下一次回收时还掉
+        println!("{CREATED}{} {}", chain.index(), heap.id());
+        println!("{READY}");
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
     let heap = space.open(Path::new(&path), THREADS).unwrap();
     let anchor: Public<AnchorB> = heap.mutate(|m| m.find(env(ANCHOR).parse().unwrap())).expect("凭入口号找到锚");
     match role {
@@ -269,7 +308,109 @@ fn child() {
                 heap.collect();
             }
         }
+        Role::Create => unreachable!("上面已经处理"),
     }
+}
+
+/// 一个单独的目录（里面的堆号标记只归这条测试）。
+struct Dir(PathBuf);
+
+impl Dir {
+    fn new(name: &str) -> Self {
+        let dir = PathBuf::from(format!("/dev/shm/paragc-dir-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        Self(dir)
+    }
+
+    fn file(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for Dir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// 读建堆子进程打印的（链头入口号, 堆号）。
+fn created(kid: &mut Kid) -> (u32, usize) {
+    let line = kid.line(CREATED);
+    let mut parts = line.split_whitespace().map(|p| p.parse::<u64>().unwrap());
+    (u32::try_from(parts.next().unwrap()).unwrap(), usize::try_from(parts.next().unwrap()).unwrap())
+}
+
+/// 打开 `path` 的堆，凭入口号找到链、核对 0..CREATED_LEN，回收后核对存活字节数与挂接数。
+fn reopen_and_check(path: &Path, index: u32) -> PublicHeap {
+    let space = PublicSpace::reserve().unwrap();
+    let heap = space.open(path, THREADS).unwrap();
+    let chain: Public<NodeB> = heap.mutate(|m| m.find(index)).expect("建堆的进程挂的链还在");
+    let sum = heap.mutate(|m| {
+        let (mut s, mut cur) = (0, Some(chain.get(m)));
+        while let Some(n) = cur {
+            s += n.value;
+            cur = n.next.get(m);
+        }
+        s
+    });
+    assert_eq!(sum, CREATED_LEN * (CREATED_LEN - 1) / 2);
+    heap.collect();
+    assert_eq!(heap.attached(), 1, "建堆的进程已经不在，它的挂接被收拾");
+    assert_eq!(heap.stats().live, NODE * usize::try_from(CREATED_LEN).unwrap(), "链还活着（我们的句柄）");
+    drop(chain);
+    heap
+}
+
+#[test]
+fn restart_after_the_creator_is_gone() {
+    let dir = Dir::new("restart");
+    // 建堆的进程被 kill -9（主进程崩溃）：文件留着，别的进程打开接着用；它持有的入口在回收时还掉
+    let crashed = dir.file("crashed");
+    let mut kid = Kid::spawn(Role::Create, &crashed, 0, 0, 0, false);
+    let (index, _) = created(&mut kid);
+    kid.line(READY);
+    kid.kill();
+    let heap = reopen_and_check(&crashed, index);
+    heap.collect();
+    assert_eq!(heap.stats().live, 0, "它挂的链只剩它自己的入口，进程死了就收掉");
+    drop(heap);
+    assert!(crashed.exists(), "打开的一方不删文件");
+    // 建堆的进程调过 persist 后正常退出：文件与堆号标记都留着
+    let kept = dir.file("kept");
+    let mut kid = Kid::spawn(Role::Create, &kept, 0, 0, 0, true);
+    let (index, number) = created(&mut kid);
+    assert!(kid.child.wait().unwrap().success());
+    assert!(kept.exists() && dir.file(&format!(".paragc-{number}")).exists());
+    let heap = reopen_and_check(&kept, index);
+    // 不归任何进程的根要手动还；还掉以后链就收掉
+    assert!(heap.mutate(|m| m.release(index)));
+    assert!(!heap.mutate(|m| m.release(index)), "还过一次就空了");
+    heap.collect();
+    assert_eq!(heap.stats().live, 0);
+}
+
+#[test]
+fn heap_numbers_do_not_collide_across_processes() {
+    let dir = Dir::new("numbers");
+    let first = dir.file("first");
+    let mut kid = Kid::spawn(Role::Create, &first, 0, 0, 0, true);
+    let (_, taken) = created(&mut kid);
+    assert!(kid.child.wait().unwrap().success());
+    // 本进程在同一个目录建堆：堆号不能和别的进程建的撞，两个堆在本进程能同时打开
+    let space = PublicSpace::reserve().unwrap();
+    let second = space.create(dir.file("second"), THREADS).unwrap();
+    assert_ne!(second.id(), taken);
+    let reopened = space.open(&first, THREADS).unwrap();
+    assert_eq!(reopened.id(), taken);
+    // 堆文件没了，它的标记就是过期的：号收回重用
+    drop(reopened);
+    std::fs::remove_file(&first).unwrap();
+    let third = space.create(dir.file("third"), THREADS).unwrap();
+    assert_eq!(third.id(), taken, "过期标记的堆号收回重用");
+    drop((second, third));
+    let left: Vec<_> = std::fs::read_dir(&dir.0).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert!(left.is_empty(), "建堆的句柄析构后文件与标记都删了：{left:?}");
 }
 
 #[test]
