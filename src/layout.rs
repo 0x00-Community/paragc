@@ -81,6 +81,9 @@ pub const FRAG_NUM: usize = 3;
 pub const FRAG_DEN: usize = 2;
 /// 回收后至少留着复用的全空块数
 pub const MIN_SPARE_BLOCKS: usize = 4;
+/// 上一次年轻回收存活的超过它领用的 NUM / DEN，这一次就不搬存活的年轻对象（原地晋升）
+pub const YOUNG_COPY_NUM: usize = 3;
+pub const YOUNG_COPY_DEN: usize = 5;
 /// [`Pages`] 的热池按最近几轮的领用定上限
 pub const WARM_CYCLES: usize = 4;
 /// 溢出分配领块时最多看几个可用块（找有放得下中对象的空洞的），都不行就开新块

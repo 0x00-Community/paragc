@@ -38,7 +38,7 @@ use crate::{Gc, Trace};
 use crate::handle::{GcInternal, Invariant, RawSlot, RootTable};
 #[cfg(target_os = "linux")]
 use crate::handle::{EdgeMap, Public, PublicBrand, PublicGc, PublicGcInternal, PublicInternal, Shared};
-use crate::layout::{BLOCK, Block, Pages, WARM_CYCLES, LINE, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, HEADER, Header, LARGE, MAX_EPOCH, MIN_SPARE_BLOCKS, MIN_TRIGGER, OVERFLOW_TRIES, FRAG_NUM, FRAG_DEN, YOUNG_PER_FULL, YOUNG_PER_FULL_RC};
+use crate::layout::{BLOCK, Block, Pages, WARM_CYCLES, YOUNG_COPY_DEN, YOUNG_COPY_NUM, LINE, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, HEADER, Header, LARGE, MAX_EPOCH, MIN_SPARE_BLOCKS, MIN_TRIGGER, OVERFLOW_TRIES, FRAG_NUM, FRAG_DEN, YOUNG_PER_FULL, YOUNG_PER_FULL_RC};
 #[cfg(target_os = "linux")]
 use crate::layout::{Core, State};
 #[cfg(target_os = "linux")]
@@ -110,6 +110,8 @@ pub struct Heap {
     recent: [usize; WARM_CYCLES],
     /// 这一轮回收是 [`Heap::collect_if_needed`] 发起的（按分配量自动回收）：只有这种留 [`Pages`] 热池
     automatic: bool,
+    /// 上一次回收是年轻回收时它之前领用的字节数（清扫完存活的年轻字节除以它就是存活率）；完整回收后为 0
+    young_allocated: usize,
     /// 上次回收疏散的块数 / 字节数
     evacuated: (usize, usize),
     /// 给 [`Heap::mutate`] 复用的分配缓冲
@@ -198,6 +200,7 @@ impl Heap {
             roots: Arc::default(),
             allocated: AtomicUsize::new(0),
             recent: [0; WARM_CYCLES],
+            young_allocated: 0,
             automatic: false,
             evacuated: (0, 0),
             spare: AtomicPtr::new(null_mut()),
@@ -506,12 +509,12 @@ impl Heap {
             }
         }
         let epoch = self.epoch;
+        let mode = self.young_mode();
         let remembered = Self::drain(&self.remembered);
         let counting = *self.rc_valid.get_mut();
         let parity = *self.rc_parity.get_mut();
         let pool = self.pool.get_or_init(|| Pool::new(self.threads));
         let workers = pool.sized(self.blocks.len() + self.large.len());
-        let mode = YoungEvacuation::from(*self.young_evacuation.get_mut());
         // 晋升的对象被扫描时，它的每条边 +1（年轻对象的边从晋升起才计数）
         let mark = Marking::new(workers, epoch, &self.grey).counting(counting.then_some(parity));
         let moved = AtomicUsize::new(0);
@@ -584,10 +587,20 @@ impl Heap {
         self.warm_for_next_cycle(false);
         self.sweeper.start(epoch, young, large, spare, false);
         self.evacuated = (0, moved.into_inner());
+        self.young_allocated = *self.allocated.get_mut();
         *self.allocated.get_mut() = 0;
         self.collections += 1;
         self.young_collections += 1;
         self.young_since_full += 1;
+    }
+
+    /// 这一轮年轻回收怎么搬：按设定，但上一次年轻回收几乎全活下来（年轻对象多半要活一阵子，比如一批批建了又整批丢掉
+    /// 的对象）时原地晋升——搬它们只是把刚分配的又复制一遍，块也不碎（活的挤在一起）；碎片留给完整回收疏散。
+    /// 要在上一轮清扫完之后调（存活字节数才全）。
+    fn young_mode(&mut self) -> YoungEvacuation {
+        let allocated = core::mem::take(&mut self.young_allocated);
+        let mode = YoungEvacuation::from(*self.young_evacuation.get_mut());
+        if allocated > 0 && self.sweeper.live() * YOUNG_COPY_DEN > allocated * YOUNG_COPY_NUM { YoungEvacuation::Off } else { mode }
     }
 
     /// 取空一个队列。
@@ -708,6 +721,7 @@ impl Heap {
     /// 完整回收收尾（独占）：计数可信了；全部块交给清扫器（疏散时新开的块也已登记），清扫好的可用块之后再一个个放回
     /// available（它们本来就都在 blocks 里）。`evacuated`：疏散的块数与字节数。
     fn end_full(&mut self, epoch: u32, evacuated: (usize, usize)) {
+        self.young_allocated = 0;
         *self.rc_valid.get_mut() = true;
         let blocks = self.blocks.take();
         let large = self.large.take();
