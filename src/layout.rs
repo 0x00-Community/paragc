@@ -553,6 +553,31 @@ impl Block {
         false
     }
 
+    /// 预取块里每个对象头所在的缓存行（清扫逐个读头，块一般不在缓存里：不预取每个对象都是一次未命中，
+    /// 而且下一个头的地址要等位图里的下一位算出来，乱序执行也叠不起来）。
+    #[cfg_attr(not(target_arch = "x86_64"), expect(clippy::unused_self, reason = "只在 x86-64 上预取"))]
+    fn prefetch_headers(self) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            /// 缓存行
+            const LINE_BYTES: usize = 64;
+            let mut last = usize::MAX;
+            for (w, word) in self.meta().starts.iter().enumerate() {
+                let mut bits = word.load(Ordering::Relaxed);
+                while bits != 0 {
+                    let bit = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let at = (w * BITS + bit) * GRANULE / LINE_BYTES;
+                    if at != last {
+                        last = at;
+                        // SAFETY: 预取不访问内存，地址在块里
+                        unsafe { core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(self.base().wrapping_add(at * LINE_BYTES).cast()) };
+                    }
+                }
+            }
+        }
+    }
+
     /// 从第 `from` 行起的第一个空洞（一段连续空行），返回 `[起, 止)` 行号。
     /// 空行 = 行标记早于上次完成的纪元 `epoch`：并发标记期间标记方会把活行写成更新的纪元，那些也不是空行。
     pub fn hole(self, from: usize, epoch: u32) -> Option<(usize, usize)> {
@@ -568,6 +593,7 @@ impl Block {
     /// SAFETY（调用方）：标记已经做完，没有 mutator 在用这个块；块里对象的头是 `K` 认识的那种。
     pub unsafe fn sweep<K: Finalize>(self, epoch: u32, mut deferred: Option<&mut Vec<usize>>) -> (State, usize) {
         let mut live = 0;
+        self.prefetch_headers();
         for (w, word) in self.meta().starts.iter().enumerate() {
             let mut bits = word.load(Ordering::Relaxed);
             let mut dead = 0u64;
