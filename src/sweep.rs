@@ -116,7 +116,7 @@ impl Sweeper {
         let i = self.next_block.fetch_add(1, Ordering::AcqRel);
         let b = *self.blocks.get(i)?;
         // SAFETY: 本轮标记已完成；这个块只分给了这一次领用，扫完前没人分配进去
-        let (state, live) = unsafe { b.sweep(self.epoch) };
+        let (state, live) = unsafe { b.sweep::<Header>(self.epoch) };
         self.live.fetch_add(live, Ordering::Relaxed);
         let outcome = match state {
             State::Full => Outcome::Full(b),

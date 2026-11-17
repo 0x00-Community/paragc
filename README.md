@@ -38,6 +38,7 @@ collection marks and sweeps on every core.
 | 🏃 **Parallel collection** | A persistent pool per heap (threads park between collections). Marking: one crossbeam work-stealing deque per worker, stealing in batches. Sweeping, destructors included: blocks handed out in batches to the same workers. |
 | 🏷️ **Branded handles** | `Gc<'gc, T>` cannot escape the `mutate` closure. `Root<B>` handles carry no lifetime and can be stored anywhere and sent across threads. |
 | 🔗 **References between heaps** | `Far<'a, B>` lets an object in one heap point straight at an object in another heap of the same process: no copy, no indirection. Each heap still collects on its own; `Heap::collect_group` traces several heaps together to reclaim cycles that span them. |
+| 🗄️ **Public heaps** (Linux) | A `PublicHeap` lives in a file on a shared-memory filesystem (`/dev/shm`, a tmpfs or hugetlbfs mount): everything — header, type table, entries, block table, blocks — is inside the file, at fixed offsets, and pointers are offsets, so the same heap can be mapped at different addresses (another address space today, another process next). The file starts empty and grows as it is used. Objects carry a type number instead of code, and collection follows the type's pointer map. Private heaps can hold `Public<B>` handles into it. |
 | 📦 **Opportunistic evacuation** | A stop-the-world collection moves the live objects out of sparse blocks while it marks (Immix defragmentation): one pass marks, copies and rewrites every edge. Concurrent marking never moves anything, so mutators need no read barrier. |
 | 🐣 **Young collections** | `Heap::collect_young` traces only objects allocated since the last collection, starting from the roots and the slots the write barrier logged, and sweeps only the blocks allocated into since; old objects are not touched. `collect_if_needed` runs young collections and a full one every few rounds (the first stage of LXR-style young-object reclamation). |
 | 🔢 **Reference counting** | Old objects carry a small reference count, maintained by the `Slot` write barrier (each slot logged once per round) and settled at young collections. The pause only applies increments and queues the decrements; `sweep_concurrently` frees objects whose count drops to zero on the pool, cascading, while mutators run, and their lines return to the allocator at the next pause. Tracing (a full collection) runs rarely, for cycles and objects whose count overflowed (LXR stages two and three). |
@@ -91,6 +92,9 @@ assert_eq!(sum, 999 * 1000 / 2);
 | Sweeping | Workers claim blocks in batches, walk the start bitmap, drop unmarked objects and classify each block as empty / recyclable / full. Spare empty blocks beyond a quarter of the heap go back to the system. |
 | Roots | Each `Root<B>` owns a slot in an append-only table; freed slot numbers are folded into a read-only array at collection time and claimed with an atomic cursor during `mutate`. |
 | References between heaps | Creating a `Far` (inside both heaps' `mutate`) claims a slot in the target heap's root table that also records the holder heap; finalizing the object that holds the `Far` (sweeping or a reference-count release) returns the slot. Collecting the target heap alone treats these entries as roots, so young collections, reference counting and concurrent marking need nothing new. Entries are pinned: before an evacuating collection marks anything, the blocks holding entry targets drop out of evacuation (and become copy targets), so a `Far` never needs rewriting. `collect_group` does not take entries held inside the group as roots: each heap marks from its own roots, a traced `Far` hands its target to the target heap (seeded with that heap's epoch), and the heaps take turns until no heap has grey objects left; entries held inside the group whose target stayed unmarked belong to dead holders and are cleared, so a later collection never seeds a freed object. |
+| Public heap layout | `PublicSpace::reserve` takes a range of addresses (address space only, no memory), aligned to its own size and cut into 16 GiB windows; public heap *k* is always mapped at window *k*. A window is laid out at fixed offsets: superblock, type table, pointer maps, the entry table, the block table, then 32 KiB blocks. The file is created empty (only the superblock page is written) and every part is extended with `fallocate` when first used — it only ever grows the file, so threads can race on it safely, and pages never written stay holes. |
+| Public heap objects | A 16-byte header: the same mark and info words as a private object (so blocks, lines and sweeping are shared code) plus a type number. `#[derive(Shared)]` requires `#[repr(C)]` and generates a pointer map; the first allocation of a type registers its key (type name, size and map, hashed) and map in the heap. A `PublicSlot` stores the target's offset from the start of the address range, so the same value is correct in every mapping; `get` and `set` take the `PublicMutator`, which knows this mapping's base. `alloc` rejects types with destructors at compile time. Objects over 8 KiB take a run of fresh blocks; when they die, the blocks become ordinary blocks. |
+| Public heap collection | The gate word is in the superblock, so mutators and collectors in every mapping of the heap exclude each other. `collect` raises the request, waits for every mapping's mutators to leave, marks in parallel from the entry table (reading each object's pointer map, never calling its code) and sweeps in parallel; it does not move objects. Free blocks and free entries are lock-free stacks inside the file (tagged heads against ABA). `Public::index` is the entry number, valid in every mapping; `PublicMutator::find` turns it into a new handle after checking that the object's type key matches. |
 | Stale buffers | A buffer remembers (heap, collection count); after a collection it starts over, because its block was re-classified. |
 | Concurrent marking | Start: finish the previous sweep (it judges by "mark ≠ that epoch", so it must end before the next marking stamps live objects with a newer one), raise a request bit in the gate word (top bit; low bits count threads inside `mutate`), wait until no mutator is inside, mark the roots grey, drop the request. paragc does not scan stacks, so the snapshot has to be taken when no mutator holds an unrooted `Gc`. Then mark on the pool. During marking, a `Slot` write marks the value it overwrites and puts it in the heap's grey queue (snapshot at the beginning), new objects get the marking epoch and their lines marked (black). A line is free when its mark is older than the last finished epoch, so lines the marker has just stamped are never handed out. `finish_marking` drains the grey queue in parallel. |
 | Concurrent sweeping | `finish_marking` hands every block and large object to the sweeper and returns. Claiming is an atomic cursor, so each block is swept exactly once by whoever claims it, before it is handed out: a mutator that needs a block first takes a swept one, otherwise claims an unswept block and sweeps it on the spot; `sweep_concurrently` sweeps the rest on the pool and waits for blocks others are still sweeping. New objects carry the last finished epoch, so allocations during sweeping are never taken for dead. `collect` = `finish_marking` + `sweep_concurrently`. |
@@ -121,6 +125,11 @@ Work-stealing deques and backoff come from [crossbeam](https://github.com/crossb
   holder heap's objects (its brand), and is read with the target heap's `Mutator` (`far.get(mb)`). It never changes;
   to point elsewhere, keep it in an object behind a `Slot` and replace that object. Edges within one heap use `Slot`.
 - Cycles that span heaps are reclaimed only by `Heap::collect_group`.
+- Public heaps are Linux only. Their types use `#[derive(Shared)]`: `#[repr(C)]`, only plain data, `PublicSlot`,
+  nested `Shared` types and fixed-size arrays, no destructor. Public heaps do not yet have concurrent marking, young
+  collections, reference counting or evacuation: `collect` is stop-the-world.
+- The handle that created a public heap (and every `Public` made through it) deletes the file when the last of them is
+  dropped; other mappings keep working.
 - A root released while a collection is running may keep its object alive until the next one.
 - `std` only.
 
@@ -146,9 +155,14 @@ Work-stealing deques and backoff come from [crossbeam](https://github.com/crossb
 | `far_targets_are_pinned_during_evacuation` | Sparse blocks, half of the survivors also held from another heap: the collection evacuates the other half, the held objects stay where they are (the root path and the `Far` see the same object), finalization exact |
 | `far_keeps_target_until_holder_dies` · `far_survives_holder_heap_drop_order` | A target with no root of its own survives full and young collections of its heap while the holder lives, and goes once the holder heap has finalized the holder; dropping the target heap first is safe |
 | `cross_heap_cycle_needs_group_collection` · `rings_over_eight_heaps` | Rings across 2 and 8 heaps survive collecting each heap alone; a group missing some of the heaps keeps them (outside holders are roots); the full group frees exactly the unrooted rings, the kept rings stay walkable |
+| `public_list_survives_and_garbage_is_reclaimed` · `pointer_map_covers_nested_fields_and_arrays` · `large_public_objects` | Public heaps: exact live bytes after collection, freed lines reused, pointer maps through nested fields and arrays, objects over 8 KiB intact and their blocks reused for small objects |
+| `file_starts_empty_and_grows` · `two_mappings_of_one_heap` | The file is one page after creation and grows only as used; one heap mapped at two base addresses: handles found by entry number (and refused on a type mismatch), 4 threads per mapping relinking while collections alternate between the mappings, the creator dropped first |
+| `private_heap_holds_public_handles` · `eight_threads_churn_public_heap` | A `Public` inside a private-heap object keeps its target alive until the private heap finalizes it; 8 threads pushing and popping chains while another collects, live bytes exact every round |
 | `eight_threads_relink_far_holders` | 8 threads × 8 heaps keep replacing holders that point into other heaps and reading them back, while another thread marks every heap concurrently; full, young and group collections in turn; every target finalized at the end, none early |
 
-All of them also run under Miri with both Stacked Borrows and Tree Borrows (scaled down under `cfg(miri)`).
+All of them also run under Miri with both Stacked Borrows and Tree Borrows (scaled down under `cfg(miri)`). Miri cannot
+map files, so under Miri the public address range is an ordinary allocation (4 windows of 16 MiB): the public-heap tests
+without a file run on it, and the two file tests are skipped.
 `-Zmiri-ignore-leaks` is needed because crossbeam-epoch's global collector still holds deferred garbage at exit; at
 4 collector threads per heap Stacked Borrows also reports a violation inside crossbeam-epoch itself, so the tests use 2
 under Miri; the two concurrent `gc` tests and `far_targets_are_pinned_during_evacuation` /
@@ -156,7 +170,7 @@ under Miri; the two concurrent `gc` tests and `far_targets_are_pinned_during_eva
 crossbeam-deque push), and are clean under Tree Borrows:
 
 ```sh
-cargo test --test gc -- --exact <name>          # tests/far.rs: --test far
+cargo test --test gc -- --exact <name>          # tests/far.rs: --test far · tests/public.rs: --test public
 MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-ignore-leaks" cargo +nightly miri test --test gc -- --exact <name>
 MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-ignore-leaks -Zmiri-tree-borrows" cargo +nightly miri test --test gc -- --exact <name>
 ```
@@ -185,7 +199,8 @@ Done: parallel stop-the-world collection, a persistent pool, concurrent marking,
 opportunistic evacuation, young collections, reference counting for old objects with decrements processed concurrently,
 full tracing run only every 16 young collections, concurrent marking that recounts, a cheaper single-threaded
 recount, and direct references between heaps of one process with group collection for cycles across them. Next: public
-heaps in shared memory that several processes attach to ([design](docs/cross-heap.zh-CN.md)). Other possible steps: a concurrent young collection, and a smaller `Slot` (it is two words to remember the
+heaps in shared memory, first in one process (done: layout, type maps, offsets, stop-the-world parallel collection),
+next attached by several processes ([design](docs/cross-heap.zh-CN.md)). Other possible steps: a concurrent young collection, and a smaller `Slot` (it is two words to remember the
 value last counted).
 
 ## 📜 License

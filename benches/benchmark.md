@@ -12,6 +12,7 @@ behind Blink), [gc-arena](https://crates.io/crates/gc-arena), [gc](https://crate
 | --- | --- |
 | Machine | Intel Core Ultra 7 356H, 16 cores (1 thread per core), Linux 7.0 |
 | Rust | 1.98.1, release profile |
+| paragc, public heap | public heaps in shared memory (cross-heap design P1), on top of `915355b`; file in `/dev/shm`; load 2.4 at the start |
 | paragc | 0.2.1 (commit `bb6c81c`: concurrent recount, cheaper single-threaded recount); the other collectors were measured with `5c4c5c5` |
 | cppgc | V8 15.2.124.1 through rusty_v8 (`v8` crate 152.2.0) |
 | Others | gc-arena 0.7.0, gc 0.5.1, dumpster 2.1.0 |
@@ -35,6 +36,7 @@ that the live tree still has exactly 2^depth − 1 nodes.
 | | Serial | Parallel | Collecting in `gcbench` |
 | --- | --- | --- | --- |
 | **paragc** | `Heap::new(1)` | `Heap::new(n)`: a persistent pool of n − 1 workers | `collect_if_needed` after every tree: young collections with reference counting, a full collection every 16 |
+| **paragc, public heap** | `PublicHeap` on a `/dev/shm` file, 1 collector thread | n collector threads | stop-the-world `collect` when allocation since the last collection exceeds 2 × max(live, 4 MiB) (no young collections or reference counting yet) |
 | **cppgc** | heap attached to an isolate (how Blink uses it), single-threaded platform plus `--single-threaded`; full collections through `request_garbage_collection_for_testing(Full)` | default platform with n worker threads | V8's own scheduling |
 | **cppgc, all flags** | as above | as above, plus `--parallel-marking --concurrent-marking --cppheap-concurrent-marking --cppheap-incremental-marking --concurrent-marking-max-worker-num=n` | V8's own scheduling |
 | **cppgc, detached** | heap not attached to an isolate, `collect_garbage_for_testing` | as above | paragc's trigger policy, by hand |
@@ -54,6 +56,7 @@ Wall ms (CPU ÷ wall); best of 5.
 | paragc, concurrent marking | 6.6 | 2.4 (3.0) | 1.5 (11.9) |
 | paragc, concurrent sweeping | 15.9 | 6.5 (4.0) | 2.8 (12.7) |
 | **paragc, concurrent marking + sweeping** | **0.03** | **0.03** | **0.05** |
+| paragc, public heap | 17.0 | 6.7 (3.9) | 3.3 (14.3) |
 | cppgc, attached to an isolate | 45.0 | 44.7 (1.0) | 43.4 (1.0) |
 | cppgc, all parallel / concurrent flags | 43.5 | 43.7 (1.0) | 43.0 (1.0) |
 | cppgc, detached heap | 42.5 | 42.7 (1.0) | 42.5 (1.0) |
@@ -66,6 +69,7 @@ Wall ms (CPU ÷ wall); best of 5.
 | | 1 thread | 4 threads | 16 threads |
 | --- | ---: | ---: | ---: |
 | **paragc** | **53.7** | **59.1** (1.2) | **67.3** (2.1) |
+| paragc, public heap | 67.8 | 55.1 (1.5) | 78.2 (2.0) |
 | cppgc, attached to an isolate | 119.2 | 95.3 (1.3) | 100.4 (1.3) |
 | cppgc, all parallel / concurrent flags | 117.4 | 94.9 (1.3) | 99.4 (1.3) |
 | cppgc, detached heap | 173.2 | 171.7 (1.0) | 173.0 (1.0) |
@@ -100,6 +104,10 @@ cppgc, gc-arena and rust-gc allow one thread per heap, so they have no entry her
   and sweeping still happen, on the pool and in mutators that sweep the blocks they take. In this benchmark no mutator
   runs during marking, so the grey queue is empty at the end and the remaining pause is bookkeeping proportional to the
   number of blocks; with mutators running, draining what the write barrier logged is added to it.
+- **Public heaps: shared memory costs little.** A full collection of the same tree in a public heap (a `/dev/shm` file,
+  offset pointers, tracing by pointer map) takes 17.0 ms on one thread against 22.4 ms for the private heap: its header is
+  16 bytes instead of 24 and it does not rebuild reference counts. GCBench is slower (67.8 ms against 53.7 ms) because
+  every public-heap collection is a full one; young collections and reference counting are not there yet.
 - **cppgc marks a full collection on one thread.** Attached or detached, with or without 16 worker threads and every
   parallel / concurrent marking flag, a forced full collection runs at CPU ÷ wall = 1.0 and takes about 43–45 ms. cppgc
   only uses other threads for background marking during the incremental collections V8 schedules itself (GCBench, about

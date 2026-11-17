@@ -7,7 +7,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
 
-use crate::header::Header;
+use crate::header::{Core, Header};
 use crate::layout::{BITS, BLOCK, GRANULE, GRANULES, LINE, LINES};
 
 #[repr(C)]
@@ -22,6 +22,19 @@ struct Meta {
     evacuate: AtomicBool,
     /// 在可用队列里（防止同一块进队两次）
     listed: AtomicBool,
+}
+
+/// 清扫时怎么析构死对象：私有堆调对象自己的析构函数，公开堆的对象没有析构。
+pub(crate) trait Finalize {
+    /// SAFETY（调用方）：`object` 是死对象的头，之后不再使用。
+    unsafe fn finalize(object: *const Core);
+}
+
+impl Finalize for Header {
+    unsafe fn finalize(object: *const Core) {
+        // SAFETY: 私有堆块里的对象头都是 Header（Core 在它开头）；见上
+        unsafe { Header::finalize(object.cast()) };
+    }
 }
 
 /// [`Meta::live`]：块被重新拿去分配了，上次清扫的存活量不再作数
@@ -60,6 +73,19 @@ impl Block {
         let b = Self(NonNull::new(p.cast()).unwrap_or_else(|| handle_alloc_error(Self::LAYOUT)));
         b.reused();
         b
+    }
+
+    /// 公开堆窗口里的块。SAFETY（调用方）：`p` 按块大小对齐、有 [`BLOCK`] 字节可读写；
+    /// 第一次用时内存是零（新延长的文件页）或已经 [`Block::reset`] 过。
+    pub(crate) unsafe fn at(p: *mut u8) -> Self {
+        // SAFETY: 见上
+        Self(unsafe { NonNull::new_unchecked(p.cast()) })
+    }
+
+    /// 元数据清零（大对象占过的块还回来时）。SAFETY（调用方）：块里没有对象，没人在用它。
+    pub(crate) unsafe fn reset(self) {
+        // SAFETY: 见上；元数据全是原子量，全零是合法值
+        unsafe { self.0.as_ptr().write_bytes(0, 1) };
     }
 
     /// 交给分配缓冲：上次清扫的存活量不再作数。
@@ -108,7 +134,7 @@ impl Block {
                 bits &= bits - 1;
                 let p = self.base().wrapping_add((w * BITS + bit) * GRANULE);
                 // SAFETY: 起点位标着的地方是还没析构的对象
-                let h = unsafe { &*p.cast::<Header>() };
+                let h = unsafe { &*p.cast::<Core>() };
                 if h.is_marked(epoch) {
                     self.mark_lines(p, h.bytes(), epoch);
                     live += h.bytes();
@@ -191,9 +217,9 @@ impl Block {
         Some((start, end))
     }
 
-    /// 清扫：析构没标上本轮纪元的对象（搬走了的不析构）、清掉它们的起点位，返回块的状态与存活字节数。
-    /// SAFETY（调用方）：标记已经做完，没有 mutator 在用这个块。
-    pub(crate) unsafe fn sweep(self, epoch: u32) -> (State, usize) {
+    /// 清扫：析构（按 `K`）没标上本轮纪元的对象（搬走了的不析构）、清掉它们的起点位，返回块的状态与存活字节数。
+    /// SAFETY（调用方）：标记已经做完，没有 mutator 在用这个块；块里对象的头是 `K` 认识的那种。
+    pub(crate) unsafe fn sweep<K: Finalize>(self, epoch: u32) -> (State, usize) {
         let mut live = 0;
         for (w, word) in self.meta().starts.iter().enumerate() {
             let mut bits = word.load(Ordering::Relaxed);
@@ -201,7 +227,7 @@ impl Block {
             while bits != 0 {
                 let bit = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
-                let header = self.base().wrapping_add((w * BITS + bit) * GRANULE).cast::<Header>().cast_const();
+                let header = self.base().wrapping_add((w * BITS + bit) * GRANULE).cast::<Core>().cast_const();
                 // SAFETY: 起点位标着的地方都是已初始化的对象
                 let h = unsafe { &*header };
                 if h.is_forwarded() {
@@ -211,7 +237,7 @@ impl Block {
                     live += h.bytes();
                 } else {
                     // SAFETY: 没标记 ⇒ 从根不可达，之后没人再用
-                    unsafe { Header::finalize(header) };
+                    unsafe { K::finalize(header) };
                     dead |= 1 << bit;
                 }
             }

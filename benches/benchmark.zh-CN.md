@@ -12,6 +12,7 @@ paragc 与 [cppgc](https://chromium.googlesource.com/v8/v8/+/main/include/cppgc/
 | --- | --- |
 | 机器 | Intel Core Ultra 7 356H，16 核（每核 1 线程），Linux 7.0 |
 | Rust | 1.98.1，release |
+| paragc，公开堆 | 共享内存上的公开堆（跨堆设计 P1），基于 `915355b`；文件在 `/dev/shm`；开始时负载 2.4 |
 | paragc | 0.2.1（提交 `bb6c81c`：并发重新计数、单线程重新计数更便宜）；其他回收器是 `5c4c5c5` 时量的 |
 | cppgc | V8 15.2.124.1，经 rusty_v8（`v8` crate 152.2.0） |
 | 其他 | gc-arena 0.7.0、gc 0.5.1、dumpster 2.1.0 |
@@ -34,6 +35,7 @@ paragc 与 [cppgc](https://chromium.googlesource.com/v8/v8/+/main/include/cppgc/
 | | 串行 | 并行 | `gcbench` 里怎么回收 |
 | --- | --- | --- | --- |
 | **paragc** | `Heap::new(1)` | `Heap::new(n)`：n − 1 个常驻回收线程 | 每棵树后 `collect_if_needed`：年轻回收 + 引用计数，每 16 次一次完整回收 |
+| **paragc，公开堆** | `/dev/shm` 文件上的 `PublicHeap`，1 个回收线程 | n 个回收线程 | 上次回收后新分配超过 2 × max(存活, 4 MiB) 时暂停式 `collect`（还没有年轻回收与引用计数） |
 | **cppgc** | 挂在 isolate 上（Blink 的用法），单线程平台 + `--single-threaded`；完整回收用 `request_garbage_collection_for_testing(Full)` | 默认平台，n 个工作线程 | V8 自己调度 |
 | **cppgc，选项全开** | 同上 | 同上，再加 `--parallel-marking --concurrent-marking --cppheap-concurrent-marking --cppheap-incremental-marking --concurrent-marking-max-worker-num=n` | V8 自己调度 |
 | **cppgc，不挂 isolate** | 不挂 isolate，`collect_garbage_for_testing` | 同上 | 照 paragc 的触发策略手动回收 |
@@ -53,6 +55,7 @@ paragc 与 [cppgc](https://chromium.googlesource.com/v8/v8/+/main/include/cppgc/
 | paragc，并发标记 | 6.6 | 2.4 (3.0) | 1.5 (11.9) |
 | paragc，并发清扫 | 15.9 | 6.5 (4.0) | 2.8 (12.7) |
 | **paragc，并发标记 + 并发清扫** | **0.03** | **0.03** | **0.05** |
+| paragc，公开堆 | 17.0 | 6.7 (3.9) | 3.3 (14.3) |
 | cppgc，挂 isolate | 45.0 | 44.7 (1.0) | 43.4 (1.0) |
 | cppgc，并行 / 并发选项全开 | 43.5 | 43.7 (1.0) | 43.0 (1.0) |
 | cppgc，不挂 isolate | 42.5 | 42.7 (1.0) | 42.5 (1.0) |
@@ -65,6 +68,7 @@ paragc 与 [cppgc](https://chromium.googlesource.com/v8/v8/+/main/include/cppgc/
 | | 1 线程 | 4 线程 | 16 线程 |
 | --- | ---: | ---: | ---: |
 | **paragc** | **53.7** | **59.1** (1.2) | **67.3** (2.1) |
+| paragc，公开堆 | 67.8 | 55.1 (1.5) | 78.2 (2.0) |
 | cppgc，挂 isolate | 119.2 | 95.3 (1.3) | 100.4 (1.3) |
 | cppgc，并行 / 并发选项全开 | 117.4 | 94.9 (1.3) | 99.4 (1.3) |
 | cppgc，不挂 isolate | 173.2 | 171.7 (1.0) | 173.0 (1.0) |
@@ -91,6 +95,8 @@ cppgc、gc-arena、rust-gc 一个堆只能一个线程用，这一项没有它�
   那部分代码没变；那次开始时负载 0.5，这次 2.5。
 - **并发标记 + 并发清扫把活移出了停顿**：单线程 22.4 ms 变成 0.03 ms；标记和清扫照样要做，在线程池上、在顺手扫块的 mutator 里。
   这里标记期间没有 mutator 在跑，最后灰队列是空的，剩下的停顿是与块数成正比的簿记；有 mutator 在跑时还要加上清空写屏障攒下的灰对象。
+- **公开堆：共享内存几乎不额外花钱**：同一棵树放在公开堆（`/dev/shm` 文件、偏移指针、按指针图追踪）里完整回收一次，单线程 17.0 ms，
+  私有堆 22.4 ms——它的头 16 字节而不是 24，也不重建引用计数。GCBench 慢一些（67.8 对 53.7 ms），因为公开堆每次都是完整回收，年轻回收与引用计数还没做。
 - **cppgc 的完整回收只用一个线程标记**：挂不挂 isolate、开不开 16 个工作线程和全部并行 / 并发标记选项，强制完整回收都是 CPU ÷ 墙钟 = 1.0、约 43–45 ms。
   只有 V8 自己调度的增量回收里，后台标记用上了别的线程（GCBench 约 1.3）。要在 `pause` 里量它的并发周期得去驱动 V8 的增量 GC，这里没做。
 - **cppgc 要付 Rust ⇄ C++ 的边界开销**：经 rusty_v8 调用，每次分配、每个 `Member`、标记时每条边都是一次 FFI；挂 isolate 时 V8 自己那份

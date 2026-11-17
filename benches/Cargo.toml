@@ -1,7 +1,7 @@
 # paragc 与 cppgc（V8 Oilpan）/ gc-arena / gc（rust-gc）/ dumpster 的对比基准。
 # V8 的预编译库很大，所以自成 workspace，不进 paragc 的构建。跑法见 run.sh。
 [workspace]
-members = ["common", "paragc", "cppgc", "gc-arena", "rust-gc", "dumpster"]
+members = ["common", "paragc", "paragc-public", "cppgc", "gc-arena", "rust-gc", "dumpster"]
 resolver = "3"
 
 [workspace.package]

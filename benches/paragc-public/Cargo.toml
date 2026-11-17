@@ -1,0 +1,10 @@
+[package]
+name = "bench-paragc-public"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bench-common.workspace = true
+paragc = { path = "../.." }
