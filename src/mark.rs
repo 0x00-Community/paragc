@@ -222,8 +222,11 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
                 self.visit(cur, T::NO_EDGES);
                 self.inc(cur);
             }
-        } else if let Some(gc) = slot.get() {
-            self.visit(gc.header(), T::NO_EDGES);
+        } else {
+            raw.promote();
+            if let Some(gc) = slot.get() {
+                self.visit(gc.header(), T::NO_EDGES);
+            }
         }
     }
 
@@ -232,9 +235,9 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
             let new = self.forward_gc(gc);
             slot.store_exclusive(Some(new));
         }
-        if self.count.is_some()
-            && let (Some(cur), _) = slot.raw_slot().recount()
-        {
+        if self.count.is_none() {
+            slot.raw_slot().promote();
+        } else if let (Some(cur), _) = slot.raw_slot().recount() {
             self.inc(cur);
         }
     }

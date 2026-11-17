@@ -28,7 +28,7 @@
 use core::mem::needs_drop;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
+use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 
 use crossbeam_utils::Backoff;
 
@@ -355,11 +355,14 @@ impl Block {
     /// 元数据之后第一个能放对象的行
     pub const FIRST_LINE: usize = size_of::<Meta>().div_ceil(LINE);
 
-    /// 新块：全零（行标记 0 早于任何纪元，全部是空行）。
+    /// 新块：只有元数据清零（行标记 0 早于任何纪元，全部是空行）；对象区不清——分配从不依赖内存是零，
+    /// 不碰的页也就不缺页。
     pub fn new() -> Self {
         // SAFETY: LAYOUT 大小非零
-        let p = unsafe { alloc_zeroed(Self::LAYOUT) };
+        let p = unsafe { alloc(Self::LAYOUT) };
         let b = Self(NonNull::new(p.cast()).unwrap_or_else(|| handle_alloc_error(Self::LAYOUT)));
+        // SAFETY: 刚分配、独有；元数据全是原子量，全零是合法值
+        unsafe { b.0.as_ptr().write_bytes(0, 1) };
         b.reused();
         b
     }

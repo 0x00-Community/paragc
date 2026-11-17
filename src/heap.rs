@@ -829,8 +829,8 @@ pub trait MutatorInternal<'gc> {
     fn heap(&self) -> &'gc Heap;
 
     /// 写屏障。并发标记中：被覆盖的旧值若还没标就标上、进灰队列（初始快照）。
-    /// 平时：写进去的是年轻对象（标记纪元不是上次完成的那轮）就记下槽的地址——老对象指向年轻对象的边只能这样产生，
-    /// 年轻回收从这些槽出发。（并发标记期间新对象都是黑的、收尾后全是老对象，不用记。）
+    /// 平时：老对象里的槽（[`RawSlot::is_young`] 为假）写进去的是年轻对象（标记纪元不是上次完成的那轮）就记下槽的地址——
+    /// 老对象指向年轻对象的边只能这样产生，年轻回收从这些槽出发；年轻对象里的槽不用记，年轻回收从对象本身追到。（并发标记期间新对象都是黑的、收尾后全是老对象，不用记。）
     ///
     /// 计数中的槽（老对象里的；年轻对象的槽不计数）本轮第一次被写还要登记，回收时结算。
     fn written(&self, slot: &RawSlot, old: Option<*const Header>, new: Option<*const Header>);
@@ -847,7 +847,8 @@ impl<'gc> MutatorInternal<'gc> for Mutator<'gc> {
             if let Some(old) = old {
                 self.heap.remember(old, epoch.get());
             }
-        } else if let Some(new) = new
+        } else if !slot.is_young()
+            && let Some(new) = new
             // SAFETY: new 是刚写进槽的、活着的对象
             && !unsafe { &*new }.is_marked(self.heap.epoch)
         {

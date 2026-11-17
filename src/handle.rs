@@ -150,8 +150,11 @@ pub struct Slot<'gc, T> {
     _brand: PhantomData<Gc<'gc, T>>,
 }
 
-/// [`Slot::counted`]：这个槽不在引用计数里
+/// [`Slot::counted`]：这个槽不在引用计数里，所在对象还年轻（写屏障不用记它）
 pub const UNCOUNTED: usize = usize::MAX;
+/// [`Slot::counted`]：这个槽不在引用计数里，但所在对象已被回收追踪过（老了，写进年轻值要记）。
+/// 比它大的值都表示不计数（最低位是 [`LOGGED`]，所以占两个值）
+pub const PROMOTED: usize = usize::MAX - 1;
 /// [`Slot::counted`] 的最低位：本轮已登记（地址按粒度对齐，最低位空着）
 pub const LOGGED: usize = 1;
 
@@ -167,14 +170,29 @@ impl RawSlot {
         (!p.is_null()).then(|| Header::of(p))
     }
 
+    fn uncounted(c: usize) -> bool {
+        c >= PROMOTED
+    }
+
     fn from_counted(c: usize) -> Option<*const Header> {
-        (c != UNCOUNTED && c & !LOGGED != 0).then(|| Header::of(core::ptr::with_exposed_provenance::<u8>(c & !LOGGED)))
+        (!Self::uncounted(c) && c & !LOGGED != 0).then(|| Header::of(core::ptr::with_exposed_provenance::<u8>(c & !LOGGED)))
     }
 
     /// 本轮第一次被写：打上登记标志，返回 true（调用方把槽地址交给回收器）。不计数的槽返回 false。
     pub fn log(&self) -> bool {
         let c = self.counted.load(Ordering::Relaxed);
-        c != UNCOUNTED && c & LOGGED == 0 && self.counted.compare_exchange(c, c | LOGGED, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+        !Self::uncounted(c) && c & LOGGED == 0 && self.counted.compare_exchange(c, c | LOGGED, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+    }
+
+    /// 所在对象还年轻（自分配以来没被回收追踪过）：写进年轻值不用进记忆集，年轻回收会从对象本身追到。
+    pub fn is_young(&self) -> bool {
+        self.counted.load(Ordering::Relaxed) == UNCOUNTED
+    }
+
+    /// 回收追踪到了所在对象（不计数时）：从此它是老对象，写屏障要记它。
+    pub fn promote(&self) {
+        // 失败 ⇒ 已经不是年轻（计数中或已晋升），不用改
+        let _ = self.counted.compare_exchange(UNCOUNTED, PROMOTED, Ordering::Relaxed, Ordering::Relaxed);
     }
 
     /// 清掉登记标志（计数不可信时丢弃登记）。
