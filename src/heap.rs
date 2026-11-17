@@ -104,6 +104,8 @@ pub struct Heap {
     /// 块的来源（析构时 Drop 里先把块都还回来，之后它才解除映射）
     pages: Pages,
     roots: Arc<RootTable>,
+    /// 弱表：[`crate::Weak`] 的槽（不当根；每次回收标记完清空没标到的）
+    weaks: Arc<RootTable>,
     /// 上次回收后新领用的字节数（按块 / 大对象计）
     allocated: AtomicUsize,
     /// 上次回收疏散的块数 / 字节数
@@ -192,6 +194,7 @@ impl Heap {
             shrinking: AtomicBool::new(false),
             pages: Pages::default(),
             roots: Arc::default(),
+            weaks: Arc::default(),
             allocated: AtomicUsize::new(0),
             evacuated: (0, 0),
             spare: AtomicPtr::new(null_mut()),
@@ -320,7 +323,7 @@ impl Heap {
     /// 写屏障：并发标记中覆盖掉的旧值若还没标，就标上（连同它跨的行）并放进灰队列（保住初始快照）。
     /// 灰队列里的对象都已标过，取出来只追踪它的边，所以这里必须先标。
     fn remember(&self, old: *const Header, epoch: u32) {
-        // SAFETY: old 来自本堆的槽，初始快照时活着，本轮不会被回收
+        // SAFETY: old 来自本堆的槽（初始快照时活着）或弱表（上次停顿后活着、计数粘住），本轮不会被回收
         let h = unsafe { &*old };
         if h.mark(epoch) {
             if !h.is_large() {
@@ -568,6 +571,8 @@ impl Heap {
                 self.decs.push(addr);
             }
         }
+        // SAFETY: 没有 mutator；标记（含年轻疏散）做完了、还没清扫
+        unsafe { self.weaks.clear_unreached(epoch, parity) };
         // 只扫上次回收后拿去分配过的块（年轻对象只可能在这些块里）；没动过的老块原样放回
         let (young, old): (Vec<Block>, Vec<Block>) = self.blocks.take().into_iter().partition(|b| b.live_since_sweep().is_none());
         self.blocks.extend(old);
@@ -658,6 +663,8 @@ impl Heap {
         if concurrent {
             self.settle_concurrent_log(epoch);
         }
+        // SAFETY: 没有 mutator；标记（含疏散）做完了、还没清扫
+        unsafe { self.weaks.clear_unreached(epoch, *self.rc_parity.get_mut()) };
         self.end_full(epoch, (evacuate, moved.into_inner()));
     }
 
@@ -749,6 +756,8 @@ impl Heap {
         for (h, &epoch) in heaps.iter_mut().zip(&epochs) {
             // SAFETY: 没有 mutator；还没开始清扫
             unsafe { h.roots.clear_dead(inside, epoch) };
+            // SAFETY: 同上
+            unsafe { h.weaks.clear_unreached(epoch, *h.rc_parity.get_mut()) };
             h.end_full(epoch, (0, 0));
         }
         for h in heaps.iter() {
@@ -761,6 +770,8 @@ impl Heap {
 pub trait HeapInternal {
     fn roots(&self) -> &Arc<RootTable>;
 
+    fn weaks(&self) -> &Arc<RootTable>;
+
     /// 堆的身份：根表的地址（堆本身可能被移动）；不会是 [`crate::handle::NO_HOLDER`]。
     fn id(&self) -> usize;
 }
@@ -768,6 +779,10 @@ pub trait HeapInternal {
 impl HeapInternal for Heap {
     fn roots(&self) -> &Arc<RootTable> {
         &self.roots
+    }
+
+    fn weaks(&self) -> &Arc<RootTable> {
+        &self.weaks
     }
 
     fn id(&self) -> usize {
@@ -995,6 +1010,9 @@ pub trait MutatorInternal<'gc> {
     ///
     /// 计数中的槽（老对象里的；年轻对象的槽不计数）本轮第一次被写还要登记，回收时结算。
     fn written(&self, slot: &RawSlot, old: Option<*const Header>, new: Option<*const Header>);
+
+    /// 读屏障（只在并发标记中）：mutator 从弱引用取到了 `h`，若还没标就标上、进灰队列。
+    fn reached(&self, h: *const Header);
 }
 
 impl<'gc> MutatorInternal<'gc> for Mutator<'gc> {
@@ -1018,6 +1036,12 @@ impl<'gc> MutatorInternal<'gc> for Mutator<'gc> {
         // 引用计数登记：平时与并发标记期间都要（标记期间被改写的槽在收尾时结算）
         if slot.log() {
             self.heap.rc_log.push(addr);
+        }
+    }
+
+    fn reached(&self, h: *const Header) {
+        if let Some(epoch) = self.marking {
+            self.heap.remember(h, epoch.get());
         }
     }
 }

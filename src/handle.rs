@@ -1,8 +1,9 @@
-//! 指针与句柄：私有堆的 [`Gc`] / [`Slot`] / [`Root`] / [`Far`]，公开堆的 [`PublicGc`] / [`PublicSlot`] / [`PublicRef`] / [`Public`] 与 [`Shared`]。
+//! 指针与句柄：私有堆的 [`Gc`] / [`Slot`] / [`Root`] / [`Weak`] / [`Far`]，公开堆的 [`PublicGc`] / [`PublicSlot`] / [`PublicRef`] / [`Public`] 与 [`Shared`]。
 //!
 //! 堆指针 [`Gc`] 与原子指针槽 [`Slot`]。
 //!
 //! 根：[`Root`] 是 mutate 之外也能持有的强引用句柄（可跨线程），回收从全部根出发。
+//! 弱引用 [`Weak`] 同样可以在 mutate 之外持有，但不保活：每次回收标记完清空没标到的目标。
 //!
 //! 根表是只追加的槽数组：新根在 mutate 里领槽（先用释放过的空槽），句柄析构时把槽清空、下标挂回去。
 //! 空槽只在回收时（没有 mutator）整理成只读数组，mutate 期间原子游标领取，所以无锁、没有 ABA。
@@ -428,10 +429,7 @@ impl RootTable {
     /// 同 [`RootTable::settle`]，但持有方满足 `inside` 的入口不算根（一起回收的堆里的 Far，由追踪决定死活）。
     pub unsafe fn settle_outside(&self, inside: impl Fn(usize) -> bool) -> Vec<*const Header> {
         // SAFETY: 见 settle
-        let ready = unsafe { &mut *self.ready.get() };
-        let used = self.cursor.swap(0, Ordering::AcqRel).min(ready.len());
-        ready.drain(..used);
-        ready.extend(self.returned.take());
+        unsafe { self.recycle() };
         self.slots
             .iter()
             .filter_map(|s| {
@@ -439,6 +437,38 @@ impl RootTable {
                 (!p.is_null() && !inside(s.holder.load(Ordering::Relaxed))).then_some(p.cast_const())
             })
             .collect()
+    }
+
+    /// 还回来的槽号并进可复用的（领走的去掉）。SAFETY（调用方）：没有 mutator。
+    unsafe fn recycle(&self) {
+        // SAFETY: 见上：ready 只在这时改
+        let ready = unsafe { &mut *self.ready.get() };
+        let used = self.cursor.swap(0, Ordering::AcqRel).min(ready.len());
+        ready.drain(..used);
+        ready.extend(self.returned.take());
+    }
+
+    /// 弱表（[`Weak`] 的槽）在回收标记完、清扫之前：目标没标到 `epoch` 的清空，搬走了的改成新地址；
+    /// 活着的目标计数粘住（`parity` 是当前计数的奇偶）。句柄可能同时在别的线程析构（槽被清空），所以用 CAS。
+    /// SAFETY（调用方）：没有 mutator；标记（含疏散）做完了、还没清扫，槽里的对象内存都还在。
+    pub unsafe fn clear_unreached(&self, epoch: u32, parity: bool) {
+        // SAFETY: 见上
+        unsafe { self.recycle() };
+        for slot in self.slots.iter() {
+            let old = slot.load();
+            if old.is_null() {
+                continue;
+            }
+            let new = Header::survivor(old, epoch);
+            if let Some(new) = new {
+                // SAFETY: 活着的对象
+                unsafe { &*new }.rc_stick(parity);
+            }
+            let new = new.map_or(null_mut(), <*const Header>::cast_mut);
+            if !core::ptr::eq(old, new) {
+                let _ = slot.ptr.compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire);
+            }
+        }
     }
 
     /// 一起回收之后：持有方满足 `inside`、目标没标到的入口——持有它的 Far 已经死了（活的 Far 都被追踪到、把目标标上了）——
@@ -494,6 +524,63 @@ impl<'gc> Mutator<'gc> {
     pub fn set<B: Brand>(&self, root: &Root<B>, gc: Gc<'gc, B::Of<'gc>>) {
         assert!(Arc::ptr_eq(&root.table, self.heap().roots()), "这个 Root 不属于这个堆");
         root.table.slot(root.slot).store(gc.header().cast_mut());
+    }
+}
+
+/// 弱引用句柄：不保活对象；对象被回收后 [`Mutator::upgrade`] 给 None。像 [`Root`] 一样不带 `'gc`，可以存在任何地方
+/// （也可以放进堆对象里）、跨线程传。用 [`Mutator::weak`] 建。
+///
+/// 每次回收（完整、年轻、并发标记收尾、一起回收）在标记之后、清扫之前清空目标没被标到的弱引用，搬走的改成新地址；
+/// 所以在任何一次 mutate 里，弱引用要么是空的，要么指着活对象。
+/// 年轻对象没有强引用就在下一次年轻回收死；老对象（计数被弱引用粘住，见 [`crate::Heap::collect_young`]）要等完整回收。
+pub struct Weak<B: Brand> {
+    /// 堆的弱表
+    table: Arc<RootTable>,
+    slot: usize,
+    _brand: PhantomData<fn() -> B>,
+}
+
+impl<B: Brand> Weak<B> {
+    /// 目标已经被回收了（之后一直是）。不需要进 mutate；为假时目标也可能在下一次回收死。
+    pub fn is_cleared(&self) -> bool {
+        self.table.slot(self.slot).load().is_null()
+    }
+}
+
+impl<B: Brand> Drop for Weak<B> {
+    fn drop(&mut self) {
+        self.table.release(self.slot);
+    }
+}
+
+// SAFETY: 句柄本身不含 Gc，对目标没有强边
+unsafe impl<B: Brand> Trace for Weak<B> {
+    const NO_EDGES: bool = true;
+    fn trace(&self, _: &mut crate::Tracer<'_>) {}
+}
+
+impl<'gc> Mutator<'gc> {
+    /// 给对象建一个弱引用。
+    ///
+    /// 下一次回收起目标的引用计数粘住（不再按计数释放，留给追踪回收）：按计数释放在后台、与 mutator 并发，来不及先清空
+    /// 弱引用。每次停顿处理弱表时粘住，早于那次停顿算出的减量，所以在那之前它还不会被按计数释放。
+    pub fn weak<B: Brand>(&self, gc: Gc<'gc, B::Of<'gc>>) -> Weak<B> {
+        let table = self.heap().weaks().clone();
+        let slot = table.claim(gc.header(), NO_HOLDER);
+        Weak { table, slot, _brand: PhantomData }
+    }
+
+    /// 弱引用指着的对象；已经被回收了就是 None。并发标记期间取到的对象当作被引用了（标上），本轮不会死。
+    pub fn upgrade<B: Brand>(&self, weak: &Weak<B>) -> Option<Gc<'gc, B::Of<'gc>>> {
+        assert!(Arc::ptr_eq(&weak.table, self.heap().weaks()), "这个 Weak 不属于这个堆");
+        let header = weak.table.slot(weak.slot).load();
+        if header.is_null() {
+            return None;
+        }
+        // 读屏障：初始快照只保证快照时强可达的对象被标上，从弱引用取出、再存进黑对象的会漏
+        self.reached(header);
+        // SAFETY: 弱表里非空的槽指着活对象（每次回收清扫前清空了死的），类型是建它时的 B
+        Some(unsafe { Gc::from_data(Header::data(header).cast()) })
     }
 }
 

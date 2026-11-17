@@ -36,6 +36,7 @@ paragc 是**给多个线程共用一个堆的 Rust 程序用的追踪式垃圾�
 | 🧹 **并发清扫** | `Heap::finish_marking(&mut self)` 只做标记收尾、把块交给清扫器；mutator 要块时顺手扫（惰性清扫），`Heap::sweep_concurrently(&self)` 在线程池上扫剩下的。两者都用上，停顿只剩清空灰队列。析构缺省在全部回收线程上并行跑；`Heap::set_parallel_drop(false)` 改成只在调用回收 / `sweep_concurrently` 的线程上析构（判死、算行照旧并行），析构要释放 mutator 线程分配的内存时用它，免得跨线程释放让分配器争用。 |
 | 🏃 **并行回收** | 每个堆一个常驻线程池（两次回收之间线程挂起）。标记：每个工人一个 crossbeam 工作窃取双端队列、成批偷；清扫（含析构）：块按批分给同一批工人。 |
 | 🏷️ **带品牌的句柄** | `Gc<'gc, T>` 逃不出 `mutate` 的闭包；`Root<B>` 不带生命周期，可以存在任何地方、跨线程传。 |
+| 🪶 **弱引用** | `Weak<B>` 像 `Root<B>` 一样不带生命周期、放在哪都行，但不保活对象：每次回收（完整、年轻、并发标记收尾、一起回收）在标记之后、清扫之前清空目标没被标到的，搬走的跟着改地址；`Mutator::upgrade` 取回 `Option<Gc>`，`Weak::is_cleared` 不进 mutate 也能查。 |
 | 🔗 **堆之间直接引用** | `Far<'a, B>` 让一个堆的对象直接指着同一进程里另一个堆的对象：不复制、不经过间接表。每个堆仍然各自回收；`Heap::collect_group` 把几个堆一起追踪，收掉跨堆的环。 |
 | 🗄️ **公开堆**（Linux） | `PublicHeap` 放在共享内存文件系统（`/dev/shm`、自己挂的 tmpfs / hugetlbfs）上的文件里：超级块、类型表、入口表、块状态表、块全在文件里、位置固定，指针存偏移，所以多个进程（有权限打开这个文件的）可以把同一个堆映射在各自不同的地址上、同时用。文件刚建时是空的，用到哪里长到哪里。对象头存类型号而不是代码，回收照类型的指针图追踪。进程在任何时刻被杀（mutate 中、回收中）既不卡住别人，也不漏掉它持有的东西。公开堆之间可以直接互指（`PublicRef`），`PublicHeap::collect_group` 收跨堆的环；同一目录里的堆号跨进程唯一，堆可以比建它的进程活得久。私有堆的对象里可以放指向它的 `Public<B>` 句柄。 |
 | 📦 **机会式疏散** | 暂停式回收在标记的同时把稀疏块里的活对象搬走（Immix defrag）：一遍里完成标记、复制、改写全部边。存活不到半块的都是候选，最稀疏的先搬、不设块数上限；块占的比「存活 + 一轮允许新分配的」多出 1.5 倍时 `collect_if_needed` 提前做完整回收。并发标记从不搬对象，所以 mutator 不需要读屏障。 |
@@ -82,6 +83,7 @@ heap.collect();
 | 清扫 | 工人按批领块：按起点位图逐个看对象，没标上本轮纪元的析构、清位；块分成 全空 / 有空行 / 满，比上一轮领用的块数多出来的空块还给系统。`Heap::shrink`（空闲时调）做一次完整回收、空块一个不留，并把有空行的块里凑满整页的空行 madvise 掉 |
 | 年轻疏散 | 上次回收后分配过的块都标成疏散；`SkipRemembered` 先把记忆集里的槽的目标与入口目标原地标上（本轮已标的不搬），其余追到的年轻对象复制进可用块与新块、留下转发地址，根表与被扫描的年轻对象的边改成新地址（`Trace::relocate`）；`Full` 由 0 号工人把记忆集里的槽也改成新地址。引用计数在标记之后结算（用搬后的地址）。年轻回收不扫描老对象：按地址建索引的结构只要指着年轻对象，它自己也得是年轻的（改动时挪进新分配的对象） |
 | 根 | `Root<B>` 占根表一个槽；根表只追加，空槽号在回收时整理成只读数组、mutate 期间原子游标领取 |
+| 弱引用 | `Weak<B>` 占弱表（同样的槽表，不当根）一个槽。每次停顿标记（含疏散）做完、清扫之前过一遍弱表：目标搬走了改成新地址，没标到本轮纪元的清空（句柄同时析构时用 CAS，不改回去），所以 mutate 里弱表只指着活对象。活着的目标引用计数粘住：按计数释放在后台、与 mutator 并发，弱引用来不及先清空，只能交给追踪；粘住在算出减量的同一次停顿里、早于后台处理，所以老对象只剩弱引用后要等下一次完整回收才清。并发标记期间 `upgrade` 走读屏障（和写屏障同一个 `remember`：标上、进灰队列），否则快照时只剩弱引用、标记中被取出挂到黑对象底下的对象会漏标 |
 | 堆之间的引用 | 建 `Far`（同时在两个堆的 `mutate` 里）在目标堆的根表领一个槽，槽里还记着持有方堆；持有 `Far` 的对象被析构（清扫或引用计数释放）时还槽。目标堆单独回收时这些入口就是根，年轻回收、引用计数、并发标记都不用改。入口对象不搬：疏散回收开始标记之前，入口目标所在的块撤掉疏散（改当搬入目标），年轻疏散则先把入口目标原地标上，所以 `Far` 永远不用改写。`collect_group` 不把组内持有的入口当根：各堆从自己的根出发标记，追踪到 `Far` 就把目标交给目标堆（按那个堆的纪元标灰），轮流标到没有哪个堆还有灰对象；组内持有、目标没被标到的入口属于已死的持有方，清空，免得之后的回收拿它去碰已释放的对象 |
 | 公开堆布局 | `PublicSpace::reserve` 保留一段地址（只占地址、不占内存），按自身大小对齐，切成 16 GiB 的窗口；公开堆 *k* 永远映射在第 *k* 个窗口。窗口里位置定死：超级块、类型表、指针图、入口表、块状态表、32 KiB 的块。文件建出来是空的（只写超级块那一页），每一段第一次用到时用 `fallocate` 延长——它只会把文件变长，多个线程同时调也安全，没写过的页是空洞 |
 | 公开堆对象 | 16 字节头：和私有堆一样的标记字与信息字（所以块、行、清扫是同一份代码）加类型号。`#[derive(Shared)]` 要求 `#[repr(C)]`，生成指针图；一个类型第一次分配时把类型键（类型名、大小、指针图的哈希）与指针图登记进堆。`PublicSlot` 存目标相对地址区起点的偏移，同一个值在每个映射里都对；`get` / `set` 带 `PublicMutator`（它知道本映射的起点）。`alloc` 在编译期拒绝有析构的类型。超过半块（16 KiB）的对象占一串新块，死了以后这些块变成普通块 |
@@ -116,6 +118,7 @@ heap.collect();
 - 不要在同一个堆的 `mutate` 里调用 `mark_concurrently`：它会一直等自己走空。
 - 有 `Gc` 字段的类型不许实现 `Drop`：析构顺序不定，`Drop` 里可能碰到已经析构的对象。derive 会检查，`#[trace(unsafe_drop)]` 关掉检查。
 - 只有从 `Root`（或别的堆里的 `Far`）可达的对象能活过回收。
+- `Weak` 不保活：只有弱引用指着的年轻对象下一次年轻回收就清空，老对象下一次完整回收清空。读要带它所在堆的 `Mutator`（`m.upgrade(&weak)`）。
 - `Far` 用 `Far::new(holder, target, gc)` 建（同时在两个堆的 `mutate` 里），只能放进持有方堆的对象里（品牌限制），
   读要带目标堆的 `Mutator`（`far.get(mb)`）。建好后不变；要改指向，把它放在 `Slot` 后面的对象里、换掉那个对象。同一个堆里的边用 `Slot`。
 - 跨堆的环只有 `Heap::collect_group` 能收。
@@ -172,6 +175,11 @@ heap.collect();
 | `reference_counting_leaves_cycles_to_tracing` | 整体扔掉的老对象链在年轻回收时按计数释放（500 层连锁）；两节点的环留到完整回收 |
 | `far_targets_are_pinned_during_young_evacuation` | 年轻疏散（`Full`）也不搬别的堆经 `Far` 直接指着的年轻对象，只有根的照常搬走 |
 | `far_targets_are_pinned_during_evacuation` | 稀疏块，留下的对象一半还被别的堆直接指着：回收疏散了另一半，被指着的原地不动（根的路径与 `Far` 看到同一个对象），析构数精确 |
+| `weak_does_not_keep_alive` · `weak_inside_heap_objects` | 只剩弱引用的对象被回收、弱引用清空，挂着的取得到原值；放在堆对象里的弱引用随持有者析构 |
+| `weak_follows_evacuation` · `young_collection_clears_young_targets` | 疏散后弱引用与强引用看到同一个新副本、旧副本不析构；年轻回收三种搬法下没有强引用的年轻对象清空、活着的取得到原值 |
+| `weak_targets_wait_for_tracing` | 老对象最后一个强引用没了：没有弱引用的按计数释放，有弱引用的留到完整回收 |
+| `upgrade_during_concurrent_marking_keeps_target` · `weak_churn_while_marking_concurrently` | 快照时只剩弱引用、标记期间被取出挂进别的对象的对象活过收尾（读屏障）；4 个线程建弱引用、取出挂上，另一个线程并发标记，每轮析构数恰好 |
+| `group_collection_clears_weak` | 只经别的堆的 `Far` 可达的对象：单独回收不清，持有者死后一起回收才清 |
 | `far_keeps_target_until_holder_dies` · `far_survives_holder_heap_drop_order` | 自己没有根的目标在持有方活着时挺过所在堆的完整、年轻回收；持有方堆析构了持有方之后才收；目标堆先析构也安全 |
 | `cross_heap_cycle_needs_group_collection` · `rings_over_eight_heaps` | 跨 2 个、8 个堆的环挺过各堆单独回收；缺几个堆的组收不掉（组外的持有方是根）；整组一起回收恰好收掉没挂根的环，留下的环走得通 |
 | `eight_threads_relink_far_holders` | 8 线程 × 8 堆不停换掉指向别的堆的持有对象、读回来核对，另一个线程同时对每个堆并发标记；完整、年轻、一起回收轮流来；最后每个目标都被回收，没有提前的 |
@@ -183,7 +191,7 @@ crossbeam-epoch 的全局回收器退出时还拿着延迟释放的垃圾；每�
 在 Stacked Borrows 下仍会碰到 crossbeam-epoch 内部那处违例（crossbeam-deque 压栈时），Tree Borrows 下干净：
 
 ```sh
-cargo test --test gc -- --exact <名字>          # 另有 --test far · --test public · --test processes
+cargo test --test gc -- --exact <名字>          # 另有 --test far · --test weak · --test public · --test processes
 MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-ignore-leaks" cargo +nightly miri test --test gc -- --exact <名字>
 MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-ignore-leaks -Zmiri-tree-borrows" cargo +nightly miri test --test gc -- --exact <名字>
 ```
