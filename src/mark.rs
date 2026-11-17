@@ -37,6 +37,8 @@ pub(crate) struct Marking<'g> {
     count: Option<bool>,
     /// 并发标记：引用计数登记队列（重新计数时被 mutator 改写的槽补登记）
     log: Option<&'g Injector<usize>>,
+    /// 一起回收：追踪到的 Far 报到这里
+    group: Option<&'g Injector<(usize, usize)>>,
 }
 
 // SAFETY: 每个工号的本地队列只被一个线程取走（工号互不相同）；其余是线程安全的
@@ -56,12 +58,19 @@ impl<'g> Marking<'g> {
             roots: None,
             count: None,
             log: None,
+            group: None,
         }
     }
 
     /// 并发标记：给引用计数登记队列。
     pub(crate) fn logging(mut self, log: &'g Injector<usize>) -> Self {
         self.log = Some(log);
+        self
+    }
+
+    /// 一起回收几个堆：追踪到的 Far 报到 `group`。
+    pub(crate) fn grouping(mut self, group: &'g Injector<(usize, usize)>) -> Self {
+        self.group = Some(group);
         self
     }
 
@@ -119,7 +128,7 @@ impl<'g> Marking<'g> {
         // SAFETY: 同上，复制缓冲也按工号取一次
         let mut copier = self.copiers.get(me).and_then(|c| unsafe { (*c.get()).take() });
         // 只有一个工人时没有别人改计数（mutator 不碰计数，减量队列此时为空）
-        let mut t = Tracer::new(&local, self.epoch, copier.as_mut()).counting(self.count, self.locals.len() == 1).logging(self.log);
+        let mut t = Tracer::new(&local, self.epoch, copier.as_mut()).counting(self.count, self.locals.len() == 1).logging(self.log).grouping(self.group);
         if me == 0
             && let Some(roots) = self.roots
         {

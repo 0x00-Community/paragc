@@ -141,8 +141,8 @@ impl Heap {
         &self.roots
     }
 
-    /// 堆的身份：根表的地址（堆本身可能被移动）。
-    fn id(&self) -> usize {
+    /// 堆的身份：根表的地址（堆本身可能被移动）；不会是 [`crate::roots::NO_HOLDER`]。
+    pub(crate) fn id(&self) -> usize {
         Arc::as_ptr(&self.roots).addr()
     }
 
@@ -469,21 +469,10 @@ impl Heap {
     /// 或者某个线程调 [`Heap::sweep_concurrently`]）。停顿只有标记的收尾。
     pub fn finish_marking(&mut self) {
         self.sweep_concurrently();
-        // 完整标记重新标行（被引用计数释放的对象的行早于新纪元，自然空出），脏块不用再重算
-        drop(Self::drain(&self.dirty));
-        // 完整标记会找到全部活对象，记忆集不再需要
-        drop(Self::drain(&self.remembered));
-        self.young_since_full = 0;
         // 引用计数顺带重新计数（旧计数作废，扫描时每条边 +1、槽改成计入当前值）：停顿式在这里翻转奇偶；
         // 并发标记已在握手时翻转，扫描已经计了一部分，下面补黑对象的边、结算标记期间被改写的槽
         let concurrent = *self.marking.get_mut() != 0;
-        if !concurrent {
-            // 标记前登记的槽：所在对象活着就会被扫描、计入当前值；死了不用管
-            drop(Self::drain(&self.rc_log));
-            let parity = self.rc_parity.get_mut();
-            *parity = !*parity;
-        }
-        self.rc_roots.clear();
+        self.begin_full(concurrent);
         let count = Some(*self.rc_parity.get_mut());
         // SAFETY: &mut self ⇒ 没有 mutator
         let roots = unsafe { self.roots.settle() };
@@ -492,12 +481,22 @@ impl Heap {
         let pool = self.pool.get_or_init(|| Pool::new(self.threads));
         let workers = pool.sized(self.blocks.len() + self.large.len());
         // 清扫好、没再用过的可用块：不并发标记时从里面挑稀疏的疏散，其余当搬入的目标
-        let available = Self::drain(&self.available);
-        for b in &available {
-            b.unlist();
-        }
+        let available = self.take_available();
         let targets = Injector::new();
-        let evacuate = if marking == 0 { Self::pick_evacuation(&available, &targets) } else { 0 };
+        let mut evacuate = if marking == 0 { Self::pick_evacuation(&available, &targets) } else { 0 };
+        if evacuate > 0 {
+            // 别的堆直接指着的对象不能搬：它们所在的块撤掉疏散、改当搬入目标。必须在标记开始前撤，
+            // 否则别的工人可能先经堆内的边追到它、把它搬走
+            let pin = |h: *const Header| {
+                // SAFETY: 入口指着本堆的活对象
+                if !unsafe { &*h }.is_large() && Block::containing(h.cast()).pin() {
+                    evacuate -= 1;
+                    targets.push(Block::containing(h.cast()));
+                }
+            };
+            // SAFETY: 没有 mutator
+            unsafe { self.roots.pinned(pin) };
+        }
         // 并发标记的黑对象：已标过、没扫描过，放进灰队列让收尾的标记扫描一遍（只为计数）
         for addr in Self::drain(&self.black) {
             self.grey.push(addr);
@@ -515,19 +514,101 @@ impl Heap {
         if concurrent {
             self.settle_concurrent_log(epoch);
         }
+        self.end_full(epoch, (evacuate, moved.into_inner()));
+    }
+
+    /// 完整回收开头的簿记（独占）：完整标记重新标行、找到全部活对象，脏块、记忆集不再需要；
+    /// 停顿式的在这里翻转计数奇偶（标记前登记的槽：所在对象活着就会被扫描、计入当前值，死了不用管）。
+    fn begin_full(&mut self, concurrent: bool) {
+        drop(Self::drain(&self.dirty));
+        drop(Self::drain(&self.remembered));
+        self.young_since_full = 0;
+        if !concurrent {
+            drop(Self::drain(&self.rc_log));
+            let parity = self.rc_parity.get_mut();
+            *parity = !*parity;
+        }
+        self.rc_roots.clear();
+    }
+
+    /// 取出全部可用块（完整回收后清扫器会重新分类、放回）。
+    fn take_available(&self) -> Vec<Block> {
+        let available = Self::drain(&self.available);
+        for b in &available {
+            b.unlist();
+        }
+        available
+    }
+
+    /// 完整回收收尾（独占）：计数可信了；全部块交给清扫器（疏散时新开的块也已登记），清扫好的可用块之后再一个个放回
+    /// available（它们本来就都在 blocks 里）。`evacuated`：疏散的块数与字节数。
+    fn end_full(&mut self, epoch: u32, evacuated: (usize, usize)) {
         *self.rc_valid.get_mut() = true;
-        // 全部块交给清扫器（疏散时新开的块也已登记）；清扫好的可用块之后再一个个放回 available（它们本来就都在 blocks 里）
         let blocks = self.blocks.take();
         let large = self.large.take();
         // 留作备用的全空块：上一轮领用了多少块，下一轮大概还要这么多；多的还给系统。
         // 留少了每轮都要新开块（清零 + 缺页），比如临时对象多的负载每轮几乎全空
         let spare = (*self.allocated.get_mut() / BLOCK).max(MIN_SPARE_BLOCKS);
         self.sweeper.start(epoch, blocks, large, spare);
-        self.evacuated = (evacuate, moved.into_inner());
+        self.evacuated = evacuated;
         self.epoch = epoch;
         *self.marking.get_mut() = 0;
         *self.allocated.get_mut() = 0;
         self.collections += 1;
+    }
+
+    /// 几个堆一起完整回收，收掉跨堆的环（A 的对象经 [`crate::Far`] 指向 B、B 的又指回 A，单独回收时彼此的入口都是根）。
+    ///
+    /// 组内堆持有的 Far 不算根：各堆从自己的 [`crate::Root`]（和组外持有的 Far）出发标记，追踪到 Far 就把目标交给目标堆
+    /// 接着标，直到不再有新的；没被标到的入口说明持有它的 Far 已经死了，清空。不疏散。返回时死对象都已析构。
+    /// 有并发标记在进行的堆先单独收尾。
+    pub fn collect_group(heaps: &mut [&mut Heap]) {
+        for h in heaps.iter_mut() {
+            if *h.marking.get_mut() != 0 {
+                h.finish_marking();
+            }
+            h.sweep_concurrently();
+        }
+        let ids: Vec<usize> = heaps.iter().map(|h| h.id()).collect();
+        let inside = |holder: usize| ids.contains(&holder);
+        let mut epochs = Vec::with_capacity(heaps.len());
+        for h in heaps.iter_mut() {
+            h.begin_full(false);
+            drop(h.take_available());
+            let epoch = h.next_epoch();
+            // SAFETY: &mut ⇒ 没有 mutator
+            let roots = unsafe { h.roots.settle_outside(inside) };
+            Marking::seed(&h.grey, &roots, epoch);
+            epochs.push(epoch);
+        }
+        let found = Injector::new();
+        loop {
+            for (h, &epoch) in heaps.iter().zip(&epochs) {
+                if h.grey.is_empty() {
+                    continue;
+                }
+                let pool = h.pool();
+                let workers = pool.sized(h.blocks.len() + h.large.len());
+                Marking::new(workers, epoch, &h.grey).counting(Some(h.rc_parity.load(Ordering::Acquire))).grouping(&found).run(pool);
+            }
+            for (table, header) in Self::drain(&found) {
+                // 组外的堆不在这次回收里，它的入口是自己的根，不用管
+                if let Some(j) = ids.iter().position(|&id| id == table) {
+                    Marking::seed(&heaps[j].grey, &[core::ptr::with_exposed_provenance(header)], epochs[j]);
+                }
+            }
+            if heaps.iter().all(|h| h.grey.is_empty()) {
+                break;
+            }
+        }
+        for (h, &epoch) in heaps.iter_mut().zip(&epochs) {
+            // SAFETY: 没有 mutator；还没开始清扫
+            unsafe { h.roots.clear_dead(inside, epoch) };
+            h.end_full(epoch, (0, 0));
+        }
+        for h in heaps.iter() {
+            h.sweep_concurrently();
+        }
     }
 }
 

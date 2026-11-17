@@ -36,6 +36,7 @@ paragc 是**给多个线程共用一个堆的 Rust 程序用的追踪式垃圾�
 | 🧹 **并发清扫** | `Heap::finish_marking(&mut self)` 只做标记收尾、把块交给清扫器；mutator 要块时顺手扫（惰性清扫），`Heap::sweep_concurrently(&self)` 在线程池上扫剩下的。两者都用上，停顿只剩清空灰队列。 |
 | 🏃 **并行回收** | 每个堆一个常驻线程池（两次回收之间线程挂起）。标记：每个工人一个 crossbeam 工作窃取双端队列、成批偷；清扫（含析构）：块按批分给同一批工人。 |
 | 🏷️ **带品牌的句柄** | `Gc<'gc, T>` 逃不出 `mutate` 的闭包；`Root<B>` 不带生命周期，可以存在任何地方、跨线程传。 |
+| 🔗 **堆之间直接引用** | `Far<'a, B>` 让一个堆的对象直接指着同一进程里另一个堆的对象：不复制、不经过间接表。每个堆仍然各自回收；`Heap::collect_group` 把几个堆一起追踪，收掉跨堆的环。 |
 | 📦 **机会式疏散** | 暂停式回收在标记的同时把稀疏块里的活对象搬走（Immix defrag）：一遍里完成标记、复制、改写全部边。并发标记从不搬对象，所以 mutator 不需要读屏障。 |
 | 🐣 **年轻回收** | `Heap::collect_young` 只追上次回收后分配的对象，从根与写屏障记下的槽出发，只扫上次回收后分配过的块；老对象一个不碰。`collect_if_needed` 平时做年轻回收、每几次穿插一次完整回收（LXR 式年轻对象回收的第一期）。 |
 | 🔢 **引用计数** | 老对象带一个小计数，由 `Slot` 写屏障维护（每个槽每轮登记一次），在年轻回收时结算。停顿里只加增量、把减量放进队列；`sweep_concurrently` 在线程池上与 mutator 并发地连锁释放计数归零的对象，它们的行在下一次停顿还给分配器。追踪（完整回收）少跑，只为环与计数溢出的对象（LXR 第二、三期）。 |
@@ -78,6 +79,7 @@ heap.collect();
 | 线程池 | 第一次回收时起、活到堆析构；分派 = 一个原子字（代号 + 参与人数）加一代、只叫醒参与的工人；空闲工人先退避再挂起；工人里的 panic 在回收线程上重新抛出 |
 | 清扫 | 工人按批领块：按起点位图逐个看对象，没标上本轮纪元的析构、清位；块分成 全空 / 有空行 / 满，多于总块数四分之一的空块还给系统 |
 | 根 | `Root<B>` 占根表一个槽；根表只追加，空槽号在回收时整理成只读数组、mutate 期间原子游标领取 |
+| 堆之间的引用 | 建 `Far`（同时在两个堆的 `mutate` 里）在目标堆的根表领一个槽，槽里还记着持有方堆；持有 `Far` 的对象被析构（清扫或引用计数释放）时还槽。目标堆单独回收时这些入口就是根，年轻回收、引用计数、并发标记都不用改。入口对象不搬：疏散回收开始标记之前，入口目标所在的块撤掉疏散（改当搬入目标），所以 `Far` 永远不用改写。`collect_group` 不把组内持有的入口当根：各堆从自己的根出发标记，追踪到 `Far` 就把目标交给目标堆（按那个堆的纪元标灰），轮流标到没有哪个堆还有灰对象；组内持有、目标没被标到的入口属于已死的持有方，清空，免得之后的回收拿它去碰已释放的对象 |
 | 缓冲过期 | 缓冲记着（堆, 回收次数），回收过就重来（它的块已被重新分类） |
 | 并发标记 | 开头：先把上一轮扫完（它按「纪元 ≠ 那一轮」判死，必须在新一轮把活对象标成更新纪元之前结束）；握手字（最高位请求，低位是 mutate 里的线程数）挂上请求、等 mutate 里没人、把根标灰、撤请求——paragc 不扫栈，快照只能在没有 mutator 拿着未挂根的 `Gc` 时照；然后在线程池上标记。标记期间 `Slot` 写入把被覆盖的旧值标上并放进堆的灰队列（初始快照），新对象直接拿本轮纪元、连同行一起标上（黑分配）。空行 = 行标记早于上次完成的纪元，标记方刚写上新纪元的行不会被当成空行。`finish_marking` 并行清空灰队列 |
 | 并发清扫 | `finish_marking` 把全部块与大对象交给清扫器就返回。领用是原子游标，每个块恰好被领到的那个线程扫一次、扫完才交出去：mutator 要块时先拿扫好的，没有就领一个没扫的当场扫；`sweep_concurrently` 在线程池上扫剩下的，并等别人手里领走的扫完。新对象带上次完成的纪元，清扫期间分配的不会被当成死的。`collect` = `finish_marking` + `sweep_concurrently` |
@@ -99,7 +101,10 @@ heap.collect();
   手写有边的 `Trace` 还要实现 `relocate`（derive 会生成）。
 - 不要在同一个堆的 `mutate` 里调用 `mark_concurrently`：它会一直等自己走空。
 - 有 `Gc` 字段的类型不许实现 `Drop`：析构顺序不定，`Drop` 里可能碰到已经析构的对象。derive 会检查，`#[trace(unsafe_drop)]` 关掉检查。
-- 只有从 `Root` 可达的对象能活过回收。
+- 只有从 `Root`（或别的堆里的 `Far`）可达的对象能活过回收。
+- `Far` 用 `Far::new(holder, target, gc)` 建（同时在两个堆的 `mutate` 里），只能放进持有方堆的对象里（品牌限制），
+  读要带目标堆的 `Mutator`（`far.get(mb)`）。建好后不变；要改指向，把它放在 `Slot` 后面的对象里、换掉那个对象。同一个堆里的边用 `Slot`。
+- 跨堆的环只有 `Heap::collect_group` 能收。
 - 回收进行中释放的根，它指的对象可能要到下一次回收才死。
 - 只支持 `std`。
 
@@ -122,13 +127,18 @@ heap.collect();
 | `background_release_while_mutating` | 整条老链一次扔掉：`finish_young` 返回时一个都还没析构；之后连锁释放在线程池上跑、mutator 同时照常挪，不析构还挂着的；下一次停顿空出的行被复用 |
 | `concurrent_marking_recounts` | 一轮并发标记（mutator 挪动、黑对象把节点挂到自己底下）收尾后计数立刻可信：扔掉的老链在下一次年轻回收按计数释放，之后几轮不误收挂着的节点 |
 | `reference_counting_leaves_cycles_to_tracing` | 整体扔掉的老对象链在年轻回收时按计数释放（500 层连锁）；两节点的环留到完整回收 |
+| `far_targets_are_pinned_during_evacuation` | 稀疏块，留下的对象一半还被别的堆直接指着：回收疏散了另一半，被指着的原地不动（根的路径与 `Far` 看到同一个对象），析构数精确 |
+| `far_keeps_target_until_holder_dies` · `far_survives_holder_heap_drop_order` | 自己没有根的目标在持有方活着时挺过所在堆的完整、年轻回收；持有方堆析构了持有方之后才收；目标堆先析构也安全 |
+| `cross_heap_cycle_needs_group_collection` · `rings_over_eight_heaps` | 跨 2 个、8 个堆的环挺过各堆单独回收；缺几个堆的组收不掉（组外的持有方是根）；整组一起回收恰好收掉没挂根的环，留下的环走得通 |
+| `eight_threads_relink_far_holders` | 8 线程 × 8 堆不停换掉指向别的堆的持有对象、读回来核对，另一个线程同时对每个堆并发标记；完整、年轻、一起回收轮流来；最后每个目标都被回收，没有提前的 |
 
 全部测试也在 Miri 下跑（Stacked Borrows 和 Tree Borrows，`cfg(miri)` 下自动缩规模）。要加 `-Zmiri-ignore-leaks`：
 crossbeam-epoch 的全局回收器退出时还拿着延迟释放的垃圾；每堆 4 个回收线程时 Stacked Borrows 还会在 crossbeam-epoch 内部报违例，
-所以 Miri 下测试用 2 个；两条并发测试在 Stacked Borrows 下仍会碰到 crossbeam-epoch 内部那处违例，Tree Borrows 下干净：
+所以 Miri 下测试用 2 个；`gc` 的两条并发测试和 `far_targets_are_pinned_during_evacuation`、`eight_threads_relink_far_holders`
+在 Stacked Borrows 下仍会碰到 crossbeam-epoch 内部那处违例（crossbeam-deque 压栈时），Tree Borrows 下干净：
 
 ```sh
-cargo test --test gc -- --exact <名字>
+cargo test --test gc -- --exact <名字>          # tests/far.rs：--test far
 MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-ignore-leaks" cargo +nightly miri test --test gc -- --exact <名字>
 MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-ignore-leaks -Zmiri-tree-borrows" cargo +nightly miri test --test gc -- --exact <名字>
 ```
@@ -152,7 +162,8 @@ MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-ignore-leaks -Zmiri-tree-borrows"
 ## 🗺️ 路线
 
 已完成：并行暂停式回收、常驻线程池、并发标记、并发 + 惰性清扫、机会式疏散、年轻回收、老对象引用计数（减量并发处理），
-完整追踪每 16 次年轻回收才一次、并发标记顺带重新计数、单线程重新计数更便宜。可能的下一步：并发的年轻回收、更小的 `Slot`
+完整追踪每 16 次年轻回收才一次、并发标记顺带重新计数、单线程重新计数更便宜、同一进程里堆之间的直接引用（一起回收收跨堆的环）。
+下一步：放在共享内存上、多个进程都能挂的公开堆（[设计稿](docs/cross-heap.zh-CN.md)）。其他可能的：并发的年轻回收、更小的 `Slot`
 （为了记住上次计入的值，现在占两个字）。
 
 ## 📜 许可

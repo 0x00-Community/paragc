@@ -49,11 +49,13 @@ pub struct Tracer<'t> {
     exclusive: bool,
     /// 并发标记时的引用计数登记：重新计数的槽在读与改之间被 mutator 改写了，由这里补登记（见 [`Tracer::slot`]）
     log: Option<&'t Injector<usize>>,
+    /// 一起回收几个堆（[`crate::Heap::collect_group`]）：追踪到的 Far 把（目标堆的根表, 目标对象的头）报到这里
+    group: Option<&'t Injector<(usize, usize)>>,
 }
 
 impl<'t> Tracer<'t> {
     pub(crate) fn new(work: &'t Worker<usize>, epoch: u32, copier: Option<&'t mut Copier>) -> Self {
-        Self { work, epoch, copier, count: None, decs: None, exclusive: false, log: None }
+        Self { work, epoch, copier, count: None, decs: None, exclusive: false, log: None, group: None }
     }
 
     /// 计数模式：扫描时每条边给目标 +1（种子——根与记忆集——直接走 visit，不计）。
@@ -66,13 +68,26 @@ impl<'t> Tracer<'t> {
 
     /// 释放模式：访问一个死对象时把它每条边的目标（槽取上次计入的值）放进 `decs`。
     pub(crate) fn releasing(work: &'t Worker<usize>, decs: &'t mut Vec<usize>) -> Self {
-        Self { work, epoch: 0, copier: None, count: None, decs: Some(decs), exclusive: false, log: None }
+        Self { work, epoch: 0, copier: None, count: None, decs: Some(decs), exclusive: false, log: None, group: None }
     }
 
     /// 并发标记：给登记队列（见 [`Tracer::log`]）。
     pub(crate) fn logging(mut self, log: Option<&'t Injector<usize>>) -> Self {
         self.log = log;
         self
+    }
+
+    /// 一起回收：给报告 Far 目标的队列。
+    pub(crate) fn grouping(mut self, group: Option<&'t Injector<(usize, usize)>>) -> Self {
+        self.group = group;
+        self
+    }
+
+    /// 追踪到一个 [`crate::Far`]：一起回收时报上去（由目标堆接着标），平时什么都不做（目标堆的入口就是根）。
+    pub(crate) fn far(&mut self, table: usize, header: *const Header) {
+        if let Some(group) = self.group {
+            group.push((table, header.expose_provenance()));
+        }
     }
 
     fn inc(&self, header: *const Header) {

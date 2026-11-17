@@ -37,6 +37,7 @@ collection marks and sweeps on every core.
 | 🧹 **Concurrent sweeping** | `Heap::finish_marking(&mut self)` only finishes marking and hands the blocks to the sweeper; mutators sweep a block themselves when they need one (lazy sweeping) while `Heap::sweep_concurrently(&self)` sweeps the rest on the pool. With both, the pause is just draining the grey queue. |
 | 🏃 **Parallel collection** | A persistent pool per heap (threads park between collections). Marking: one crossbeam work-stealing deque per worker, stealing in batches. Sweeping, destructors included: blocks handed out in batches to the same workers. |
 | 🏷️ **Branded handles** | `Gc<'gc, T>` cannot escape the `mutate` closure. `Root<B>` handles carry no lifetime and can be stored anywhere and sent across threads. |
+| 🔗 **References between heaps** | `Far<'a, B>` lets an object in one heap point straight at an object in another heap of the same process: no copy, no indirection. Each heap still collects on its own; `Heap::collect_group` traces several heaps together to reclaim cycles that span them. |
 | 📦 **Opportunistic evacuation** | A stop-the-world collection moves the live objects out of sparse blocks while it marks (Immix defragmentation): one pass marks, copies and rewrites every edge. Concurrent marking never moves anything, so mutators need no read barrier. |
 | 🐣 **Young collections** | `Heap::collect_young` traces only objects allocated since the last collection, starting from the roots and the slots the write barrier logged, and sweeps only the blocks allocated into since; old objects are not touched. `collect_if_needed` runs young collections and a full one every few rounds (the first stage of LXR-style young-object reclamation). |
 | 🔢 **Reference counting** | Old objects carry a small reference count, maintained by the `Slot` write barrier (each slot logged once per round) and settled at young collections. The pause only applies increments and queues the decrements; `sweep_concurrently` frees objects whose count drops to zero on the pool, cascading, while mutators run, and their lines return to the allocator at the next pause. Tracing (a full collection) runs rarely, for cycles and objects whose count overflowed (LXR stages two and three). |
@@ -89,6 +90,7 @@ assert_eq!(sum, 999 * 1000 / 2);
 | Thread pool | Started at the first collection, lives as long as the heap. A collection is handed out by bumping one atomic word (generation + number of participants) and unparking only those workers; idle workers back off, then park. A panic on a worker is re-raised on the collecting thread. |
 | Sweeping | Workers claim blocks in batches, walk the start bitmap, drop unmarked objects and classify each block as empty / recyclable / full. Spare empty blocks beyond a quarter of the heap go back to the system. |
 | Roots | Each `Root<B>` owns a slot in an append-only table; freed slot numbers are folded into a read-only array at collection time and claimed with an atomic cursor during `mutate`. |
+| References between heaps | Creating a `Far` (inside both heaps' `mutate`) claims a slot in the target heap's root table that also records the holder heap; finalizing the object that holds the `Far` (sweeping or a reference-count release) returns the slot. Collecting the target heap alone treats these entries as roots, so young collections, reference counting and concurrent marking need nothing new. Entries are pinned: before an evacuating collection marks anything, the blocks holding entry targets drop out of evacuation (and become copy targets), so a `Far` never needs rewriting. `collect_group` does not take entries held inside the group as roots: each heap marks from its own roots, a traced `Far` hands its target to the target heap (seeded with that heap's epoch), and the heaps take turns until no heap has grey objects left; entries held inside the group whose target stayed unmarked belong to dead holders and are cleared, so a later collection never seeds a freed object. |
 | Stale buffers | A buffer remembers (heap, collection count); after a collection it starts over, because its block was re-classified. |
 | Concurrent marking | Start: finish the previous sweep (it judges by "mark ≠ that epoch", so it must end before the next marking stamps live objects with a newer one), raise a request bit in the gate word (top bit; low bits count threads inside `mutate`), wait until no mutator is inside, mark the roots grey, drop the request. paragc does not scan stacks, so the snapshot has to be taken when no mutator holds an unrooted `Gc`. Then mark on the pool. During marking, a `Slot` write marks the value it overwrites and puts it in the heap's grey queue (snapshot at the beginning), new objects get the marking epoch and their lines marked (black). A line is free when its mark is older than the last finished epoch, so lines the marker has just stamped are never handed out. `finish_marking` drains the grey queue in parallel. |
 | Concurrent sweeping | `finish_marking` hands every block and large object to the sweeper and returns. Claiming is an atomic cursor, so each block is swept exactly once by whoever claims it, before it is handed out: a mutator that needs a block first takes a swept one, otherwise claims an unswept block and sweeps it on the spot; `sweep_concurrently` sweeps the rest on the pool and waits for blocks others are still sweeping. New objects carry the last finished epoch, so allocations during sweeping are never taken for dead. `collect` = `finish_marking` + `sweep_concurrently`. |
@@ -114,7 +116,11 @@ Work-stealing deques and backoff come from [crossbeam](https://github.com/crossb
 - Never call `mark_concurrently` from inside a `mutate` on the same heap: it would wait for itself to leave.
 - A type with `Gc` fields must not implement `Drop`: destructors run in no particular order, so a `Drop` could see
   objects that were already dropped. The derive checks this; `#[trace(unsafe_drop)]` opts out.
-- Only objects reachable from a `Root` survive a collection.
+- Only objects reachable from a `Root` (or from a `Far` in another heap) survive a collection.
+- A `Far` is created with `Far::new(holder, target, gc)` while inside both heaps' `mutate`, can only be stored in the
+  holder heap's objects (its brand), and is read with the target heap's `Mutator` (`far.get(mb)`). It never changes;
+  to point elsewhere, keep it in an object behind a `Slot` and replace that object. Edges within one heap use `Slot`.
+- Cycles that span heaps are reclaimed only by `Heap::collect_group`.
 - A root released while a collection is running may keep its object alive until the next one.
 - `std` only.
 
@@ -137,15 +143,20 @@ Work-stealing deques and backoff come from [crossbeam](https://github.com/crossb
 | `background_release_while_mutating` | An old chain dropped at once: `finish_young` returns with nothing freed yet; the cascade then runs on the pool while mutators keep relinking, freeing nothing still linked; at the next pause the freed lines are reused |
 | `concurrent_marking_recounts` | After one concurrent mark (mutators relinking, black objects hanging nodes under themselves) the counts are trusted at once: a dropped old chain is freed by count at the next young collection, and later rounds never free a linked node |
 | `reference_counting_leaves_cycles_to_tracing` | Chains of old objects dropped at once are freed by their counts at a young collection (a 500-deep cascade); two-node rings stay until a full collection |
+| `far_targets_are_pinned_during_evacuation` | Sparse blocks, half of the survivors also held from another heap: the collection evacuates the other half, the held objects stay where they are (the root path and the `Far` see the same object), finalization exact |
+| `far_keeps_target_until_holder_dies` · `far_survives_holder_heap_drop_order` | A target with no root of its own survives full and young collections of its heap while the holder lives, and goes once the holder heap has finalized the holder; dropping the target heap first is safe |
+| `cross_heap_cycle_needs_group_collection` · `rings_over_eight_heaps` | Rings across 2 and 8 heaps survive collecting each heap alone; a group missing some of the heaps keeps them (outside holders are roots); the full group frees exactly the unrooted rings, the kept rings stay walkable |
+| `eight_threads_relink_far_holders` | 8 threads × 8 heaps keep replacing holders that point into other heaps and reading them back, while another thread marks every heap concurrently; full, young and group collections in turn; every target finalized at the end, none early |
 
 All of them also run under Miri with both Stacked Borrows and Tree Borrows (scaled down under `cfg(miri)`).
 `-Zmiri-ignore-leaks` is needed because crossbeam-epoch's global collector still holds deferred garbage at exit; at
 4 collector threads per heap Stacked Borrows also reports a violation inside crossbeam-epoch itself, so the tests use 2
-under Miri; the two concurrent tests still hit that crossbeam-epoch violation under Stacked Borrows, and are clean under
-Tree Borrows:
+under Miri; the two concurrent `gc` tests and `far_targets_are_pinned_during_evacuation` /
+`eight_threads_relink_far_holders` still hit that crossbeam-epoch violation under Stacked Borrows (inside a
+crossbeam-deque push), and are clean under Tree Borrows:
 
 ```sh
-cargo test --test gc -- --exact <name>
+cargo test --test gc -- --exact <name>          # tests/far.rs: --test far
 MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-ignore-leaks" cargo +nightly miri test --test gc -- --exact <name>
 MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-ignore-leaks -Zmiri-tree-borrows" cargo +nightly miri test --test gc -- --exact <name>
 ```
@@ -172,8 +183,9 @@ collection marks on one thread even with every parallel flag on, and pays an FFI
 
 Done: parallel stop-the-world collection, a persistent pool, concurrent marking, concurrent and lazy sweeping,
 opportunistic evacuation, young collections, reference counting for old objects with decrements processed concurrently,
-full tracing run only every 16 young collections, concurrent marking that recounts, and a cheaper single-threaded
-recount. Possible next steps: a concurrent young collection, and a smaller `Slot` (it is two words to remember the
+full tracing run only every 16 young collections, concurrent marking that recounts, a cheaper single-threaded
+recount, and direct references between heaps of one process with group collection for cycles across them. Next: public
+heaps in shared memory that several processes attach to ([design](docs/cross-heap.zh-CN.md)). Other possible steps: a concurrent young collection, and a smaller `Slot` (it is two words to remember the
 value last counted).
 
 ## 📜 License

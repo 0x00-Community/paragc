@@ -126,6 +126,11 @@ impl Block {
         self.meta().evacuate.store(true, Ordering::Relaxed);
     }
 
+    /// 不疏散这个块（里面有别的堆直接指着的对象）；原来要疏散返回 true。
+    pub(crate) fn pin(self) -> bool {
+        self.meta().evacuate.swap(false, Ordering::Relaxed)
+    }
+
     pub(crate) fn is_evacuating(self) -> bool {
         self.meta().evacuate.load(Ordering::Relaxed)
     }
