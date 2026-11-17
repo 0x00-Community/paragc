@@ -38,7 +38,7 @@ use crate::{Gc, Trace};
 use crate::handle::{GcInternal, Invariant, RawSlot, RootTable};
 #[cfg(target_os = "linux")]
 use crate::handle::{EdgeMap, Public, PublicBrand, PublicGc, PublicGcInternal, PublicInternal, Shared};
-use crate::layout::{BLOCK, Block, Pages, LINE, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, HEADER, Header, LARGE, MAX_EPOCH, MIN_SPARE_BLOCKS, MIN_TRIGGER, OVERFLOW_TRIES, FRAG_NUM, FRAG_DEN, YOUNG_PER_FULL, YOUNG_PER_FULL_RC};
+use crate::layout::{BLOCK, Block, Pages, WARM_CYCLES, LINE, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, HEADER, Header, LARGE, MAX_EPOCH, MIN_SPARE_BLOCKS, MIN_TRIGGER, OVERFLOW_TRIES, FRAG_NUM, FRAG_DEN, YOUNG_PER_FULL, YOUNG_PER_FULL_RC};
 #[cfg(target_os = "linux")]
 use crate::layout::{Core, State};
 #[cfg(target_os = "linux")]
@@ -106,6 +106,10 @@ pub struct Heap {
     roots: Arc<RootTable>,
     /// 上次回收后新领用的字节数（按块 / 大对象计）
     allocated: AtomicUsize,
+    /// 最近 [`WARM_CYCLES`] 轮各领用了多少块（定 [`Pages`] 热池的上限）
+    recent: [usize; WARM_CYCLES],
+    /// 这一轮回收是 [`Heap::collect_if_needed`] 发起的（按分配量自动回收）：只有这种留 [`Pages`] 热池
+    automatic: bool,
     /// 上次回收疏散的块数 / 字节数
     evacuated: (usize, usize),
     /// 给 [`Heap::mutate`] 复用的分配缓冲
@@ -193,6 +197,8 @@ impl Heap {
             pages: Pages::default(),
             roots: Arc::default(),
             allocated: AtomicUsize::new(0),
+            recent: [0; WARM_CYCLES],
+            automatic: false,
             evacuated: (0, 0),
             spare: AtomicPtr::new(null_mut()),
         }
@@ -458,11 +464,13 @@ impl Heap {
             let every = if *self.rc_valid.get_mut() { YOUNG_PER_FULL_RC } else { YOUNG_PER_FULL };
             // 碎了：块占的比「存活 + 这一轮允许新分配的」多出 FRAG_RATIO 倍 ⇒ 完整回收（带疏散），不等轮到
             let fragmented = self.blocks.len() * BLOCK * FRAG_DEN > live * (1 + GROWTH) * FRAG_NUM;
+            self.automatic = true;
             if self.young_since_full < every && !fragmented {
                 self.collect_young();
             } else {
                 self.collect();
             }
+            self.automatic = false;
         }
         due
     }
@@ -573,6 +581,7 @@ impl Heap {
         self.blocks.extend(old);
         let large = self.large.take();
         let spare = (*self.allocated.get_mut() / BLOCK).max(MIN_SPARE_BLOCKS);
+        self.warm_for_next_cycle(false);
         self.sweeper.start(epoch, young, large, spare, false);
         self.evacuated = (0, moved.into_inner());
         *self.allocated.get_mut() = 0;
@@ -597,6 +606,18 @@ impl Heap {
     pub fn collect(&mut self) {
         self.finish_marking();
         self.sweep_concurrently();
+    }
+
+    /// 清扫前定 [`Pages`] 热池的上限。清扫留作备用的全空块按这一轮的领用算；领用在涨的负载（存活的多了，触发线跟着
+    /// 抬高）下一轮要得更多，多出来的块一还一领就是 `madvise` 再整块缺页。所以备用的加上热池的，合起来留到最近
+    /// [`WARM_CYCLES`] 轮里领用最多的那一轮那么多；负载降下来，几轮之后多的就还给系统。只有自动回收
+    /// （[`Heap::collect_if_needed`]）这样留；直接调的回收（[`Heap::collect`] 等）和 `shrinking` 热池一块不留。
+    fn warm_for_next_cycle(&mut self, shrinking: bool) {
+        self.recent.rotate_right(1);
+        self.recent[0] = *self.allocated.get_mut() / BLOCK;
+        let most = self.recent.iter().copied().max().unwrap_or(0);
+        let cap = if shrinking || !self.automatic { 0 } else { most - self.recent[0] };
+        self.pages.set_warm_cap(cap);
     }
 
     /// 尽量把内存还给系统（像 cppgc 的减内存回收）：完整回收（带疏散），全空的块一个不留，
@@ -694,6 +715,7 @@ impl Heap {
         // 留少了每轮都要新开块（清零 + 缺页），比如临时对象多的负载每轮几乎全空
         let shrinking = *self.shrinking.get_mut();
         let spare = if shrinking { 0 } else { (*self.allocated.get_mut() / BLOCK).max(MIN_SPARE_BLOCKS) };
+        self.warm_for_next_cycle(shrinking);
         self.sweeper.start(epoch, blocks, large, spare, shrinking);
         self.evacuated = evacuated;
         self.epoch = epoch;
@@ -804,6 +826,8 @@ impl Drop for Heap {
         // 从没回收过就不为析构专门起线程
         let pool = self.pool.take().unwrap_or_else(|| Pool::new(NonZeroUsize::MIN));
         let parallel_drop = *self.parallel_drop.get_mut();
+        // 块随后整段解除映射：还回来的不必先 madvise
+        self.pages.set_warm_cap(usize::MAX);
         // 先把上一轮扫完，再用一个比谁都新的纪元（并发标记中的也算死）不标记直接扫一轮：全部析构，全空块不留备用全部还回去
         self.sweeper.finish(&pool, self, parallel_drop);
         let epoch = self.epoch.max(*self.marking.get_mut()).wrapping_add(1);

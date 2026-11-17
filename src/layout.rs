@@ -81,6 +81,8 @@ pub const FRAG_NUM: usize = 3;
 pub const FRAG_DEN: usize = 2;
 /// 回收后至少留着复用的全空块数
 pub const MIN_SPARE_BLOCKS: usize = 4;
+/// [`Pages`] 的热池按最近几轮的领用定上限
+pub const WARM_CYCLES: usize = 4;
 /// 溢出分配领块时最多看几个可用块（找有放得下中对象的空洞的），都不行就开新块
 pub const OVERFLOW_TRIES: usize = 8;
 
@@ -609,14 +611,24 @@ const CHUNK: usize = 2 * 1024 * 1024;
 
 /// 私有堆的块从这里领、还回这里（每个堆一份）。
 ///
-/// Linux：自己 mmap 一段段（[`CHUNK`]），切成按 [`BLOCK`] 对齐的块放进空闲池；还回来的块先 `madvise(MADV_DONTNEED)`
-/// 把物理内存还给系统，地址进池复用（不经 glibc：对齐分配有额外开销，释放的内存它也不还给系统）。
+/// Linux：自己 mmap 一段段（[`CHUNK`]），切成按 [`BLOCK`] 对齐的块放进空闲池（不经 glibc：对齐分配有额外开销，释放的内存它也
+/// 不还给系统）。还回来的块先进热池，内存留着（下一轮多半又要这么多块，`madvise` 掉再缺页拿回来是白干）；热池满了（上限见
+/// [`Pages::set_warm_cap`]）才 `madvise(MADV_DONTNEED)` 把物理内存还给系统，地址进冷池复用。领块先领热的。
 /// 映射的段在堆析构时一起解除。其他平台与 Miri 下走全局分配器。
 #[derive(Default)]
 pub struct Pages {
-    /// 空闲的块（地址）
+    /// 空闲的块（地址），没有物理内存（新切的或 `madvise` 过的）
     #[cfg(all(target_os = "linux", not(miri)))]
     free: Injector<usize>,
+    /// 空闲的块（地址），内存还在
+    #[cfg(all(target_os = "linux", not(miri)))]
+    warm: Injector<usize>,
+    /// 热池里有几块（可能短暂多算：先加后放）
+    #[cfg(all(target_os = "linux", not(miri)))]
+    warm_len: core::sync::atomic::AtomicUsize,
+    /// 热池最多留几块
+    #[cfg(all(target_os = "linux", not(miri)))]
+    warm_cap: core::sync::atomic::AtomicUsize,
     /// 映射过的段（起点地址），析构时解除
     #[cfg(all(target_os = "linux", not(miri)))]
     chunks: Injector<usize>,
@@ -624,14 +636,45 @@ pub struct Pages {
 
 impl Pages {
     #[cfg(all(target_os = "linux", not(miri)))]
-    fn take(&self) -> NonNull<Meta> {
+    fn steal(pool: &Injector<usize>) -> Option<NonNull<Meta>> {
         loop {
-            match self.free.steal() {
+            match pool.steal() {
                 // SAFETY: 池里只有本对象切出来、非零的块地址
-                Steal::Success(addr) => return unsafe { NonNull::new_unchecked(core::ptr::with_exposed_provenance_mut(addr)) },
+                Steal::Success(addr) => {
+                    return Some(unsafe { NonNull::new_unchecked(core::ptr::with_exposed_provenance_mut(addr)) });
+                }
                 Steal::Retry => {}
-                Steal::Empty => break,
+                Steal::Empty => return None,
             }
+        }
+    }
+
+    /// 热池最多留 `cap` 块；多出来的现在就还给系统。`usize::MAX`：一块都不还（马上要整段解除时）。
+    #[cfg(all(target_os = "linux", not(miri)))]
+    pub fn set_warm_cap(&self, cap: usize) {
+        self.warm_cap.store(cap, Ordering::Relaxed);
+        while self.warm_len.load(Ordering::Relaxed) > cap {
+            let Some(p) = Self::steal(&self.warm) else {
+                break;
+            };
+            self.warm_len.fetch_sub(1, Ordering::Relaxed);
+            // SAFETY: 热池里的块没人在用
+            unsafe { self.discard(p) };
+        }
+    }
+
+    #[cfg(any(not(target_os = "linux"), miri))]
+    #[expect(clippy::unused_self, reason = "与 Linux 版同签名")]
+    pub fn set_warm_cap(&self, _cap: usize) {}
+
+    #[cfg(all(target_os = "linux", not(miri)))]
+    fn take(&self) -> NonNull<Meta> {
+        if let Some(p) = Self::steal(&self.warm) {
+            self.warm_len.fetch_sub(1, Ordering::Relaxed);
+            return p;
+        }
+        if let Some(p) = Self::steal(&self.free) {
+            return p;
         }
         let base = self.map_chunk();
         // 第一块自己用，其余进池
@@ -671,6 +714,18 @@ impl Pages {
     /// SAFETY（调用方）：`p` 来自本对象的 [`Pages::take`]，之后不再使用。
     #[cfg(all(target_os = "linux", not(miri)))]
     unsafe fn give(&self, p: NonNull<Meta>) {
+        if self.warm_len.fetch_add(1, Ordering::Relaxed) < self.warm_cap.load(Ordering::Relaxed) {
+            self.warm.push(p.as_ptr().expose_provenance());
+            return;
+        }
+        self.warm_len.fetch_sub(1, Ordering::Relaxed);
+        // SAFETY: 见上
+        unsafe { self.discard(p) };
+    }
+
+    /// 物理内存还给系统，块进冷池。SAFETY（调用方）：同 [`Pages::give`]。
+    #[cfg(all(target_os = "linux", not(miri)))]
+    unsafe fn discard(&self, p: NonNull<Meta>) {
         // SAFETY: 块在本对象映射的段里；DONTNEED 只丢内容，地址仍可用
         unsafe { libc::madvise(p.as_ptr().cast(), BLOCK, libc::MADV_DONTNEED) };
         self.free.push(p.as_ptr().expose_provenance());
