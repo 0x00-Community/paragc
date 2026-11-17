@@ -38,7 +38,7 @@ use crate::{Gc, Trace};
 use crate::handle::{GcInternal, Invariant, RawSlot, RootTable};
 #[cfg(target_os = "linux")]
 use crate::handle::{EdgeMap, Public, PublicBrand, PublicGc, PublicGcInternal, PublicInternal, Shared};
-use crate::layout::{BLOCK, Block, Pages, LINE, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, HEADER, Header, LARGE, MAX_EPOCH, MIN_SPARE_BLOCKS, MIN_TRIGGER, OVERFLOW_TRIES, FRAG_NUM, FRAG_DEN, YOUNG_PER_FULL, YOUNG_PER_FULL_RC};
+use crate::layout::{BLOCK, Block, Pages, WARM_CYCLES, YOUNG_COPY_DEN, YOUNG_COPY_NUM, LINE, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, HEADER, Header, LARGE, MAX_EPOCH, MIN_SPARE_BLOCKS, MIN_TRIGGER, OVERFLOW_TRIES, FRAG_NUM, FRAG_DEN, YOUNG_PER_FULL, YOUNG_PER_FULL_RC};
 #[cfg(target_os = "linux")]
 use crate::layout::{Core, State};
 #[cfg(target_os = "linux")]
@@ -106,6 +106,12 @@ pub struct Heap {
     roots: Arc<RootTable>,
     /// 上次回收后新领用的字节数（按块 / 大对象计）
     allocated: AtomicUsize,
+    /// 最近 [`WARM_CYCLES`] 轮各领用了多少块（定 [`Pages`] 热池的上限）
+    recent: [usize; WARM_CYCLES],
+    /// 这一轮回收是 [`Heap::collect_if_needed`] 发起的（按分配量自动回收）：只有这种留 [`Pages`] 热池
+    automatic: bool,
+    /// 上一次回收是年轻回收时它之前领用的字节数（清扫完存活的年轻字节除以它就是存活率）；完整回收后为 0
+    young_allocated: usize,
     /// 上次回收疏散的块数 / 字节数
     evacuated: (usize, usize),
     /// 给 [`Heap::mutate`] 复用的分配缓冲
@@ -193,6 +199,9 @@ impl Heap {
             pages: Pages::default(),
             roots: Arc::default(),
             allocated: AtomicUsize::new(0),
+            recent: [0; WARM_CYCLES],
+            young_allocated: 0,
+            automatic: false,
             evacuated: (0, 0),
             spare: AtomicPtr::new(null_mut()),
         }
@@ -222,7 +231,9 @@ impl Heap {
         tlab.adopt((self.id(), self.collections));
         // 并发标记只在没有 mutator 时开始、只在独占堆时结束，所以一次 mutate 里它不变
         let marking = NonZeroU32::new(self.marking.load(Ordering::Acquire));
-        f(&Mutator { heap: self, tlab, marking, _brand: PhantomData })
+        // 闭包 panic 也要把攒着的起点位写进去：漏了，下一次停顿重算行时会把活对象占的行当空行
+        let tlab = FlushStarts(tlab);
+        f(&Mutator { heap: self, tlab: tlab.0, marking, _brand: PhantomData })
     }
 
     fn pool(&self) -> &Pool {
@@ -458,11 +469,13 @@ impl Heap {
             let every = if *self.rc_valid.get_mut() { YOUNG_PER_FULL_RC } else { YOUNG_PER_FULL };
             // 碎了：块占的比「存活 + 这一轮允许新分配的」多出 FRAG_RATIO 倍 ⇒ 完整回收（带疏散），不等轮到
             let fragmented = self.blocks.len() * BLOCK * FRAG_DEN > live * (1 + GROWTH) * FRAG_NUM;
+            self.automatic = true;
             if self.young_since_full < every && !fragmented {
                 self.collect_young();
             } else {
                 self.collect();
             }
+            self.automatic = false;
         }
         due
     }
@@ -498,12 +511,12 @@ impl Heap {
             }
         }
         let epoch = self.epoch;
+        let mode = self.young_mode();
         let remembered = Self::drain(&self.remembered);
         let counting = *self.rc_valid.get_mut();
         let parity = *self.rc_parity.get_mut();
         let pool = self.pool.get_or_init(|| Pool::new(self.threads));
         let workers = pool.sized(self.blocks.len() + self.large.len());
-        let mode = YoungEvacuation::from(*self.young_evacuation.get_mut());
         // 晋升的对象被扫描时，它的每条边 +1（年轻对象的边从晋升起才计数）
         let mark = Marking::new(workers, epoch, &self.grey).counting(counting.then_some(parity));
         let moved = AtomicUsize::new(0);
@@ -573,12 +586,23 @@ impl Heap {
         self.blocks.extend(old);
         let large = self.large.take();
         let spare = (*self.allocated.get_mut() / BLOCK).max(MIN_SPARE_BLOCKS);
+        self.warm_for_next_cycle(false);
         self.sweeper.start(epoch, young, large, spare, false);
         self.evacuated = (0, moved.into_inner());
+        self.young_allocated = *self.allocated.get_mut();
         *self.allocated.get_mut() = 0;
         self.collections += 1;
         self.young_collections += 1;
         self.young_since_full += 1;
+    }
+
+    /// 这一轮年轻回收怎么搬：按设定，但上一次年轻回收几乎全活下来（年轻对象多半要活一阵子，比如一批批建了又整批丢掉
+    /// 的对象）时原地晋升——搬它们只是把刚分配的又复制一遍，块也不碎（活的挤在一起）；碎片留给完整回收疏散。
+    /// 要在上一轮清扫完之后调（存活字节数才全）。
+    fn young_mode(&mut self) -> YoungEvacuation {
+        let allocated = core::mem::take(&mut self.young_allocated);
+        let mode = YoungEvacuation::from(*self.young_evacuation.get_mut());
+        if allocated > 0 && self.sweeper.live() * YOUNG_COPY_DEN > allocated * YOUNG_COPY_NUM { YoungEvacuation::Off } else { mode }
     }
 
     /// 取空一个队列。
@@ -597,6 +621,18 @@ impl Heap {
     pub fn collect(&mut self) {
         self.finish_marking();
         self.sweep_concurrently();
+    }
+
+    /// 清扫前定 [`Pages`] 热池的上限。清扫留作备用的全空块按这一轮的领用算；领用在涨的负载（存活的多了，触发线跟着
+    /// 抬高）下一轮要得更多，多出来的块一还一领就是 `madvise` 再整块缺页。所以备用的加上热池的，合起来留到最近
+    /// [`WARM_CYCLES`] 轮里领用最多的那一轮那么多；负载降下来，几轮之后多的就还给系统。只有自动回收
+    /// （[`Heap::collect_if_needed`]）这样留；直接调的回收（[`Heap::collect`] 等）和 `shrinking` 热池一块不留。
+    fn warm_for_next_cycle(&mut self, shrinking: bool) {
+        self.recent.rotate_right(1);
+        self.recent[0] = *self.allocated.get_mut() / BLOCK;
+        let most = self.recent.iter().copied().max().unwrap_or(0);
+        let cap = if shrinking || !self.automatic { 0 } else { most - self.recent[0] };
+        self.pages.set_warm_cap(cap);
     }
 
     /// 尽量把内存还给系统（像 cppgc 的减内存回收）：完整回收（带疏散），全空的块一个不留，
@@ -687,6 +723,7 @@ impl Heap {
     /// 完整回收收尾（独占）：计数可信了；全部块交给清扫器（疏散时新开的块也已登记），清扫好的可用块之后再一个个放回
     /// available（它们本来就都在 blocks 里）。`evacuated`：疏散的块数与字节数。
     fn end_full(&mut self, epoch: u32, evacuated: (usize, usize)) {
+        self.young_allocated = 0;
         *self.rc_valid.get_mut() = true;
         let blocks = self.blocks.take();
         let large = self.large.take();
@@ -694,6 +731,7 @@ impl Heap {
         // 留少了每轮都要新开块（清零 + 缺页），比如临时对象多的负载每轮几乎全空
         let shrinking = *self.shrinking.get_mut();
         let spare = if shrinking { 0 } else { (*self.allocated.get_mut() / BLOCK).max(MIN_SPARE_BLOCKS) };
+        self.warm_for_next_cycle(shrinking);
         self.sweeper.start(epoch, blocks, large, spare, shrinking);
         self.evacuated = evacuated;
         self.epoch = epoch;
@@ -804,6 +842,8 @@ impl Drop for Heap {
         // 从没回收过就不为析构专门起线程
         let pool = self.pool.take().unwrap_or_else(|| Pool::new(NonZeroUsize::MIN));
         let parallel_drop = *self.parallel_drop.get_mut();
+        // 块随后整段解除映射：还回来的不必先 madvise
+        self.pages.set_warm_cap(usize::MAX);
         // 先把上一轮扫完，再用一个比谁都新的纪元（并发标记中的也算死）不标记直接扫一轮：全部析构，全空块不留备用全部还回去
         self.sweeper.finish(&pool, self, parallel_drop);
         let epoch = self.epoch.max(*self.marking.get_mut()).wrapping_add(1);
@@ -821,8 +861,16 @@ impl Drop for Heap {
     }
 }
 
+/// mutate 结束（含 panic）时把分配缓冲攒着的起点位写进块里。
+struct FlushStarts<'a>(&'a Tlab);
+
+impl Drop for FlushStarts<'_> {
+    fn drop(&mut self) {
+        self.0.flush_starts();
+    }
+}
+
 /// 线程的分配缓冲：主游标与溢出游标（各自的块、找到哪一行、当前空洞的游标与界）。块在两次回收之间只归它。
-#[derive(Default)]
 pub struct Tlab {
     /// (所属堆, 那时的回收次数)；对不上就作废
     owner: Cell<(usize, u64)>,
@@ -831,6 +879,16 @@ pub struct Tlab {
     overflow: Bump,
     /// 公开堆：上一次分配的（类型名的地址, 类型号）
     last: Cell<Option<(usize, u32)>>,
+    /// 还没写进块里的起点位：(起点位图里的一个字, 要置上的位)。连着分配的对象多半落在同一个字里，攒着换字时一次写进去，
+    /// 不必每个对象一次原子 RMW。块在两次回收之间只归这个缓冲；起点位只在停顿里读（那时 mutate 都已结束、写进去了），
+    /// 并发的引用计数释放只清别的（老对象的）位，所以晚写不碍事
+    starts: Cell<(*const AtomicU64, u64)>,
+}
+
+impl Default for Tlab {
+    fn default() -> Self {
+        Self { owner: Cell::default(), main: Bump::default(), overflow: Bump::default(), last: Cell::default(), starts: Cell::new((core::ptr::null(), 0)) }
+    }
 }
 
 // SAFETY: 指针指向它独占的块；移到别的线程后由那个线程独占使用
@@ -839,9 +897,32 @@ unsafe impl Send for Tlab {}
 impl Tlab {
     /// 换了堆或堆回收过（`owner` = (堆, 回收次数)）：之前的块已经被清扫重新分类，丢掉；同一个堆的类型号缓存留着。
     fn adopt(&mut self, owner: (usize, u64)) {
+        self.flush_starts();
         if self.owner.get() != owner {
             let last = if self.owner.get().0 == owner.0 { self.last.get() } else { None };
             *self = Self { owner: Cell::new(owner), last: Cell::new(last), ..Self::default() };
+        }
+    }
+
+    /// 记下 `p` 处有一个对象（见 [`Tlab::starts`]）。
+    #[inline]
+    fn note_start(&self, p: *const u8) {
+        let (word, bit) = Block::containing(p).start_bit(p);
+        let (cur, bits) = self.starts.get();
+        if core::ptr::eq(cur, word) {
+            self.starts.set((cur, bits | bit));
+        } else {
+            self.flush_starts();
+            self.starts.set((word, bit));
+        }
+    }
+
+    /// 攒着的起点位写进块里。
+    fn flush_starts(&self) {
+        let (word, bits) = self.starts.replace((core::ptr::null(), 0));
+        if bits != 0 {
+            // SAFETY: 字在本缓冲独占的块里，块在回收之前不会还回去（回收前 mutate 结束时已经写过）
+            unsafe { &*word }.fetch_or(bits, Ordering::Relaxed);
         }
     }
 
@@ -980,7 +1061,7 @@ impl<'gc> Mutator<'gc> {
 
     fn alloc_small(&self, bytes: usize) -> *mut u8 {
         let p = self.tlab.bump(bytes, self.heap.epoch, || self.heap.acquire(), |need| self.heap.acquire_for(need));
-        Block::containing(p).set_start(p);
+        self.tlab.note_start(p);
         p
     }
 }
