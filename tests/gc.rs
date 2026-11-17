@@ -1115,3 +1115,22 @@ fn concurrent_marking_recounts() {
     drop(spare);
     moves.finish(heap, board);
 }
+
+#[test]
+fn gc_from_raw_round_trip() {
+    // 布局：一个指针大小，Option 也是（repr(transparent) + NonNull）
+    assert_eq!(size_of::<Gc<'static, u64>>(), size_of::<*const u64>());
+    assert_eq!(size_of::<Option<Gc<'static, u64>>>(), size_of::<*const u64>());
+    let heap = Heap::new(THREADS);
+    heap.mutate(|m| {
+        let a = m.alloc(Node { value: 7, next: None });
+        let b = m.alloc(Node { value: 8, next: Some(a) });
+        // 拆成裸地址再取回（同一次 mutate 里）
+        let raw = b.as_ptr();
+        // SAFETY: raw 是这次 mutate 里 b 的数据指针，b 活着
+        let back: Gc<'_, Node<'_>> = unsafe { Gc::from_raw(raw) };
+        assert!(Gc::ptr_eq(back, b));
+        assert_eq!(back.value, 8);
+        assert_eq!(back.next.map(|n| n.value), Some(7));
+    });
+}

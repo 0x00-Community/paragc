@@ -47,7 +47,10 @@ pub type Invariant<'gc> = PhantomData<Cell<&'gc ()>>;
 /// Gc 的品牌：借着 `&'gc T`，再加上对 `'gc` 不变
 type GcBrand<'gc, T> = PhantomData<(&'gc T, fn(&'gc ()) -> &'gc ())>;
 
-/// 指向堆对象的指针，只在一次 `mutate` 里有效（`'gc` 是那次调用的品牌）。对象不会移动。
+/// 指向堆对象的指针，只在一次 `mutate` 里有效（`'gc` 是那次调用的品牌）。对象只在暂停式回收（两次 mutate 之间）时可能被搬走。
+///
+/// 布局保证就是一个 `NonNull<T>`（`#[repr(transparent)]`），所以 `Option<Gc<'_, T>>` 也是一个指针大小。
+#[repr(transparent)]
 pub struct Gc<'gc, T> {
     ptr: NonNull<T>,
     _brand: GcBrand<'gc, T>,
@@ -93,6 +96,20 @@ impl<T> GcInternal for Gc<'_, T> {
 impl<'gc, T> Gc<'gc, T> {
     pub fn as_ptr(self) -> *const T {
         self.ptr.as_ptr()
+    }
+
+    /// 由数据指针（[`Gc::as_ptr`] 的结果）取回 `Gc`，比如从 NaN-boxing 的值里解出来。
+    ///
+    /// # Safety
+    /// `ptr` 必须是本堆里一个活对象的数据指针，而且是在当前这次 `mutate`（品牌 `'gc`）里由 [`Gc::as_ptr`] 得到的：
+    /// 暂停式回收会搬对象，上一次 mutate 里拿到的地址这一次可能已经失效。
+    ///
+    /// 把这样的裸地址存进堆对象里时，回收器看不见它：对象的 [`crate::Trace`] 实现要用 `from_raw` 把它变回 `Gc` 报给
+    /// [`crate::Tracer::edge`]（追踪），并在 `relocate` 里交给 [`crate::Tracer::relocate`]、把返回的新地址写回去（疏散会搬对象）；
+    /// 否则对象会被当垃圾回收或搬走后留下悬垂地址。
+    pub unsafe fn from_raw(ptr: *const T) -> Self {
+        // SAFETY: 见上；数据指针非空
+        unsafe { Self::from_data(ptr.cast_mut()) }
     }
 
     /// 在整个 `'gc` 里有效的引用。
