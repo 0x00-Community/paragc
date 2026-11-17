@@ -12,11 +12,10 @@ behind Blink), [gc-arena](https://crates.io/crates/gc-arena), [gc](https://crate
 | --- | --- |
 | Machine | Intel Core Ultra 7 356H, 16 cores (1 thread per core), Linux 7.0 |
 | Rust | 1.98.1, release profile |
-| paragc, public heap | public heaps in shared memory (cross-heap design P1), on top of `915355b`; file in `/dev/shm`; load 2.4 at the start |
-| paragc | 0.2.1 (commit `bb6c81c`: concurrent recount, cheaper single-threaded recount); the other collectors were measured with `5c4c5c5` |
+| paragc | 0.5.0 (commit `d44bad0`), private and public heaps; public-heap files in `/dev/shm`. Every collector was measured in the same run |
 | cppgc | V8 15.2.124.1 through rusty_v8 (`v8` crate 152.2.0) |
 | Others | gc-arena 0.7.0, gc 0.5.1, dumpster 2.1.0 |
-| Method | every configuration run 5 times in a fresh process, fastest kept; runs started only once the 1-minute load average was below 2.5 (0.5 at the start, 0.8 at the end) |
+| Method | every configuration run 5 times in a fresh process, fastest kept; runs started only once the 1-minute load average was below 2.5 (2.49 at the start, 2.61 at the end) |
 | CPU column | CPU time of the whole process (all threads) over the timed region; CPU ÷ wall is how many threads were actually working |
 
 ## Workloads
@@ -53,37 +52,37 @@ Wall ms (CPU ÷ wall); best of 5.
 
 | | 1 thread | 4 threads | 16 threads |
 | --- | ---: | ---: | ---: |
-| **paragc** | 22.4 | 9.1 (3.9) | **4.2** (14.2) |
-| paragc, concurrent marking | 6.6 | 2.4 (3.0) | 1.5 (11.9) |
-| paragc, concurrent sweeping | 15.9 | 6.5 (4.0) | 2.8 (12.7) |
-| **paragc, concurrent marking + sweeping** | **0.03** | **0.03** | **0.05** |
-| paragc, public heap | 17.0 | 6.7 (3.9) | 3.3 (14.3) |
-| cppgc, attached to an isolate | 45.0 | 44.7 (1.0) | 43.4 (1.0) |
-| cppgc, all parallel / concurrent flags | 43.5 | 43.7 (1.0) | 43.0 (1.0) |
-| cppgc, detached heap | 42.5 | 42.7 (1.0) | 42.5 (1.0) |
-| gc-arena | 15.8 | – | – |
-| dumpster | 16.4 | – | – |
-| gc (rust-gc) | 87.6 | – | – |
+| **paragc** | 20.2 | 8.7 (3.8) | **4.2** (13.0) |
+| paragc, concurrent marking | 4.6 | 2.4 (3.0) | 1.5 (15.6) |
+| paragc, concurrent sweeping | 15.5 | 6.3 (4.0) | 2.8 (13.1) |
+| **paragc, concurrent marking + sweeping** | **0.02** | **0.02** | **0.06** |
+| paragc, public heap | 18.4 | 6.5 (3.9) | 3.3 (13.9) |
+| cppgc, attached to an isolate | 44.2 | 44.3 (1.0) | 44.9 (1.0) |
+| cppgc, all parallel / concurrent flags | 44.2 | 44.5 (1.0) | 44.0 (1.0) |
+| cppgc, detached heap | 43.2 | 43.5 (1.0) | 43.3 (1.0) |
+| gc-arena | 16.3 | – | – |
+| dumpster | 16.3 | – | – |
+| gc (rust-gc) | 90.2 | – | – |
 
 ### GCBench: total time
 
 | | 1 thread | 4 threads | 16 threads |
 | --- | ---: | ---: | ---: |
-| **paragc** | **53.7** | **59.1** (1.2) | **67.3** (2.1) |
-| paragc, public heap | 67.8 | 55.1 (1.5) | 78.2 (2.0) |
-| cppgc, attached to an isolate | 119.2 | 95.3 (1.3) | 100.4 (1.3) |
-| cppgc, all parallel / concurrent flags | 117.4 | 94.9 (1.3) | 99.4 (1.3) |
-| cppgc, detached heap | 173.2 | 171.7 (1.0) | 173.0 (1.0) |
-| gc-arena | 115.3 | – | – |
-| dumpster | 102.2 | – | – |
-| gc (rust-gc) | 281.7 | – | – |
+| **paragc** | **50.3** | **54.3** (1.3) | **64.3** (2.2) |
+| paragc, public heap | 72.7 | 67.3 (1.3) | 83.2 (2.1) |
+| cppgc, attached to an isolate | 121.0 | 94.2 (1.3) | 100.1 (1.3) |
+| cppgc, all parallel / concurrent flags | 115.5 | 97.6 (1.3) | 98.4 (1.3) |
+| cppgc, detached heap | 174.5 | 173.5 (1.0) | 175.5 (1.0) |
+| gc-arena | 118.0 | – | – |
+| dumpster | 97.8 | – | – |
+| gc (rust-gc) | 294.6 | – | – |
 
 ### Many mutators: total time
 
 | | 1 thread | 4 threads | 16 threads |
 | --- | ---: | ---: | ---: |
-| **paragc** | **38.9** | **10.5** (3.6) | **9.8** (8.0) |
-| dumpster (`sync`) | 116.4 | 296.2 (3.9) | 334.3 (13.2) |
+| **paragc** | **35.8** | **9.4** (3.7) | **9.0** (8.5) |
+| dumpster (`sync`) | 117.5 | 289.4 (3.9) | 343.5 (12.9) |
 
 cppgc, gc-arena and rust-gc allow one thread per heap, so they have no entry here.
 
@@ -91,38 +90,36 @@ cppgc, gc-arena and rust-gc allow one thread per heap, so they have no entry her
 
 | | threads | wall ms | RSS after MB | peak RSS MB |
 | --- | ---: | ---: | ---: | ---: |
-| **paragc** | 1 | **1668** | **110.5** | **415.7** |
-| **paragc** | 16 | **1457** | **111.2** | 416.5 |
-| cppgc (attached, V8 schedules) | 1 | 2052 | 445.1 | 1902.5 |
-| cppgc (attached, V8 schedules) | 16 | 1858 | 474.1 | 1985.3 |
-| cppgc-detached (paragc's trigger) | 1 | 4074 | 294.4 | 417.1 |
-| cppgc-detached (paragc's trigger) | 16 | 4145 | 294.2 | 417.0 |
+| **paragc** | 1 | **1578** | **110.5** | **415.6** |
+| **paragc** | 16 | **1344** | **111.2** | **416.4** |
+| cppgc, attached (V8 schedules) | 1 | 2010 | 444.7 | 1894.2 |
+| cppgc, attached (V8 schedules) | 16 | 1824 | 477.0 | 1984.5 |
+| cppgc, detached (paragc's trigger) | 1 | 4134 | 294.4 | 417.1 |
+| cppgc, detached (paragc's trigger) | 16 | 4160 | 294.4 | 417.1 |
 
-(Best wall time of 3; load about 5 at the start.) paragc 0.4.2 on the same workload ended at about 935 MB RSS with a peak of about 940 MB:
-blocks and large objects came from glibc, which kept freed memory; young collections promoted in place, so scattered survivors each pinned a line;
-medium objects threw away the rest of a hole; evacuation was capped at 1024 blocks per collection. What 0.5.0 does instead is under "Reading the numbers".
+paragc 0.4.2 on the same workload ended at about 935 MB RSS with a peak of about 940 MB: blocks and large objects came from glibc,
+which kept freed memory; young collections promoted in place, so scattered survivors each pinned a line; medium objects threw away the
+rest of a hole; evacuation was capped at 1024 blocks per collection. What 0.5.0 does instead is under "Reading the numbers".
 
 ## Reading the numbers
 
-- **Throughput: young collections and reference counting.** GCBench on one thread takes 53.7 ms against 102–119 ms
+- **Throughput: young collections and reference counting.** GCBench on one thread takes 50.3 ms against 98–121 ms
   for dumpster, gc-arena and cppgc: `collect_if_needed` runs young collections, which trace only new objects, and old
-  garbage is freed by reference counts in the background. The many-mutator workload is 38.9 ms against dumpster's
-  116.4 ms, and dumpster gets slower as threads are added (reference counts shared across threads) while paragc gets
+  garbage is freed by reference counts in the background. The many-mutator workload is 35.8 ms against dumpster's
+  117.5 ms, and dumpster gets slower as threads are added (reference counts shared across threads) while paragc gets
   faster.
-- **Serial full pauses: gc-arena and dumpster are faster.** One full collection of the 2M-node heap takes about 16 ms
-  with them and 22.4 ms with paragc on one thread. Part of that is the recount: a full collection rebuilds the
-  reference counts, one increment per edge (20.7 ms before reference counting; 25.7 ms in 0.2.0, where the increment was
-  a locked atomic even with a single marker). paragc is ahead from 4 threads on (9.1 ms) and takes 4.2 ms on 16.
+- **Serial full pauses: gc-arena and dumpster are faster.** One full collection of the 2M-node heap takes 16.3 ms
+  with them and 20.2 ms with paragc on one thread. Part of that is the recount: a full collection rebuilds the
+  reference counts, one increment per edge. paragc is ahead from 4 threads on (8.7 ms) and takes 4.2 ms on 16.
 - **GCBench does not get faster with threads.** Young collections are small; waking more workers costs more than it
-  saves (16 threads: 2.1× the CPU for a slower result). The paragc GCBench and many-mutator numbers are 2–3 ms above the
-  0.2.0 run although that code did not change; that run started at a load average of 0.5, this one at 2.5.
-- **Concurrent marking and sweeping take the work out of the pause.** 22.4 ms becomes 0.03 ms on one thread: marking
+  saves (16 threads: 2.2× the CPU for a slower result).
+- **Concurrent marking and sweeping take the work out of the pause.** 20.2 ms becomes 0.02 ms on one thread: marking
   and sweeping still happen, on the pool and in mutators that sweep the blocks they take. In this benchmark no mutator
   runs during marking, so the grey queue is empty at the end and the remaining pause is bookkeeping proportional to the
   number of blocks; with mutators running, draining what the write barrier logged is added to it.
 - **Public heaps: shared memory costs little.** A full collection of the same tree in a public heap (a `/dev/shm` file,
-  offset pointers, tracing by pointer map) takes 17.0 ms on one thread against 22.4 ms for the private heap: its header is
-  16 bytes instead of 24 and it does not rebuild reference counts. GCBench is slower (67.8 ms against 53.7 ms) because
+  offset pointers, tracing by pointer map) takes 18.4 ms on one thread against 20.2 ms for the private heap: its header is
+  16 bytes instead of 24 and it does not rebuild reference counts. GCBench is slower (72.7 ms against 50.3 ms) because
   every public-heap collection is a full one; young collections and reference counting are not there yet.
 - **cppgc marks a full collection on one thread.** Attached or detached, with or without 16 worker threads and every
   parallel / concurrent marking flag, a forced full collection runs at CPU ÷ wall = 1.0 and takes about 43–45 ms. cppgc
@@ -135,8 +132,8 @@ medium objects threw away the rest of a hole; evacuation was capped at 1024 bloc
   madvised away; objects larger than a line that do not fit the current hole go to an overflow cursor instead of discarding the hole; young
   collections move survivors that only young objects and roots point at into compact blocks; full collections evacuate every block under half
   live, sparsest first, with no block cap, and a full collection comes early once blocks exceed "live + one round of allowed allocation" by 1.5×.
-  RSS after collection is 38 % of cppgc's and the peak matches cppgc on the same trigger. For a lower peak, call `Heap::shrink` when idle (it also
-  returns whole pages of free lines, which then fault in again on reuse).
+  RSS after collection is 23–38 % of cppgc's and the peak matches cppgc on the same trigger (V8's own scheduling peaks at 1.9 GB). For a lower
+  peak, call `Heap::shrink` when idle (it also returns whole pages of free lines, which then fault in again on reuse).
 - **dumpster is reference counting.** These trees have no cycles, so dead nodes are freed the moment their last reference
   goes; its `pause` is really the cost of dropping the dead tree.
 
