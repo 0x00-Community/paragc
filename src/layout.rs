@@ -532,7 +532,7 @@ impl Block {
             }
         }
         #[cfg(not(all(target_os = "linux", not(miri))))]
-        let _ = epoch;
+        let _ = (self, epoch);
     }
 
     /// 有没有放得下 `bytes` 字节的空洞（连续空行）。

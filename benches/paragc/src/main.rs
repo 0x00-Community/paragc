@@ -1,8 +1,8 @@
 //! paragc：pause / gcbench 的线程数是回收线程数；alloc-mt 是 mutator 线程数（回收线程同数）。
 use std::num::NonZeroUsize;
 
-use bench_common::{Args, Bench, Clock, Took, GcBench, LONG_LIVED_DEPTH, MT_DEPTH, MT_ROUNDS, MT_TREES, PAUSE_DEPTH, STRETCH_DEPTH, Tree};
-use paragc::{Gc, Heap, Mutator, Root, Tlab, Trace, brand};
+use bench_common::{Args, Bench, Clock, FRAG_PER_ROUND, FRAG_ROUNDS, Footprint, Frag, GcBench, LONG_LIVED_DEPTH, MT_DEPTH, MT_ROUNDS, MT_TREES, PAUSE_DEPTH, STRETCH_DEPTH, Size, Took, Tree};
+use paragc::{Gc, Heap, Mutator, Root, Slot, Tlab, Trace, brand};
 
 #[derive(Trace)]
 struct Node<'gc> {
@@ -12,6 +12,49 @@ struct Node<'gc> {
 }
 
 brand!(NodeB = for<'gc> Node<'gc>);
+
+/// 碎片负载的对象：`N` 个 u64 的数据
+#[derive(Trace)]
+struct Blob<const N: usize> {
+    _data: [u64; N],
+}
+
+/// 碎片负载的持有者：每种大小一组槽
+#[derive(Trace)]
+struct Holder<'gc> {
+    small: Vec<Slot<'gc, Blob<3>>>,
+    medium: Vec<Slot<'gc, Blob<30>>>,
+    large: Vec<Slot<'gc, Blob<200>>>,
+    huge: Vec<Slot<'gc, Blob<1500>>>,
+}
+
+brand!(HolderB = for<'gc> Holder<'gc>);
+
+impl<'gc> Holder<'gc> {
+    fn new() -> Self {
+        fn slots<'gc, const N: usize>(size: Size) -> Vec<Slot<'gc, Blob<N>>> {
+            (0..size.slots()).map(|_| Slot::default()).collect()
+        }
+        Self { small: slots(Size::Small), medium: slots(Size::Medium), large: slots(Size::Large), huge: slots(Size::Huge) }
+    }
+
+    /// 分配一个对象，需要的话放进槽里（覆盖掉的旧对象成为垃圾）。
+    fn place(&self, m: &Mutator<'gc>, frag: &mut Frag) {
+        fn put<'gc, const N: usize>(m: &Mutator<'gc>, slots: &[Slot<'gc, Blob<N>>], slot: Option<usize>) {
+            let blob = m.alloc(Blob { _data: [0; N] });
+            if let Some(i) = slot {
+                slots[i].set(m, Some(blob));
+            }
+        }
+        let pick = frag.next();
+        match pick.size {
+            Size::Small => put(m, &self.small, pick.slot),
+            Size::Medium => put(m, &self.medium, pick.slot),
+            Size::Large => put(m, &self.large, pick.slot),
+            Size::Huge => put(m, &self.huge, pick.slot),
+        }
+    }
+}
 
 struct Paragc {
     threads: NonZeroUsize,
@@ -99,6 +142,30 @@ impl Bench for Paragc {
         let took = start.stop();
         assert_eq!(Self::count(&heap, &long), Tree::size(LONG_LIVED_DEPTH));
         Some(took)
+    }
+
+    fn frag(&self) -> Option<(Took, Footprint)> {
+        let base = Footprint::rss();
+        let start = Clock::start();
+        let mut heap = Heap::new(self.threads);
+        let holder: Root<HolderB> = heap.mutate(|m| m.root(m.alloc(Holder::new())));
+        let mut frag = Frag::default();
+        let mut peak = 0;
+        for _ in 0..FRAG_ROUNDS {
+            heap.mutate(|m| {
+                let h = m.get(&holder);
+                for _ in 0..FRAG_PER_ROUND {
+                    h.place(m, &mut frag);
+                }
+            });
+            heap.collect_if_needed();
+            peak = peak.max(Footprint::rss().saturating_sub(base));
+        }
+        heap.collect();
+        let took = start.stop();
+        let after = Footprint::rss().saturating_sub(base);
+        drop(holder);
+        Some((took, Footprint { after, peak: peak.max(after) }))
     }
 
     fn pause_concurrent(&self) -> Option<Took> {

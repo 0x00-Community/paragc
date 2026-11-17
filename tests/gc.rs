@@ -143,15 +143,20 @@ fn blocks_are_reused() {
 #[test]
 #[allow(clippy::large_stack_arrays)]
 fn large_objects() {
+    /// 单独 mmap 的那档（≥ 64 KiB）
     const BIG: usize = 64 * 1024;
+    /// 走全局分配器的那档（半块到 64 KiB）
+    const MID: usize = 20 * 1024;
     let mut heap = Heap::new(THREADS);
     let root: Root<TreeB> = heap.mutate(|m| {
         let big = m.alloc(vec![7u8; BIG]);
         let _garbage = m.alloc([0u64; BIG / 8]);
+        let mid = m.alloc([3u64; MID / 8]);
         assert_eq!(big.len(), BIG);
+        assert!(mid.iter().all(|&x| x == 3));
         m.root(m.alloc(Tree::Leaf(Counted(Arc::default()))))
     });
-    assert_eq!(heap.stats().large, 1);
+    assert_eq!(heap.stats().large, 2);
     heap.collect();
     assert_eq!(heap.stats().large, 0);
     drop(root);
@@ -168,7 +173,7 @@ struct Item<'gc> {
     tag: Counted,
 }
 
-/// 大对象（超过 8 KiB 单独分配），回指挂着它的节点（成环）。
+/// 大对象（超过半块单独分配），回指挂着它的节点（成环）。
 #[derive(Trace)]
 struct Ballast<'gc> {
     words: [u64; BALLAST_WORDS],
@@ -177,7 +182,7 @@ struct Ballast<'gc> {
 
 brand!(ItemB = for<'gc> Item<'gc>);
 
-const BALLAST_WORDS: usize = 1100;
+const BALLAST_WORDS: usize = 2100;
 /// Miri 下 8 × 8 超出单条 15 s，缩到 4 × 4
 const HEAPS: usize = if cfg!(miri) { 4 } else { 8 };
 const WORKERS: usize = HEAPS;
@@ -201,6 +206,7 @@ impl Ledger {
     }
 
     /// 在第 `h` 个堆上造一条链，链头带着 `guest`。
+    #[allow(clippy::large_stack_arrays, reason = "大对象就是要超过半块")]
     fn build(&self, heaps: &[Heap], h: usize, guest: Option<(usize, Root<ItemB>)>) -> Root<ItemB> {
         heaps[h].mutate(|m| {
             let mut guest = guest;

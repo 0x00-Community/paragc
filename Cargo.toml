@@ -25,7 +25,7 @@ cast_ptr_alignment = "allow"
 
 [package]
 name = "paragc"
-description = "A parallel mark-region (Immix-style blocks and lines) garbage collector for Rust: non-moving, lock-free allocation from many threads, parallel marking with work stealing and parallel sweeping"
+description = "A parallel mark-region (Immix-style blocks and lines) garbage collector for Rust: lock-free allocation from many threads, parallel marking with work stealing, parallel sweeping, young collections that compact survivors, reference counting and defragmenting evacuation"
 readme = "README.md"
 repository.workspace = true
 keywords = ["gc", "garbage-collector", "immix", "parallel"]

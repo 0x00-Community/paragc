@@ -9,11 +9,12 @@
 //! 共同：线程数 1 用单线程平台（没有工作线程），大于 1 用带这么多工作线程的默认平台；`V8_FLAGS` 传额外的 V8 选项。
 //! 每次分配、每个 `Member` 的构造、标记时每条边都要过一次 Rust ⇄ C++ 的 FFI，这部分开销算在 cppgc 头上。
 //! 只能一个线程用一个堆，没有 alloc-mt。
+use std::cell::UnsafeCell;
 use std::ffi::CStr;
 use std::num::NonZeroUsize;
 use std::str::FromStr;
 
-use bench_common::{Args, Bench, Clock, Took, GcBench, LONG_LIVED_DEPTH, PAUSE_DEPTH, STRETCH_DEPTH, Tree};
+use bench_common::{Args, Bench, Clock, FRAG_PER_ROUND, FRAG_ROUNDS, Footprint, Frag, GcBench, LONG_LIVED_DEPTH, PAUSE_DEPTH, STRETCH_DEPTH, Size, Took, Tree};
 use v8::cppgc::{EmbedderStackState, GarbageCollected, Heap, HeapCreateParams, Member, Persistent, UnsafePtr, Visitor, make_garbage_collected};
 use v8::{GarbageCollectionType, SharedRef, UniqueRef};
 
@@ -46,6 +47,99 @@ unsafe impl GarbageCollected for Node {
         c"Node"
     }
 }
+
+/// 碎片负载的对象：`N` 个 u64 的数据
+struct Blob<const N: usize> {
+    _data: [u64; N],
+}
+
+// SAFETY: 没有 Member
+unsafe impl<const N: usize> GarbageCollected for Blob<N> {
+    fn trace(&self, _: &mut Visitor) {}
+
+    fn get_name(&self) -> &'static CStr {
+        c"Blob"
+    }
+}
+
+/// 一块槽：[`CHUNK`] 个 Member，放在 cppgc 堆上（Member 只能在堆对象里：写屏障按槽地址找所在页）。
+/// 只在 mutator 线程上改。
+struct Chunk<const N: usize> {
+    slots: UnsafeCell<[Member<Blob<N>>; CHUNK]>,
+}
+
+/// 每块几个槽
+const CHUNK: usize = 64;
+
+// SAFETY: 槽都追踪了
+unsafe impl<const N: usize> GarbageCollected for Chunk<N> {
+    fn trace(&self, visitor: &mut Visitor) {
+        // SAFETY: 标记时 mutator 不在改这一块（增量标记在 mutator 的安全点上跑；改槽走 Member 的写屏障）
+        unsafe { (*self.slots.get()).iter().for_each(|m| visitor.trace(m)) };
+    }
+
+    fn get_name(&self) -> &'static CStr {
+        c"Chunk"
+    }
+}
+
+/// 一种大小的全部槽（按块挂在 Persistent 上）。
+struct Slots<const N: usize>(Vec<Persistent<Chunk<N>>>);
+
+impl<const N: usize> Slots<N> {
+    fn new(heap: &Heap, size: Size) -> Self {
+        let chunk = || {
+            // SAFETY: 马上放进 Persistent
+            Persistent::new(&unsafe { make_garbage_collected(heap, Chunk { slots: UnsafeCell::new(std::array::from_fn(|_| Member::empty())) }) })
+        };
+        Self((0..size.slots().div_ceil(CHUNK)).map(|_| chunk()).collect())
+    }
+
+    /// 分配一个对象，需要的话放进第 `slot` 个槽；返回它在 cppgc 堆上大约占的字节。
+    fn put(&self, heap: &Heap, slot: Option<usize>) -> usize {
+        // SAFETY: 新对象马上放进槽或丢掉，期间不分配
+        let blob = unsafe { make_garbage_collected(heap, Blob { _data: [0; N] }) };
+        if let Some(i) = slot {
+            let chunk = self.0[i / CHUNK].get().expect("块挂在 Persistent 上");
+            // SAFETY: 只有这个线程改槽
+            unsafe { (&mut *chunk.slots.get())[i % CHUNK].set(&blob) };
+        }
+        BLOB_OVERHEAD + N * size_of::<u64>()
+    }
+}
+
+/// 碎片负载的持有者：每种大小一组槽
+struct Holder {
+    small: Slots<3>,
+    medium: Slots<30>,
+    large: Slots<200>,
+    huge: Slots<1500>,
+}
+
+impl Holder {
+    fn new(heap: &Heap) -> Self {
+        Self { small: Slots::new(heap, Size::Small), medium: Slots::new(heap, Size::Medium), large: Slots::new(heap, Size::Large), huge: Slots::new(heap, Size::Huge) }
+    }
+
+    /// 分配一个对象，需要的话放进槽里；返回它在 cppgc 堆上大约占的字节（头 8 + RustObj 包装 24 + 数据）。
+    fn place(&self, heap: &Heap, frag: &mut Frag) -> usize {
+        let pick = frag.next();
+        match pick.size {
+            Size::Small => self.small.put(heap, pick.slot),
+            Size::Medium => self.medium.put(heap, pick.slot),
+            Size::Large => self.large.put(heap, pick.slot),
+            Size::Huge => self.huge.put(heap, pick.slot),
+        }
+    }
+
+    /// 槽全满时的存活字节（估算，detached 的触发用）
+    fn live() -> usize {
+        [(Size::Small, 3), (Size::Medium, 30), (Size::Large, 200), (Size::Huge, 1500)].iter().map(|&(s, n)| s.slots() * (BLOB_OVERHEAD + n * size_of::<u64>())).sum()
+    }
+}
+
+/// 碎片负载里每个对象在 cppgc 堆上除数据外的字节：对象头 8 + RustObj 头与 dyn 指针 24
+const BLOB_OVERHEAD: usize = 32;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HeapMode {
@@ -171,6 +265,30 @@ impl Bench for Attached {
         drop(isolate);
         Some(took)
     }
+
+    /// 回收时机交给 V8 自己调度；最后一次完整 GC 后量 RSS。
+    fn frag(&self) -> Option<(Took, Footprint)> {
+        let base = Footprint::rss();
+        let start = Clock::start();
+        let (mut isolate, heap) = self.isolate();
+        // SAFETY: 同上
+        let heap = unsafe { &*heap };
+        let h = Holder::new(heap);
+        let mut frag = Frag::default();
+        let mut peak = 0;
+        for _ in 0..FRAG_ROUNDS {
+            for _ in 0..FRAG_PER_ROUND {
+                h.place(heap, &mut frag);
+            }
+            peak = peak.max(Footprint::rss().saturating_sub(base));
+        }
+        isolate.request_garbage_collection_for_testing(GarbageCollectionType::Full);
+        let took = start.stop();
+        let after = Footprint::rss().saturating_sub(base);
+        drop(h);
+        drop(isolate);
+        Some((took, Footprint { after, peak: peak.max(after) }))
+    }
 }
 
 /// 不挂 isolate 的堆。
@@ -239,6 +357,32 @@ impl Bench for Detached {
         assert_eq!(V8::count(&long), Tree::size(LONG_LIVED_DEPTH));
         drop(long);
         Some(took)
+    }
+
+    /// 照 paragc 的触发策略手动回收（按估算字节）。
+    fn frag(&self) -> Option<(Took, Footprint)> {
+        let base = Footprint::rss();
+        let start = Clock::start();
+        let heap = self.heap();
+        let h = Holder::new(&heap);
+        let mut frag = Frag::default();
+        let (mut allocated, mut live, mut peak) = (0, 0, 0);
+        for _ in 0..FRAG_ROUNDS {
+            for _ in 0..FRAG_PER_ROUND {
+                allocated += h.place(&heap, &mut frag);
+                if allocated >= live.max(MIN_TRIGGER) * GROWTH {
+                    Self::collect(&heap);
+                    live = Holder::live();
+                    allocated = 0;
+                }
+            }
+            peak = peak.max(Footprint::rss().saturating_sub(base));
+        }
+        Self::collect(&heap);
+        let took = start.stop();
+        let after = Footprint::rss().saturating_sub(base);
+        drop(h);
+        Some((took, Footprint { after, peak: peak.max(after) }))
     }
 }
 

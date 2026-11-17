@@ -56,16 +56,19 @@ pub enum Workload {
     PauseSweepConcurrent,
     /// 并发标记 + 并发清扫：只量标记收尾的停顿
     PauseAllConcurrent,
+    /// 碎片：四种大小、随机寿命的对象（[`Frag`]），量总耗时与回收后 / 峰值 RSS
+    Frag,
 }
 
 impl Workload {
-    const NAMES: [(Self, &str); 6] = [
+    const NAMES: [(Self, &str); 7] = [
         (Self::Pause, "pause"),
         (Self::GcBench, "gcbench"),
         (Self::AllocMt, "alloc-mt"),
         (Self::PauseConcurrent, "pause-cm"),
         (Self::PauseSweepConcurrent, "pause-cs"),
         (Self::PauseAllConcurrent, "pause-cms"),
+        (Self::Frag, "frag"),
     ];
 
     fn name(self) -> &'static str {
@@ -77,7 +80,7 @@ impl FromStr for Workload {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, String> {
-        Self::NAMES.iter().find(|(_, n)| *n == s).map(|(w, _)| *w).ok_or_else(|| format!("未知工作负载 {s}（pause / gcbench / alloc-mt / pause-cm / pause-cs / pause-cms）"))
+        Self::NAMES.iter().find(|(_, n)| *n == s).map(|(w, _)| *w).ok_or_else(|| format!("未知工作负载 {s}（pause / gcbench / alloc-mt / pause-cm / pause-cs / pause-cms / frag）"))
     }
 }
 
@@ -137,6 +140,9 @@ pub trait Bench {
     fn pause_all_concurrent(&self) -> Option<Took> {
         None
     }
+    fn frag(&self) -> Option<(Took, Footprint)> {
+        None
+    }
 }
 
 /// 命令行：`<工作负载> <线程数>`。
@@ -148,7 +154,7 @@ pub struct Args {
 impl Args {
     pub fn parse() -> Self {
         let mut argv = std::env::args().skip(1);
-        let usage = "用法：bench-<名字> <pause|gcbench|alloc-mt|pause-cm|pause-cs|pause-cms> <线程数>";
+        let usage = "用法：bench-<名字> <pause|gcbench|alloc-mt|pause-cm|pause-cs|pause-cms|frag> <线程数>";
         let workload = argv.next().expect(usage).parse().unwrap_or_else(|e: String| panic!("{e}"));
         let threads = argv.next().expect(usage).parse().expect("线程数是正整数");
         Self { workload, threads }
@@ -156,7 +162,25 @@ impl Args {
 
     /// 跑一项并打印一行结果；不支持时以退出码 2 结束。
     pub fn report<B: Bench>(&self, bench: &B) {
+        if self.workload == Workload::Frag {
+            let Some((t, f)) = bench.frag() else {
+                eprintln!("{} 不支持 {}", B::NAME, self.workload);
+                std::process::exit(2);
+            };
+            println!(
+                "{}\t{}\t{}\t{:.2}\t{:.2}\t{:.1}\t{:.1}",
+                B::NAME,
+                self.workload,
+                self.threads,
+                t.wall.as_secs_f64() * 1e3,
+                t.cpu.as_secs_f64() * 1e3,
+                Footprint::mb(f.after),
+                Footprint::mb(f.peak)
+            );
+            return;
+        }
         let took = match self.workload {
+            Workload::Frag => unreachable!("上面已处理"),
             Workload::Pause => bench.pause(),
             Workload::GcBench => bench.gcbench(),
             Workload::AllocMt => bench.alloc_mt(),
@@ -173,3 +197,91 @@ impl Args {
         }
     }
 }
+
+/// 碎片负载：每种大小一组槽（持有者里），每轮分配 [`FRAG_PER_ROUND`] 个对象，按大小以不同比例随机覆盖槽里的旧对象
+/// （被覆盖的变成垃圾 ⇒ 寿命随机、存活对象散在各处）。存活约 80 MB。
+pub const FRAG_SLOTS: usize = 200_000;
+/// 每轮分配的对象数
+pub const FRAG_PER_ROUND: usize = 2 * FRAG_SLOTS;
+/// 轮数
+pub const FRAG_ROUNDS: usize = 30;
+
+/// 碎片负载里的对象大小（数据字节，不含各库的头）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Size {
+    /// 24 字节，占分配的 70 %，1/7 留进槽
+    Small,
+    /// 240 字节，20 %，1/5 留
+    Medium,
+    /// 1600 字节，8 %，1/3 留
+    Large,
+    /// 12000 字节，2 %，1/2 留
+    Huge,
+}
+
+impl Size {
+    /// 这种大小的槽数
+    pub const fn slots(self) -> usize {
+        match self {
+            Self::Small => FRAG_SLOTS,
+            Self::Medium => FRAG_SLOTS / 4,
+            Self::Large => FRAG_SLOTS / 16,
+            Self::Huge => FRAG_SLOTS / 64,
+        }
+    }
+}
+
+/// 一次分配：大小，以及要不要放进哪个槽。
+pub struct Pick {
+    pub size: Size,
+    pub slot: Option<usize>,
+}
+
+/// 碎片负载的确定性随机序列（xorshift64）。
+pub struct Frag(u64);
+
+impl Default for Frag {
+    fn default() -> Self {
+        Self(0x9e37_79b9_7f4a_7c15)
+    }
+}
+
+impl Frag {
+    pub fn next(&mut self) -> Pick {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        let (size, keep_one_in) = match x % 100 {
+            0..70 => (Size::Small, 7),
+            70..90 => (Size::Medium, 5),
+            90..98 => (Size::Large, 3),
+            _ => (Size::Huge, 2),
+        };
+        let slot = (x % keep_one_in == 0).then(|| usize::try_from(x / 100).unwrap_or(0) % size.slots());
+        Pick { size, slot }
+    }
+}
+
+/// 碎片负载的内存：回收后与峰值 RSS（字节，扣掉开始时的）。
+#[derive(Clone, Copy, Default)]
+pub struct Footprint {
+    pub after: usize,
+    pub peak: usize,
+}
+
+impl Footprint {
+    /// 当前 RSS（字节）。
+    pub fn rss() -> usize {
+        let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+        statm.split_whitespace().nth(1).and_then(|p| p.parse::<usize>().ok()).unwrap_or(0) * PAGE_BYTES
+    }
+
+    fn mb(bytes: usize) -> f64 {
+        bytes as f64 / 1e6
+    }
+}
+
+/// /proc/self/statm 的单位
+const PAGE_BYTES: usize = 4096;
