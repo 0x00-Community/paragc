@@ -1229,3 +1229,58 @@ fn serial_drop_stays_on_the_caller() {
     assert_eq!(ledger.1.load(Ordering::Relaxed), 3 * nodes + 1);
     assert_eq!(ledger.2.load(Ordering::Relaxed), 0, "有对象在别的线程上析构");
 }
+
+/// 一行大（232 字节数据 + 24 字节头 = 256）
+#[derive(Trace)]
+struct Line {
+    _pad: [u64; 29],
+}
+
+/// 五个正好填满一行（48 字节）
+#[derive(Trace)]
+struct Small {
+    _pad: [u64; 3],
+}
+
+/// 三行多一点（584 字节）
+#[derive(Trace)]
+struct Medium {
+    _pad: [u64; 70],
+}
+
+#[derive(Trace)]
+struct Lines<'gc> {
+    kept: Vec<Slot<'gc, Line>>,
+}
+
+brand!(LinesB = for<'gc> Lines<'gc>);
+
+/// 溢出分配：块里只剩单行的空洞时，交替分配小对象与中对象（放不进单行空洞），小对象照样填进旧空洞，
+/// 中对象另开溢出块——新开的块数只够放中对象（中对象把主游标带走的话，旧空洞全部作废，小对象也要开新块）。
+#[test]
+fn medium_objects_overflow_without_wasting_holes() {
+    const HOLES: usize = if cfg!(miri) { 300 } else { 6000 };
+    /// 块的大小（paragc::layout::BLOCK）
+    const BLOCK: usize = 32 * 1024;
+    let mut heap = Heap::new(THREADS);
+    // 连续分配一行大的对象，隔一个留一个：完整回收后每个死的都是单行空洞
+    let lines: Root<LinesB> = heap.mutate(|m| {
+        let all: Vec<_> = (0..2 * HOLES).map(|_| m.alloc(Line { _pad: [0; 29] })).collect();
+        m.root(m.alloc(Lines { kept: all.iter().step_by(2).map(|&l| Slot::from(Some(l))).collect() }))
+    });
+    heap.collect();
+    heap.collect();
+    let before = heap.stats().blocks;
+    heap.mutate(|m| {
+        for _ in 0..HOLES {
+            for _ in 0..5 {
+                m.alloc(Small { _pad: [1; 3] });
+            }
+            m.alloc(Medium { _pad: [2; 70] });
+        }
+    });
+    let grown = heap.stats().blocks - before;
+    let medium_blocks = (HOLES * size_of::<Medium>()).div_ceil(BLOCK * 9 / 10);
+    assert!(grown <= medium_blocks + 2, "新开 {grown} 块，只该够放中对象（约 {medium_blocks} 块）：小对象没填进旧空洞");
+    drop(lines);
+}

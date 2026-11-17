@@ -38,7 +38,7 @@ use crate::{Gc, Trace};
 use crate::handle::{GcInternal, Invariant, RawSlot, RootTable};
 #[cfg(target_os = "linux")]
 use crate::handle::{EdgeMap, Public, PublicBrand, PublicGc, PublicGcInternal, PublicInternal, Shared};
-use crate::layout::{BLOCK, Block, Pages, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, HEADER, Header, LARGE, MAX_EPOCH, MIN_SPARE_BLOCKS, MIN_TRIGGER, YOUNG_PER_FULL, YOUNG_PER_FULL_RC};
+use crate::layout::{BLOCK, Block, Pages, LINE, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, HEADER, Header, LARGE, MAX_EPOCH, MIN_SPARE_BLOCKS, MIN_TRIGGER, OVERFLOW_TRIES, YOUNG_PER_FULL, YOUNG_PER_FULL_RC};
 #[cfg(target_os = "linux")]
 use crate::layout::{Core, State};
 #[cfg(target_os = "linux")]
@@ -320,6 +320,40 @@ impl Heap {
                 None => break,
             }
         }
+        self.fresh()
+    }
+
+    /// 溢出分配领块：从可用块里找有放得下 `bytes` 的空洞的（最多看 [`OVERFLOW_TRIES`] 个，放不下的退回可用队列留给小对象），
+    /// 找不到就开新块。
+    fn acquire_for(&self, bytes: usize) -> Block {
+        self.allocated.fetch_add(BLOCK, Ordering::Relaxed);
+        let mut rejected = Vec::new();
+        let mut found = None;
+        while rejected.len() < OVERFLOW_TRIES {
+            match self.available.steal() {
+                Steal::Success(b) if b.has_hole(bytes, self.epoch) => {
+                    found = Some(b);
+                    break;
+                }
+                Steal::Success(b) => rejected.push(b),
+                Steal::Retry => {}
+                Steal::Empty => break,
+            }
+        }
+        for b in rejected {
+            self.available.push(b);
+        }
+        match found {
+            Some(b) => {
+                b.unlist();
+                b.reused();
+                b
+            }
+            None => self.fresh(),
+        }
+    }
+
+    fn fresh(&self) -> Block {
         let b = Block::new(&self.pages);
         self.blocks.push(b);
         b
@@ -703,23 +737,16 @@ impl Drop for Heap {
     }
 }
 
-/// 线程的分配缓冲：当前块、在块里找到哪一行、当前空洞的游标与界。块在两次回收之间只归它。
+/// 线程的分配缓冲：主游标与溢出游标（各自的块、找到哪一行、当前空洞的游标与界）。块在两次回收之间只归它。
+#[derive(Default)]
 pub struct Tlab {
     /// (所属堆, 那时的回收次数)；对不上就作废
     owner: Cell<(usize, u64)>,
-    block: Cell<Option<Block>>,
-    /// 下一次找空洞从哪一行开始
-    line: Cell<usize>,
-    cursor: Cell<*mut u8>,
-    limit: Cell<*mut u8>,
+    main: Bump,
+    /// 溢出分配（中对象：比一行大、主空洞又放不下）：单独的块 / 空洞，主空洞留给小对象（Immix 的溢出分配）
+    overflow: Bump,
     /// 公开堆：上一次分配的（类型名的地址, 类型号）
     last: Cell<Option<(usize, u32)>>,
-}
-
-impl Default for Tlab {
-    fn default() -> Self {
-        Self { owner: Cell::default(), block: Cell::default(), line: Cell::default(), cursor: Cell::new(null_mut()), limit: Cell::new(null_mut()), last: Cell::default() }
-    }
 }
 
 // SAFETY: 指针指向它独占的块；移到别的线程后由那个线程独占使用
@@ -734,13 +761,48 @@ impl Tlab {
         }
     }
 
-    /// 碰撞分配 `bytes` 字节：当前空洞放不下就找当前块的下一个空洞（行标记早于 `epoch` 的是空行），没有了就用 `acquire` 领新块。
-    fn bump(&self, bytes: usize, epoch: u32, acquire: impl Fn() -> Block) -> *mut u8 {
+    /// 碰撞分配 `bytes` 字节（行标记早于 `epoch` 的是空行，没有空洞了用 `acquire` 领块）。
+    /// 比一行大、主空洞放不下的走溢出游标（块用 `roomy(bytes)` 领：要有放得下它的空洞），不丢掉主空洞剩下的部分。
+    fn bump(&self, bytes: usize, epoch: u32, acquire: impl Fn() -> Block, roomy: impl Fn(usize) -> Block) -> *mut u8 {
+        if let Some(p) = self.main.fit(bytes) {
+            return p;
+        }
+        if bytes > LINE {
+            return self.overflow.take(bytes, epoch, &|| roomy(bytes));
+        }
+        self.main.take(bytes, epoch, &acquire)
+    }
+}
+
+/// 一个碰撞分配游标：当前块、下一次找空洞从哪一行开始、当前空洞的游标与界。
+struct Bump {
+    block: Cell<Option<Block>>,
+    line: Cell<usize>,
+    cursor: Cell<*mut u8>,
+    limit: Cell<*mut u8>,
+}
+
+impl Default for Bump {
+    fn default() -> Self {
+        Self { block: Cell::default(), line: Cell::default(), cursor: Cell::new(null_mut()), limit: Cell::new(null_mut()) }
+    }
+}
+
+impl Bump {
+    /// 当前空洞放得下就切出来。
+    fn fit(&self, bytes: usize) -> Option<*mut u8> {
+        let cursor = self.cursor.get();
+        (self.limit.get().addr() - cursor.addr() >= bytes).then(|| {
+            self.cursor.set(cursor.wrapping_add(bytes));
+            cursor
+        })
+    }
+
+    /// 当前空洞放不下就找当前块的下一个空洞（放不下的跳过），没有了就用 `acquire` 领新块。
+    fn take(&self, bytes: usize, epoch: u32, acquire: &impl Fn() -> Block) -> *mut u8 {
         loop {
-            let cursor = self.cursor.get();
-            if self.limit.get().addr() - cursor.addr() >= bytes {
-                self.cursor.set(cursor.wrapping_add(bytes));
-                return cursor;
+            if let Some(p) = self.fit(bytes) {
+                return p;
             }
             if let Some(b) = self.block.get()
                 && let Some((start, end)) = b.hole(self.line.get(), epoch)
@@ -833,7 +895,7 @@ impl<'gc> Mutator<'gc> {
     }
 
     fn alloc_small(&self, bytes: usize) -> *mut u8 {
-        let p = self.tlab.bump(bytes, self.heap.epoch, || self.heap.acquire());
+        let p = self.tlab.bump(bytes, self.heap.epoch, || self.heap.acquire(), |need| self.heap.acquire_for(need));
         Block::containing(p).set_start(p);
         p
     }
@@ -1957,7 +2019,7 @@ impl<'p> PublicMutator<'p> {
     }
 
     fn alloc_small(&self, bytes: usize) -> *mut u8 {
-        self.tlab.bump(bytes, self.epoch, || self.heap.acquire())
+        self.tlab.bump(bytes, self.epoch, || self.heap.acquire(), |_| self.heap.acquire())
     }
 }
 

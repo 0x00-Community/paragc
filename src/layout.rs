@@ -78,6 +78,8 @@ pub const EVACUATE_MIN: usize = 4;
 pub const EVACUATE_MAX: usize = 1024;
 /// 回收后至少留着复用的全空块数
 pub const MIN_SPARE_BLOCKS: usize = 4;
+/// 溢出分配领块时最多看几个可用块（找有放得下中对象的空洞的），都不行就开新块
+pub const OVERFLOW_TRIES: usize = 8;
 
 /// 头里 `info` 的布局：低 [`SIZE_BITS`] 位是粒度数，往上 [`RC_BITS`] 位是引用计数，再往上一位是计数的奇偶，最高位是大对象
 const SIZE_BITS: u32 = 24;
@@ -505,6 +507,19 @@ impl Block {
     pub fn set_start(self, p: *const u8) {
         let g = self.offset(p) / GRANULE;
         self.meta().starts[g / BITS].fetch_or(1 << (g % BITS), Ordering::Relaxed);
+    }
+
+    /// 有没有放得下 `bytes` 字节的空洞（连续空行）。
+    pub fn has_hole(self, bytes: usize, epoch: u32) -> bool {
+        let need = bytes.div_ceil(LINE);
+        let mut from = Self::FIRST_LINE;
+        while let Some((start, end)) = self.hole(from, epoch) {
+            if end - start >= need {
+                return true;
+            }
+            from = end;
+        }
+        false
     }
 
     /// 从第 `from` 行起的第一个空洞（一段连续空行），返回 `[起, 止)` 行号。
