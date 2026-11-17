@@ -96,6 +96,8 @@ pub struct Heap {
     large: SegVec<Large>,
     /// 上一轮的清扫（与 mutator 并发进行）
     sweeper: Sweeper,
+    /// 死对象的析构在全部回收线程上并行跑（假：只在调用回收 / 清扫的线程上跑），见 [`Heap::set_parallel_drop`]
+    parallel_drop: AtomicBool,
     roots: Arc<RootTable>,
     /// 上次回收后新领用的字节数（按块 / 大对象计）
     allocated: AtomicUsize,
@@ -153,6 +155,7 @@ impl Heap {
             available: Injector::new(),
             large: SegVec::default(),
             sweeper: Sweeper::default(),
+            parallel_drop: AtomicBool::new(true),
             roots: Arc::default(),
             allocated: AtomicUsize::new(0),
             evacuated: (0, 0),
@@ -321,6 +324,15 @@ impl Heap {
     }
 
     /// 上一轮的清扫还没做完（mutator 要块时会顺手扫，或调 [`Heap::sweep_concurrently`]）。
+    /// 死对象的析构在哪跑：真（缺省）= 全部回收线程并行；假 = 只在调用 [`Heap::collect`] / [`Heap::collect_young`] /
+    /// [`Heap::sweep_concurrently`] 的线程上跑（标记、判死、清起点位、算行照旧并行；mutator 要块时顺手扫的照旧在它自己线程上析构）。
+    ///
+    /// 析构里要释放 mutator 线程分配的内存（`Box`、`String`……）时关掉它：跨线程释放会让分配器争用（glibc 的 arena 锁），
+    /// 往往比单线程析构还慢。
+    pub fn set_parallel_drop(&self, on: bool) {
+        self.parallel_drop.store(on, Ordering::Relaxed);
+    }
+
     pub fn is_sweeping(&self) -> bool {
         !self.sweeper.is_done()
     }
@@ -330,9 +342,9 @@ impl Heap {
     pub fn sweep_concurrently(&self) {
         let pool = self.pool();
         if !self.decs.is_empty() {
-            Releaser::new(&self.decs, &self.dirty, pool.threads(), self.epoch, self.rc_parity.load(Ordering::Acquire)).run(pool);
+            Releaser::new(&self.decs, &self.dirty, pool.threads(), self.epoch, self.rc_parity.load(Ordering::Acquire), self.parallel_drop.load(Ordering::Relaxed)).run(pool);
         }
-        self.sweeper.finish(pool, self);
+        self.sweeper.finish(pool, self, self.parallel_drop.load(Ordering::Relaxed));
     }
 
     fn alloc_large(&self, bytes: usize) -> *mut u8 {
@@ -671,14 +683,15 @@ impl Drop for Heap {
     fn drop(&mut self) {
         // 从没回收过就不为析构专门起线程
         let pool = self.pool.take().unwrap_or_else(|| Pool::new(NonZeroUsize::MIN));
+        let parallel_drop = *self.parallel_drop.get_mut();
         // 先把上一轮扫完，再用一个比谁都新的纪元（并发标记中的也算死）不标记直接扫一轮：全部析构，全空块不留备用全部还回去
-        self.sweeper.finish(&pool, self);
+        self.sweeper.finish(&pool, self, parallel_drop);
         let epoch = self.epoch.max(*self.marking.get_mut()).wrapping_add(1);
         let blocks = self.blocks.take();
         let large = self.large.take();
         while !matches!(self.available.steal(), Steal::Empty) {}
         self.sweeper.start(epoch, blocks, large, 0);
-        self.sweeper.finish(&pool, self);
+        self.sweeper.finish(&pool, self, parallel_drop);
         debug_assert!(self.blocks.is_empty() && self.large.is_empty());
         let spare = *self.spare.get_mut();
         if !spare.is_null() {
@@ -1576,7 +1589,7 @@ impl Inner {
                 match Kind::from(self.state(i).kind.load(Ordering::Acquire)) {
                     Kind::Small => {
                         // SAFETY: 标记做完了，没有 mutator；块里是公开堆的对象
-                        let (state, bytes) = unsafe { self.block(i).sweep::<PHeader>(epoch) };
+                        let (state, bytes) = unsafe { self.block(i).sweep::<PHeader>(epoch, None) };
                         live += bytes;
                         if !matches!(state, State::Full) {
                             Stack::on(&self.sup().available).push(i, &self.state(i).next);

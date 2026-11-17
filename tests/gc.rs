@@ -1157,3 +1157,75 @@ fn promoted_slots_remember_young_values() {
     heap.collect();
     assert_eq!(drops.load(Ordering::Relaxed), 1);
 }
+
+/// 析构时记下是不是在建堆的线程上（没有 Gc，可以有 Drop）。
+struct Witness(Arc<(std::thread::ThreadId, AtomicUsize, AtomicUsize)>);
+
+impl Drop for Witness {
+    fn drop(&mut self) {
+        let (home, dropped, foreign) = &*self.0;
+        dropped.fetch_add(1, Ordering::Relaxed);
+        if std::thread::current().id() != *home {
+            foreign.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+// SAFETY: 没有 Gc
+unsafe impl Trace for Witness {
+    const NO_EDGES: bool = true;
+    fn trace(&self, _: &mut Tracer<'_>) {}
+}
+
+#[derive(Trace)]
+struct Twig<'gc> {
+    left: Slot<'gc, Twig<'gc>>,
+    right: Slot<'gc, Twig<'gc>>,
+    witness: Witness,
+}
+
+brand!(TwigB = for<'gc> Twig<'gc>);
+
+/// 关掉并行析构：引用计数的后台释放、并行清扫（年轻 / 完整）、堆析构，死对象都只在调用方线程上析构，一个不少。
+#[test]
+fn serial_drop_stays_on_the_caller() {
+    const DEPTH: u32 = if cfg!(miri) { 6 } else { 15 };
+    let nodes = (1usize << DEPTH) - 1;
+    let ledger = Arc::new((std::thread::current().id(), AtomicUsize::new(0), AtomicUsize::new(0)));
+    let mut heap = Heap::new(THREADS);
+    heap.set_parallel_drop(false);
+    let tree = |heap: &Heap| -> Root<TwigB> {
+        heap.mutate(|m| {
+            let mut level: Vec<_> = (0..1usize << (DEPTH - 1)).map(|_| m.alloc(Twig { left: Slot::default(), right: Slot::default(), witness: Witness(ledger.clone()) })).collect();
+            while level.len() > 1 {
+                level = level.chunks(2).map(|pair| m.alloc(Twig { left: pair[0].into(), right: pair[1].into(), witness: Witness(ledger.clone()) })).collect();
+            }
+            m.root(level[0])
+        })
+    };
+    let holder: Root<TwigB> = heap.mutate(|m| m.root(m.alloc(Twig { left: Slot::default(), right: Slot::default(), witness: Witness(ledger.clone()) })));
+    let first = tree(&heap);
+    heap.mutate(|m| m.get(&holder).left.set(m, Some(m.get(&first))));
+    drop(first);
+    heap.collect();
+    heap.collect();
+    assert_eq!(ledger.1.load(Ordering::Relaxed), 0);
+    // 老树摘掉：引用计数归零，年轻回收后的后台释放析构
+    heap.mutate(|m| m.get(&holder).left.set(m, None));
+    heap.collect_young();
+    assert_eq!(ledger.1.load(Ordering::Relaxed), nodes, "引用计数应收掉整棵老树");
+    // 年轻垃圾：年轻清扫；再一棵变老后扔掉：完整回收的清扫
+    drop(tree(&heap));
+    heap.collect_young();
+    assert_eq!(ledger.1.load(Ordering::Relaxed), 2 * nodes);
+    let third = tree(&heap);
+    heap.collect();
+    drop(third);
+    heap.collect();
+    heap.collect();
+    assert_eq!(ledger.1.load(Ordering::Relaxed), 3 * nodes);
+    drop(holder);
+    drop(heap);
+    assert_eq!(ledger.1.load(Ordering::Relaxed), 3 * nodes + 1);
+    assert_eq!(ledger.2.load(Ordering::Relaxed), 0, "有对象在别的线程上析构");
+}

@@ -330,6 +330,7 @@ impl Finalize for Header {
 const REUSED: u32 = u32::MAX;
 
 /// 清扫一个块的结果。
+#[derive(Clone, Copy)]
 pub enum State {
     /// 没有活对象
     Empty,
@@ -512,8 +513,9 @@ impl Block {
     }
 
     /// 清扫：析构（按 `K`）没标上本轮纪元的对象（搬走了的不析构）、清掉它们的起点位，返回块的状态与存活字节数。
+    /// 给了 `deferred` 就不当场析构，把死对象的头地址放进去（调用方析构完才能把块交出去）。
     /// SAFETY（调用方）：标记已经做完，没有 mutator 在用这个块；块里对象的头是 `K` 认识的那种。
-    pub unsafe fn sweep<K: Finalize>(self, epoch: u32) -> (State, usize) {
+    pub unsafe fn sweep<K: Finalize>(self, epoch: u32, mut deferred: Option<&mut Vec<usize>>) -> (State, usize) {
         let mut live = 0;
         for (w, word) in self.meta().starts.iter().enumerate() {
             let mut bits = word.load(Ordering::Relaxed);
@@ -530,8 +532,11 @@ impl Block {
                 } else if h.is_marked(epoch) {
                     live += h.bytes();
                 } else {
-                    // SAFETY: 没标记 ⇒ 从根不可达，之后没人再用
-                    unsafe { K::finalize(header) };
+                    match deferred.as_deref_mut() {
+                        Some(list) => list.push(header.expose_provenance()),
+                        // SAFETY: 没标记 ⇒ 从根不可达，之后没人再用
+                        None => unsafe { K::finalize(header) },
+                    }
                     dead |= 1 << bit;
                 }
             }
