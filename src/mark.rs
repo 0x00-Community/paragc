@@ -245,9 +245,11 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
     fn forward(&mut self, header: *const Header, no_edges: bool) -> *const Header {
         // SAFETY: header 来自本堆的 Gc / 根，对象活着
         let h = unsafe { &*header };
+        // 本轮已经原地标过的不搬（年轻疏散里老对象直接指着的、别的堆指着的年轻对象先原地标上了）
         if let Some(copier) = self.copier.as_deref_mut()
             && !h.is_large()
             && Block::containing(header.cast()).is_evacuating()
+            && !h.is_marked(self.epoch)
         {
             return match h.claim() {
                 Claim::Moved(to) => to,
@@ -495,6 +497,8 @@ pub struct Marking<'g> {
     log: Option<&'g Injector<usize>>,
     /// 一起回收：追踪到的 Far 报到这里
     group: Option<&'g Injector<(usize, usize)>>,
+    /// 年轻疏散（[`crate::YoungEvacuation::Full`]）：0 号工人把记忆集里这些槽改成搬走后的新地址
+    slots: &'g [usize],
 }
 
 // SAFETY: 每个工号的复制缓冲只被一个线程取走（工号互不相同）；其余是线程安全的
@@ -510,7 +514,14 @@ impl<'g> Marking<'g> {
             count: None,
             log: None,
             group: None,
+            slots: &[],
         }
+    }
+
+    /// 年轻疏散：记忆集里的槽（地址）由 0 号工人改成搬走后的新地址（同时把目标标灰）。
+    pub fn relocating_slots(mut self, slots: &'g [usize]) -> Self {
+        self.slots = slots;
+        self
     }
 
     /// 并发标记：给引用计数登记队列。
@@ -583,6 +594,19 @@ impl<'g> Marking<'g> {
             && let Some(roots) = self.roots
         {
             roots.relocate(|h| t.forward(h, false));
+            for &slot in self.slots {
+                let slot = core::ptr::with_exposed_provenance::<AtomicPtr<u8>>(slot);
+                // SAFETY: 槽在写入它的老对象里，到这次回收前不会被释放（见 Mutator::written）；停顿里没有 mutator 写它
+                let slot = unsafe { &*slot };
+                let p = slot.load(Ordering::Acquire);
+                if !p.is_null() {
+                    let old = Header::of(p);
+                    let new = t.forward(old, false);
+                    if !core::ptr::eq(old, new) {
+                        slot.store(Header::data(new), Ordering::Release);
+                    }
+                }
+            }
         }
         self.crew.drain(me, &local, |item| t.scan(item));
     }
@@ -665,7 +689,12 @@ impl Copier {
         let (targets, blocks, pages) = unsafe { (&*self.targets, &*self.blocks, &*self.pages) };
         let b = loop {
             match targets.steal() {
-                Steal::Success(b) => break b,
+                Steal::Success(b) => {
+                    // 年轻疏散直接从可用队列里拿：拿出来，标成用过（落进本次年轻清扫重新分类）
+                    b.unlist();
+                    b.reused();
+                    break b;
+                }
                 Steal::Retry => {}
                 Steal::Empty => {
                     let b = Block::new(pages);

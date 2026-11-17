@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use paragc::{Far, Gc, Heap, Root, Slot, Trace, Tracer, brand};
+use paragc::{Far, Gc, Heap, Root, Slot, Trace, Tracer, YoungEvacuation, brand};
 
 /// 每个堆的回收线程数（Miri 下减少）
 const THREADS: NonZeroUsize = NonZeroUsize::new(if cfg!(miri) { 2 } else { 4 }).unwrap();
@@ -327,4 +327,32 @@ fn eight_threads_relink_far_holders() {
     let mut group: Vec<&mut Heap> = hs.iter_mut().collect();
     Heap::collect_group(&mut group);
     assert_eq!(drops.load(Ordering::Relaxed), made.load(Ordering::Relaxed), "所有 Item 都应该被回收（没有漏掉的入口）");
+}
+
+/// 年轻疏散（`Full`）也不搬别的堆经 Far 直接指着的年轻对象；只有根的照常搬走。
+#[test]
+fn far_targets_are_pinned_during_young_evacuation() {
+    const ITEMS: u64 = if cfg!(miri) { 400 } else { 4_000 };
+    let a = Heap::new(THREADS);
+    let mut b = Heap::new(THREADS);
+    b.set_young_evacuation(YoungEvacuation::Full);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let roots: Vec<(u64, Root<ItemB>)> = (0..ITEMS).map(|v| (v, item(&b, v, &drops))).collect();
+    let held: Vec<(u64, Root<HolderB>)> = roots.iter().filter(|(v, _)| v % 2 == 0).map(|(v, r)| (*v, hold(&a, &b, r, *v))).collect();
+    let before: Vec<usize> = b.mutate(|m| roots.iter().map(|(_, r)| m.get(r).as_ptr().addr()).collect());
+    b.collect_young();
+    let after: Vec<usize> = b.mutate(|m| roots.iter().map(|(_, r)| m.get(r).as_ptr().addr()).collect());
+    for ((value, _), (x, y)) in roots.iter().zip(before.iter().zip(&after)) {
+        if value % 2 == 0 {
+            assert_eq!(x, y, "被 Far 指着的年轻对象被搬走了");
+        }
+    }
+    assert!(roots.iter().zip(before.iter().zip(&after)).any(|((v, _), (x, y))| v % 2 == 1 && x != y), "只有根的年轻对象应该被搬走");
+    for (value, h) in &held {
+        assert_eq!(far_value(&a, &b, h), *value);
+    }
+    for (value, r) in &roots {
+        assert_eq!(b.mutate(|m| m.get(r).value), *value);
+    }
+    assert_eq!(drops.load(Ordering::Relaxed), 0);
 }

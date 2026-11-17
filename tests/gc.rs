@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use paragc::{Gc, Heap, Root, Slot, Trace, Tracer, brand};
+use paragc::{Gc, Heap, Root, Slot, Trace, Tracer, YoungEvacuation, brand};
 
 #[derive(Trace)]
 struct Node<'gc> {
@@ -1263,10 +1263,10 @@ fn medium_objects_overflow_without_wasting_holes() {
     /// 块的大小（paragc::layout::BLOCK）
     const BLOCK: usize = 32 * 1024;
     let mut heap = Heap::new(THREADS);
-    // 连续分配一行大的对象，隔一个留一个：完整回收后每个死的都是单行空洞
+    // 连续分配一行大的对象，每三个扔一个：完整回收后每个死的都是单行空洞（块里存活 2/3，不会被疏散）
     let lines: Root<LinesB> = heap.mutate(|m| {
-        let all: Vec<_> = (0..2 * HOLES).map(|_| m.alloc(Line { _pad: [0; 29] })).collect();
-        m.root(m.alloc(Lines { kept: all.iter().step_by(2).map(|&l| Slot::from(Some(l))).collect() }))
+        let all: Vec<_> = (0..3 * HOLES).map(|_| m.alloc(Line { _pad: [0; 29] })).collect();
+        m.root(m.alloc(Lines { kept: all.iter().enumerate().filter(|(i, _)| i % 3 != 2).map(|(_, &l)| Slot::from(Some(l))).collect() }))
     });
     heap.collect();
     heap.collect();
@@ -1283,4 +1283,91 @@ fn medium_objects_overflow_without_wasting_holes() {
     let medium_blocks = (HOLES * size_of::<Medium>()).div_ceil(BLOCK * 9 / 10);
     assert!(grown <= medium_blocks + 2, "新开 {grown} 块，只该够放中对象（约 {medium_blocks} 块）：小对象没填进旧空洞");
     drop(lines);
+}
+
+/// 持有者（会变老）与它挂着的年轻链。
+#[derive(Trace)]
+struct Anchor<'gc> {
+    head: Slot<'gc, Bead<'gc>>,
+}
+
+brand!(AnchorB = for<'gc> Anchor<'gc>);
+
+#[derive(Trace)]
+struct Bead<'gc> {
+    value: u64,
+    next: Option<Gc<'gc, Bead<'gc>>>,
+    _counted: Counted,
+}
+
+brand!(BeadB = for<'gc> Bead<'gc>);
+
+/// 链上每个节点的（地址, 值）。
+fn beads<'gc>(head: Option<Gc<'gc, Bead<'gc>>>) -> Vec<(usize, u64)> {
+    let mut out = Vec::new();
+    let mut cur = head;
+    while let Some(b) = cur {
+        out.push((b.as_ptr().addr(), b.value));
+        cur = b.next;
+    }
+    out
+}
+
+/// 造一条 `len` 个节点的链（值从 `from` 起），节点之间夹着垃圾（存活对象散在块里）。
+fn chain<'gc>(m: &paragc::Mutator<'gc>, drops: &Arc<AtomicUsize>, from: u64, len: u64) -> Gc<'gc, Bead<'gc>> {
+    let mut top = None;
+    for value in from..from + len {
+        m.alloc(Bead { value: u64::MAX, next: None, _counted: Counted(drops.clone()) });
+        top = Some(m.alloc(Bead { value, next: top, _counted: Counted(drops.clone()) }));
+    }
+    top.expect("len > 0")
+}
+
+/// 年轻疏散：老持有者的槽挂一条年轻链、根也挂一条，年轻回收后——
+/// `Full`：两条链都搬了（地址全变）、值不变、槽与根都指到新地址；
+/// `SkipRemembered`：槽直接指着的头原地不动，链上其余的搬了；
+/// `Off`：都不动。之后摘掉链，引用计数照样收掉（析构数恰好）。
+#[test]
+fn young_evacuation_moves_survivors() {
+    const LEN: u64 = if cfg!(miri) { 50 } else { 5000 };
+    let n = usize::try_from(LEN).expect("链长");
+    for mode in [YoungEvacuation::Full, YoungEvacuation::SkipRemembered, YoungEvacuation::Off] {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut heap = Heap::new(THREADS);
+        heap.set_young_evacuation(mode);
+        let anchor: Root<AnchorB> = heap.mutate(|m| m.root(m.alloc(Anchor { head: Slot::default() })));
+        heap.collect();
+        heap.collect();
+        let (rooted, before_slot, before_root): (Root<BeadB>, _, _) = heap.mutate(|m| {
+            let a = m.get(&anchor);
+            a.head.set(m, Some(chain(m, &drops, 0, LEN)));
+            let r = chain(m, &drops, LEN, LEN);
+            (m.root(r), beads(a.head.get()), beads(Some(r)))
+        });
+        heap.collect_young();
+        assert_eq!(drops.load(Ordering::Relaxed), 2 * n, "{mode:?}: 夹着的垃圾应该都析构了");
+        let (after_slot, after_root) = heap.mutate(|m| (beads(m.get(&anchor).head.get()), beads(Some(m.get(&rooted)))));
+        let values = |v: &[(usize, u64)]| v.iter().map(|&(_, x)| x).collect::<Vec<_>>();
+        assert_eq!(values(&after_slot), values(&before_slot), "{mode:?}: 槽挂的链值变了");
+        assert_eq!(values(&after_root), values(&before_root), "{mode:?}: 根挂的链值变了");
+        let moved = |a: &[(usize, u64)], b: &[(usize, u64)]| a.iter().zip(b).filter(|(x, y)| x.0 != y.0).count();
+        let (slot_moved, root_moved) = (moved(&before_slot, &after_slot), moved(&before_root, &after_root));
+        match mode {
+            YoungEvacuation::Full => {
+                assert_eq!((slot_moved, root_moved), (n, n), "Full：全都该搬");
+            }
+            YoungEvacuation::SkipRemembered => {
+                assert_eq!(after_slot[0].0, before_slot[0].0, "SkipRemembered：老对象直接指着的不该搬");
+                assert_eq!((slot_moved, root_moved), (n - 1, n), "SkipRemembered：其余的该搬");
+            }
+            YoungEvacuation::Off => assert_eq!((slot_moved, root_moved), (0, 0), "Off：不该搬"),
+        }
+        // 摘掉两条链：引用计数（槽那条）与年轻 / 完整回收（根那条）收掉，析构数恰好
+        heap.mutate(|m| m.get(&anchor).head.set(m, None));
+        drop(rooted);
+        heap.collect_young();
+        heap.collect();
+        assert_eq!(drops.load(Ordering::Relaxed), 4 * n, "{mode:?}: 摘掉的链没收干净");
+        drop(anchor);
+    }
 }

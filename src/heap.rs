@@ -20,7 +20,7 @@ use core::cell::Cell;
 use core::marker::PhantomData;
 use core::num::{NonZeroU32, NonZeroUsize};
 use core::ptr::{NonNull, null_mut};
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 #[cfg(target_os = "linux")]
 use core::time::Duration;
 #[cfg(target_os = "linux")]
@@ -38,7 +38,7 @@ use crate::{Gc, Trace};
 use crate::handle::{GcInternal, Invariant, RawSlot, RootTable};
 #[cfg(target_os = "linux")]
 use crate::handle::{EdgeMap, Public, PublicBrand, PublicGc, PublicGcInternal, PublicInternal, Shared};
-use crate::layout::{BLOCK, Block, Pages, LINE, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, HEADER, Header, LARGE, MAX_EPOCH, MIN_SPARE_BLOCKS, MIN_TRIGGER, OVERFLOW_TRIES, YOUNG_PER_FULL, YOUNG_PER_FULL_RC};
+use crate::layout::{BLOCK, Block, Pages, LINE, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, HEADER, Header, LARGE, MAX_EPOCH, MIN_SPARE_BLOCKS, MIN_TRIGGER, OVERFLOW_TRIES, FRAG_NUM, FRAG_DEN, YOUNG_PER_FULL, YOUNG_PER_FULL_RC};
 #[cfg(target_os = "linux")]
 use crate::layout::{Core, State};
 #[cfg(target_os = "linux")]
@@ -97,6 +97,8 @@ pub struct Heap {
     sweeper: Sweeper,
     /// 死对象的析构在全部回收线程上并行跑（假：只在调用回收 / 清扫的线程上跑），见 [`Heap::set_parallel_drop`]
     parallel_drop: AtomicBool,
+    /// 年轻回收怎么搬存活的年轻对象（[`YoungEvacuation`] 的值）
+    young_evacuation: AtomicU8,
     /// 块的来源（析构时 Drop 里先把块都还回来，之后它才解除映射）
     pages: Pages,
     roots: Arc<RootTable>,
@@ -106,6 +108,33 @@ pub struct Heap {
     evacuated: (usize, usize),
     /// 给 [`Heap::mutate`] 复用的分配缓冲
     spare: AtomicPtr<Tlab>,
+}
+
+/// 年轻回收要不要把存活的年轻对象搬进紧凑的块（[`Heap::set_young_evacuation`]）。
+///
+/// 年轻回收不扫描老对象：老对象指着年轻对象的边只有记忆集里的槽（[`crate::Slot`] 写入时记下的）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum YoungEvacuation {
+    /// 不搬：存活的年轻对象原地晋升
+    Off,
+    /// 缺省。老对象直接指着的（记忆集里的槽的目标）、别的堆经 [`crate::Far`] 指着的原地晋升，其余的搬走：
+    /// 搬走的对象只被年轻对象和根指着，它们都会被重定位（`Trace::relocate`），老对象一个字节都不改
+    #[default]
+    SkipRemembered,
+    /// 记忆集里的槽也改成新地址，老对象直接指着的也搬。只有老对象里除了 `Slot` 没有别的地方存这个地址时才能用
+    /// （比如在 `Slot` 旁边另存一份地址的，那一份不会跟着改）
+    Full,
+}
+
+impl From<u8> for YoungEvacuation {
+    fn from(v: u8) -> Self {
+        match v {
+            0 => Self::Off,
+            2 => Self::Full,
+            _ => Self::SkipRemembered,
+        }
+    }
 }
 
 /// 堆的统计。
@@ -157,6 +186,7 @@ impl Heap {
             large: SegVec::default(),
             sweeper: Sweeper::default(),
             parallel_drop: AtomicBool::new(true),
+            young_evacuation: AtomicU8::new(YoungEvacuation::default() as u8),
             pages: Pages::default(),
             roots: Arc::default(),
             allocated: AtomicUsize::new(0),
@@ -265,19 +295,23 @@ impl Heap {
     /// 从清扫后没再用过的可用块里挑疏散候选：存活不到 [`EVACUATE_LIVE`] 字节（且不是全空）的稀疏块，至多
     /// [`EVACUATE_MAX`] 个；够 [`EVACUATE_MIN`] 个才疏散。其余块放进 `targets` 当搬入的目标。返回疏散的块数（0 = 不疏散）。
     fn pick_evacuation(available: &[Block], targets: &Injector<Block>) -> usize {
-        let sparse = |b: &Block| b.live_since_sweep().is_some_and(|live| live > 0 && live < EVACUATE_LIVE);
-        let count = available.iter().filter(|b| sparse(b)).count().min(EVACUATE_MAX);
-        let evacuate = count >= EVACUATE_MIN;
-        let mut picked = 0;
+        let live = |b: &Block| b.live_since_sweep().filter(|&live| live > 0 && live < EVACUATE_LIVE);
+        let mut sparse: Vec<(usize, Block)> = available.iter().filter_map(|b| live(b).map(|l| (l, *b))).collect();
+        // 最稀疏的先搬（搬得少、腾得多）；不够数就不疏散
+        sparse.sort_unstable_by_key(|&(l, _)| l);
+        sparse.truncate(EVACUATE_MAX);
+        if sparse.len() < EVACUATE_MIN {
+            sparse.clear();
+        }
+        for &(_, b) in &sparse {
+            b.set_evacuate();
+        }
         for &b in available {
-            if evacuate && picked < count && sparse(&b) {
-                b.set_evacuate();
-                picked += 1;
-            } else {
+            if !b.is_evacuating() {
                 targets.push(b);
             }
         }
-        picked
+        sparse.len()
     }
 
     /// 写屏障：并发标记中覆盖掉的旧值若还没标，就标上（连同它跨的行）并放进灰队列（保住初始快照）。
@@ -359,6 +393,13 @@ impl Heap {
         b
     }
 
+    /// 年轻回收怎么搬存活的年轻对象（缺省 [`YoungEvacuation::SkipRemembered`]）。搬走的对象地址会变：
+    /// 按地址建索引的结构要在 `Trace::relocate` 里更新，而且只要它指着年轻对象，它自己也得是年轻的
+    /// （年轻回收不扫描老对象；比如改动时挪进新分配的对象）。
+    pub fn set_young_evacuation(&self, mode: YoungEvacuation) {
+        self.young_evacuation.store(mode as u8, Ordering::Relaxed);
+    }
+
     /// 上一轮的清扫还没做完（mutator 要块时会顺手扫，或调 [`Heap::sweep_concurrently`]）。
     /// 死对象的析构在哪跑：真（缺省）= 全部回收线程并行；假 = 只在调用 [`Heap::collect`] / [`Heap::collect_young`] /
     /// [`Heap::sweep_concurrently`] 的线程上跑（标记、判死、清起点位、算行照旧并行；mutator 要块时顺手扫的照旧在它自己线程上析构）。
@@ -408,10 +449,13 @@ impl Heap {
     /// 计数粘住的对象而少跑——计数可信时每 [`YOUNG_PER_FULL_RC`] 次年轻回收一次；计数不可信（并发标记之后）时
     /// 每 [`YOUNG_PER_FULL`] 次一次，尽快重新计数。回收了返回 true。
     pub fn collect_if_needed(&mut self) -> bool {
-        let due = *self.allocated.get_mut() >= self.sweeper.live().max(MIN_TRIGGER) * GROWTH;
+        let live = self.sweeper.live().max(MIN_TRIGGER);
+        let due = *self.allocated.get_mut() >= live * GROWTH;
         if due {
             let every = if *self.rc_valid.get_mut() { YOUNG_PER_FULL_RC } else { YOUNG_PER_FULL };
-            if self.young_since_full < every {
+            // 碎了：块占的比「存活 + 这一轮允许新分配的」多出 FRAG_RATIO 倍 ⇒ 完整回收（带疏散），不等轮到
+            let fragmented = self.blocks.len() * BLOCK * FRAG_DEN > live * (1 + GROWTH) * FRAG_NUM;
+            if self.young_since_full < every && !fragmented {
                 self.collect_young();
             } else {
                 self.collect();
@@ -450,13 +494,46 @@ impl Heap {
                 self.available.push(b);
             }
         }
-        // SAFETY: &mut self ⇒ 没有 mutator
-        let roots = unsafe { self.roots.settle() };
         let epoch = self.epoch;
         let remembered = Self::drain(&self.remembered);
-        // 引用计数（可信时）：当前的根 +1、登记过的槽按「新值 +1、上次计入的值 −1」结算，上一轮的根延迟到现在 −1
         let counting = *self.rc_valid.get_mut();
         let parity = *self.rc_parity.get_mut();
+        let pool = self.pool.get_or_init(|| Pool::new(self.threads));
+        let workers = pool.sized(self.blocks.len() + self.large.len());
+        let mode = YoungEvacuation::from(*self.young_evacuation.get_mut());
+        // 晋升的对象被扫描时，它的每条边 +1（年轻对象的边从晋升起才计数）
+        let mark = Marking::new(workers, epoch, &self.grey).counting(counting.then_some(parity));
+        let moved = AtomicUsize::new(0);
+        if mode == YoungEvacuation::Off {
+            // SAFETY: &mut self ⇒ 没有 mutator
+            Marking::seed(&self.grey, &unsafe { self.roots.settle() }, epoch);
+            Marking::seed_slots(&self.grey, &remembered, epoch);
+            mark.run(pool);
+        } else {
+            // 上次回收后拿去分配过的块都疏散（里面的老对象不搬：本轮早就标过了）；搬入可用块与新块
+            let young: Vec<Block> = self.blocks.take();
+            for &b in &young {
+                if b.live_since_sweep().is_none() {
+                    b.set_evacuate();
+                }
+            }
+            self.blocks.extend(young);
+            // 别的堆直接指着的年轻对象先原地标上（不搬）
+            let mut pinned = Vec::new();
+            // SAFETY: 没有 mutator
+            unsafe { self.roots.pinned(|h| pinned.push(h)) };
+            Marking::seed(&self.grey, &pinned, epoch);
+            let slots: &[usize] = if mode == YoungEvacuation::Full { &remembered } else {
+                // 老对象直接指着的也原地标上
+                Marking::seed_slots(&self.grey, &remembered, epoch);
+                &[]
+            };
+            mark.evacuating(&self.roots, &self.available, &self.blocks, &self.pages, &moved, epoch).relocating_slots(slots).run(pool);
+        }
+        // 引用计数（可信时）在标记之后结算（对象可能搬了，用搬后的地址）：当前的根 +1、登记过的槽按「新值 +1、
+        // 上次计入的值 −1」结算，上一轮的根延迟到现在 −1
+        // SAFETY: &mut self ⇒ 没有 mutator
+        let roots = unsafe { self.roots.settle() };
         let mut decs = Vec::new();
         if counting {
             for &root in &roots {
@@ -481,12 +558,6 @@ impl Heap {
                 slot.unlog();
             }
         }
-        Marking::seed(&self.grey, &roots, epoch);
-        Marking::seed_slots(&self.grey, &remembered, epoch);
-        let pool = self.pool.get_or_init(|| Pool::new(self.threads));
-        let workers = pool.sized(self.blocks.len() + self.large.len());
-        // 晋升的对象被扫描时，它的每条边 +1（年轻对象的边从晋升起才计数）
-        Marking::new(workers, epoch, &self.grey).counting(counting.then_some(parity)).run(pool);
         if counting {
             self.rc_roots = roots.iter().map(|r| r.expose_provenance()).collect();
             // 增量都已加完；减量交给后台（sweep_concurrently）
@@ -500,7 +571,7 @@ impl Heap {
         let large = self.large.take();
         let spare = (*self.allocated.get_mut() / BLOCK).max(MIN_SPARE_BLOCKS);
         self.sweeper.start(epoch, young, large, spare);
-        self.evacuated = (0, 0);
+        self.evacuated = (0, moved.into_inner());
         *self.allocated.get_mut() = 0;
         self.collections += 1;
         self.young_collections += 1;

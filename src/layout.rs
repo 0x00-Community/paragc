@@ -54,7 +54,7 @@ pub const GRANULES: usize = BLOCK / GRANULE;
 /// 起点位图每个字的位数
 pub const BITS: usize = u64::BITS as usize;
 /// 大对象阈值（含头的字节数）：超过就单独分配、不进块
-pub const LARGE: usize = 8 * 1024;
+pub const LARGE: usize = BLOCK / 2;
 /// 不小于它的大对象（Linux）单独 mmap：释放时 munmap 立刻还给系统（全局分配器释放的大块常常留着不还）
 #[cfg(all(target_os = "linux", not(miri)))]
 pub const LARGE_MMAP: usize = 64 * 1024;
@@ -70,12 +70,15 @@ pub const GROWTH: usize = 2;
 pub const YOUNG_PER_FULL: usize = 4;
 /// collect_if_needed：引用计数可信时（死掉的老对象由计数收），每这么多次年轻回收才一次完整回收（收环与计数粘住的）
 pub const YOUNG_PER_FULL_RC: usize = 16;
-/// 疏散候选：上次清扫后存活不到这么多字节的块（块的 1/4）
-pub const EVACUATE_LIVE: usize = BLOCK / 4;
+/// 疏散候选：上次清扫后存活不到这么多字节的块（块的一半）
+pub const EVACUATE_LIVE: usize = BLOCK / 2;
 /// 疏散候选至少这么多个才值得疏散
 pub const EVACUATE_MIN: usize = 4;
 /// 一次至多疏散这么多个块（限住这次停顿）
-pub const EVACUATE_MAX: usize = 1024;
+pub const EVACUATE_MAX: usize = usize::MAX;
+/// collect_if_needed：块占的字节比「存活 + 一轮允许新分配的」多出 FRAG_NUM / FRAG_DEN 倍就算碎了，做完整回收（带疏散）
+pub const FRAG_NUM: usize = 3;
+pub const FRAG_DEN: usize = 2;
 /// 回收后至少留着复用的全空块数
 pub const MIN_SPARE_BLOCKS: usize = 4;
 /// 溢出分配领块时最多看几个可用块（找有放得下中对象的空洞的），都不行就开新块
