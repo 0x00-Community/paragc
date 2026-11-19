@@ -38,7 +38,7 @@ use crate::{Gc, Trace};
 use crate::handle::{GcInternal, Invariant, RawSlot, RootTable};
 #[cfg(target_os = "linux")]
 use crate::handle::{EdgeMap, Public, PublicBrand, PublicGc, PublicGcInternal, PublicInternal, Shared};
-use crate::layout::{BLOCK, Block, Pages, LINE, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, HEADER, Header, LARGE, MAX_EPOCH, MIN_SPARE_BLOCKS, MIN_TRIGGER, OVERFLOW_TRIES, FRAG_NUM, FRAG_DEN, YOUNG_PER_FULL, YOUNG_PER_FULL_RC};
+use crate::layout::{BLOCK, Block, Pages, LINE, START_SPAN, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, HEADER, Header, LARGE, MAX_EPOCH, MIN_SPARE_BLOCKS, MIN_TRIGGER, OVERFLOW_TRIES, FRAG_NUM, FRAG_DEN, YOUNG_PER_FULL, YOUNG_PER_FULL_RC};
 #[cfg(target_os = "linux")]
 use crate::layout::{Core, State};
 #[cfg(target_os = "linux")]
@@ -862,14 +862,17 @@ impl Tlab {
 
     /// 碰撞分配 `bytes` 字节（行标记早于 `epoch` 的是空行，没有空洞了用 `acquire` 领块）。
     /// 比一行大、主空洞放不下的走溢出游标（块用 `roomy(bytes)` 领：要有放得下它的空洞），不丢掉主空洞剩下的部分。
-    fn bump(&self, bytes: usize, epoch: u32, acquire: impl Fn() -> Block, roomy: impl Fn(usize) -> Block) -> *mut u8 {
+    /// 切出 `bytes` 字节，并说明它的起点位图字是否独占（[`Bump::owns_starts`]）
+    fn bump(&self, bytes: usize, epoch: u32, acquire: impl Fn() -> Block, roomy: impl Fn(usize) -> Block) -> (*mut u8, bool) {
         if let Some(p) = self.main.fit(bytes) {
-            return p;
+            return (p, self.main.owns_starts(p));
         }
         if bytes > LINE {
-            return self.overflow.take(bytes, epoch, &|| roomy(bytes));
+            let p = self.overflow.take(bytes, epoch, &|| roomy(bytes));
+            return (p, self.overflow.owns_starts(p));
         }
-        self.main.take(bytes, epoch, &acquire)
+        let p = self.main.take(bytes, epoch, &acquire);
+        (p, self.main.owns_starts(p))
     }
 }
 
@@ -877,13 +880,15 @@ impl Tlab {
 struct Bump {
     block: Cell<Option<Block>>,
     line: Cell<usize>,
+    /// 当前空洞的起点（空洞 = [hole, limit)，整个归这个游标）
+    hole: Cell<*mut u8>,
     cursor: Cell<*mut u8>,
     limit: Cell<*mut u8>,
 }
 
 impl Default for Bump {
     fn default() -> Self {
-        Self { block: Cell::default(), line: Cell::default(), cursor: Cell::new(null_mut()), limit: Cell::new(null_mut()) }
+        Self { block: Cell::default(), line: Cell::default(), hole: Cell::new(null_mut()), cursor: Cell::new(null_mut()), limit: Cell::new(null_mut()) }
     }
 }
 
@@ -897,6 +902,13 @@ impl Bump {
         })
     }
 
+    /// `p`（当前空洞里刚切出来的）所在的起点位图字管的字节是否整个在当前空洞里（见 [`Block::set_start_owned`]）
+    #[inline]
+    fn owns_starts(&self, p: *mut u8) -> bool {
+        let word = p.addr() & !(START_SPAN - 1);
+        word >= self.hole.get().addr() && word + START_SPAN <= self.limit.get().addr()
+    }
+
     /// 当前空洞放不下就找当前块的下一个空洞（放不下的跳过），没有了就用 `acquire` 领新块。
     fn take(&self, bytes: usize, epoch: u32, acquire: &impl Fn() -> Block) -> *mut u8 {
         loop {
@@ -907,12 +919,14 @@ impl Bump {
                 && let Some((start, end)) = b.hole(self.line.get(), epoch)
             {
                 self.line.set(end);
+                self.hole.set(b.line(start));
                 self.cursor.set(b.line(start));
                 self.limit.set(b.line(end));
                 continue;
             }
             self.block.set(Some(acquire()));
             self.line.set(Block::FIRST_LINE);
+            self.hole.set(null_mut());
             self.cursor.set(null_mut());
             self.limit.set(null_mut());
         }
@@ -994,8 +1008,12 @@ impl<'gc> Mutator<'gc> {
     }
 
     fn alloc_small(&self, bytes: usize) -> *mut u8 {
-        let p = self.tlab.bump(bytes, self.heap.epoch, || self.heap.acquire(), |need| self.heap.acquire_for(need));
-        Block::containing(p).set_start(p);
+        let (p, owned) = self.tlab.bump(bytes, self.heap.epoch, || self.heap.acquire(), |need| self.heap.acquire_for(need));
+        if owned {
+            Block::containing(p).set_start_owned(p);
+        } else {
+            Block::containing(p).set_start(p);
+        }
         p
     }
 }
@@ -2127,7 +2145,8 @@ impl<'p> PublicMutator<'p> {
     }
 
     fn alloc_small(&self, bytes: usize) -> *mut u8 {
-        self.tlab.bump(bytes, self.epoch, || self.heap.acquire(), |_| self.heap.acquire())
+        // 公开堆的块别的进程也会碰：起点位一律原子置（调用方用 `set_start`）
+        self.tlab.bump(bytes, self.epoch, || self.heap.acquire(), |_| self.heap.acquire()).0
     }
 }
 

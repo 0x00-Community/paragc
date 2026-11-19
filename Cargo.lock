@@ -35,7 +35,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "paragc"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "paragc-macros"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "proc-macro2",
  "quote",

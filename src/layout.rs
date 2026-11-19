@@ -53,6 +53,8 @@ pub const GRANULE: usize = 8;
 pub const GRANULES: usize = BLOCK / GRANULE;
 /// 起点位图每个字的位数
 pub const BITS: usize = u64::BITS as usize;
+/// 起点位图一个字管的字节数（两行）
+pub const START_SPAN: usize = BITS * GRANULE;
 /// 大对象阈值（含头的字节数）：超过就单独分配、不进块
 pub const LARGE: usize = BLOCK / 2;
 /// 不小于它的大对象（Linux）单独 mmap：释放时 munmap 立刻还给系统（全局分配器释放的大块常常留着不还）
@@ -528,6 +530,14 @@ impl Block {
     pub fn set_start(self, p: *const u8) {
         let g = self.offset(p) / GRANULE;
         self.meta().starts[g / BITS].fetch_or(1 << (g % BITS), Ordering::Relaxed);
+    }
+
+    /// 同 [`Block::set_start`]，但不用加锁的读改写：`p` 所在的起点位图字管的 [`START_SPAN`] 字节整个是调用方独占的空洞
+    /// （别的线程分配不进来；引用计数释放只清老对象的位，老对象的行不在空洞里），没有别人同时改这个字。
+    pub fn set_start_owned(self, p: *const u8) {
+        let g = self.offset(p) / GRANULE;
+        let word = &self.meta().starts[g / BITS];
+        word.store(word.load(Ordering::Relaxed) | 1 << (g % BITS), Ordering::Relaxed);
     }
 
     /// 把凑满整页的空行（行标记早于 `epoch`）还给系统（`madvise(MADV_DONTNEED)`；第 0 页有元数据，不碰）。
