@@ -38,6 +38,7 @@ collection marks and sweeps on every core.
 | 🏃 **Parallel collection** | A persistent pool per heap (threads park between collections). Marking: one crossbeam work-stealing deque per worker, stealing in batches. Sweeping, destructors included: blocks handed out in batches to the same workers. |
 | 🏷️ **Branded handles** | `Gc<'gc, T>` cannot escape the `mutate` closure. `Root<B>` handles carry no lifetime and can be stored anywhere and sent across threads. |
 | 🪶 **Weak references** | `Weak<B>` is like `Root<B>` (no lifetime, store it anywhere) but does not keep its object alive: every collection (full, young, concurrent-marking finish, group) clears the ones whose target was not marked, after marking and before sweeping, and moves the rest along with evacuated objects. `Mutator::upgrade` gives an `Option<Gc>`; `Weak::is_cleared` works outside `mutate`. |
+| 🔣 **Word slots** | `WordSlot<'gc>` holds a `u64` the user encodes (NaN-boxed values and the like): words at or above `WORD_POINTER_MIN` (`0xFFF8 << 48`) are pointers whose low 48 bits are an object's data address, and the top 16 bits are the user's own tag, kept as is through evacuation; every other word is plain data. Same barriers, counting and relocation as `Slot`; `word_pointer` decodes a word. |
 | 🔗 **References between heaps** | `Far<'a, B>` lets an object in one heap point straight at an object in another heap of the same process: no copy, no indirection. Each heap still collects on its own; `Heap::collect_group` traces several heaps together to reclaim cycles that span them. |
 | 🗄️ **Public heaps** (Linux) | A `PublicHeap` lives in a file on a shared-memory filesystem (`/dev/shm`, a tmpfs or hugetlbfs mount): everything — header, type table, entries, block table, blocks — is inside the file, at fixed offsets, and pointers are offsets, so several processes (anyone allowed to open the file) map the same heap at different addresses and use it at once. The file starts empty and grows as it is used. Objects carry a type number instead of code, and collection follows the type's pointer map. A process killed at any point — mutating, collecting — neither blocks the others nor leaks what it held. Public heaps point straight at each other (`PublicRef`), and `PublicHeap::collect_group` reclaims cycles across them; heap numbers are unique per directory across processes, and a heap can outlive the process that created it. Private heaps can hold `Public<B>` handles into it. |
 | 📦 **Opportunistic evacuation** | A stop-the-world collection moves the live objects out of sparse blocks while it marks (Immix defragmentation): one pass marks, copies and rewrites every edge. Every block under half live is a candidate, sparsest first, with no block cap; `collect_if_needed` runs a full collection early once blocks exceed "live + one round of allowed allocation" by 1.5×. Concurrent marking never moves anything, so mutators need no read barrier. |
@@ -126,7 +127,7 @@ Work-stealing deques and backoff come from [crossbeam](https://github.com/crossb
   taken in the same `mutate`, back into a `Gc` (for example out of a NaN-boxed value). Raw addresses stored inside heap
   objects are invisible to the collector: the type's `Trace` must rebuild them with `from_raw`, report them through
   `Tracer::edge`, and in `relocate` pass them to `Tracer::relocate` and write the new address back.
-- A `Slot` is two words (the value and the value last counted). A single object's data is at most 128 MiB.
+- A `Slot` / `WordSlot` is two words (the value and the value last counted). A `WordSlot` word with a pointer tag must point at a live object of the same heap. A single object's data is at most 128 MiB.
 - Objects can move during a stop-the-world collection. A `Gc` is only valid inside one `mutate`, so this is invisible,
   but `Gc::as_ptr` may differ from one `mutate` to the next. Hand-written `Trace` impls with edges must also implement
   `relocate` (the derive does it).
@@ -187,6 +188,7 @@ Work-stealing deques and backoff come from [crossbeam](https://github.com/crossb
 | `weak_follows_evacuation` · `young_collection_clears_young_targets` | After evacuation weak and strong references see the same new copy and the old copy is not finalized; under all three young evacuation modes young objects with no strong reference are cleared and survivors read back their values |
 | `weak_targets_wait_for_tracing` | An old object loses its last strong reference: without a weak reference it is released by count, with one it waits for a full collection |
 | `upgrade_during_concurrent_marking_keeps_target` · `weak_churn_while_marking_concurrently` | An object only weakly reachable at the snapshot, taken out during marking and stored in another object, survives the finish (read barrier); 4 threads make weak references, take objects out and store them while another thread marks concurrently, with exact finalization counts every round |
+| `survives_full_collections_and_cut_frees_the_rest` · `young_collection_*` · `concurrent_marking_while_rewriting` | `WordSlot`: tags and numbers unchanged through full, young (all three modes) and concurrent collections, the targets stay alive; replacing a pointer word with a number frees what it held, by count and by tracing |
 | `group_collection_clears_weak` | An object reachable only through another heap's `Far`: not cleared by its own heap's collection, cleared by a group collection after the holder dies |
 | `far_keeps_target_until_holder_dies` · `far_survives_holder_heap_drop_order` | A target with no root of its own survives full and young collections of its heap while the holder lives, and goes once the holder heap has finalized the holder; dropping the target heap first is safe |
 | `cross_heap_cycle_needs_group_collection` · `rings_over_eight_heaps` | Rings across 2 and 8 heaps survive collecting each heap alone; a group missing some of the heaps keeps them (outside holders are roots); the full group frees exactly the unrooted rings, the kept rings stay walkable |
@@ -216,7 +218,7 @@ under Miri; the two concurrent `gc` tests and `far_targets_are_pinned_during_eva
 crossbeam-deque push), and are clean under Tree Borrows:
 
 ```sh
-cargo test --test gc -- --exact <name>          # also --test far · --test weak · --test public · --test processes
+cargo test --test gc -- --exact <name>          # also --test far · --test weak · --test word · --test public · --test processes
 MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-ignore-leaks" cargo +nightly miri test --test gc -- --exact <name>
 MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-ignore-leaks -Zmiri-tree-borrows" cargo +nightly miri test --test gc -- --exact <name>
 ```

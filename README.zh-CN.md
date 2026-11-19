@@ -37,6 +37,7 @@ paragc 是**给多个线程共用一个堆的 Rust 程序用的追踪式垃圾�
 | 🏃 **并行回收** | 每个堆一个常驻线程池（两次回收之间线程挂起）。标记：每个工人一个 crossbeam 工作窃取双端队列、成批偷；清扫（含析构）：块按批分给同一批工人。 |
 | 🏷️ **带品牌的句柄** | `Gc<'gc, T>` 逃不出 `mutate` 的闭包；`Root<B>` 不带生命周期，可以存在任何地方、跨线程传。 |
 | 🪶 **弱引用** | `Weak<B>` 像 `Root<B>` 一样不带生命周期、放在哪都行，但不保活对象：每次回收（完整、年轻、并发标记收尾、一起回收）在标记之后、清扫之前清空目标没被标到的，搬走的跟着改地址；`Mutator::upgrade` 取回 `Option<Gc>`，`Weak::is_cleared` 不进 mutate 也能查。 |
+| 🔣 **字槽** | `WordSlot<'gc>` 放使用者自己编码的 `u64`（NaN 装箱之类）：不小于 `WORD_POINTER_MIN`（`0xFFF8 << 48`）的字是指针，低 48 位是对象数据地址、高 16 位是使用者自己的标签，疏散时原样保留；别的字是普通数据。屏障、计数、搬迁与 `Slot` 相同；`word_pointer` 解出字里的指针。 |
 | 🔗 **堆之间直接引用** | `Far<'a, B>` 让一个堆的对象直接指着同一进程里另一个堆的对象：不复制、不经过间接表。每个堆仍然各自回收；`Heap::collect_group` 把几个堆一起追踪，收掉跨堆的环。 |
 | 🗄️ **公开堆**（Linux） | `PublicHeap` 放在共享内存文件系统（`/dev/shm`、自己挂的 tmpfs / hugetlbfs）上的文件里：超级块、类型表、入口表、块状态表、块全在文件里、位置固定，指针存偏移，所以多个进程（有权限打开这个文件的）可以把同一个堆映射在各自不同的地址上、同时用。文件刚建时是空的，用到哪里长到哪里。对象头存类型号而不是代码，回收照类型的指针图追踪。进程在任何时刻被杀（mutate 中、回收中）既不卡住别人，也不漏掉它持有的东西。公开堆之间可以直接互指（`PublicRef`），`PublicHeap::collect_group` 收跨堆的环；同一目录里的堆号跨进程唯一，堆可以比建它的进程活得久。私有堆的对象里可以放指向它的 `Public<B>` 句柄。 |
 | 📦 **机会式疏散** | 暂停式回收在标记的同时把稀疏块里的活对象搬走（Immix defrag）：一遍里完成标记、复制、改写全部边。存活不到半块的都是候选，最稀疏的先搬、不设块数上限；块占的比「存活 + 一轮允许新分配的」多出 1.5 倍时 `collect_if_needed` 提前做完整回收。并发标记从不搬对象，所以 mutator 不需要读屏障。 |
@@ -112,7 +113,7 @@ heap.collect();
 - `Gc<'gc, T>` 是 `#[repr(transparent)]` 的 `NonNull<T>`。`Gc::from_raw` 把同一次 `mutate` 里 `Gc::as_ptr` 得到的数据指针变回 `Gc`
   （比如从 NaN-boxing 的值里解出来）。存进堆对象里的裸地址回收器看不见：类型的 `Trace` 要用 `from_raw` 把它变回来报给
   `Tracer::edge`，并在 `relocate` 里交给 `Tracer::relocate`、把新地址写回去。
-- `Slot` 占两个字（值与上次计入的值）。单个对象的数据至多 128 MiB。
+- `Slot` / `WordSlot` 占两个字（值与上次计入的值）。`WordSlot` 里带指针标签的字必须指着同一个堆里活着的对象。单个对象的数据至多 128 MiB。
 - 暂停式回收会搬对象。`Gc` 只在一次 `mutate` 里有效，所以察觉不到，但 `Gc::as_ptr` 两次 `mutate` 之间可能不同。
   手写有边的 `Trace` 还要实现 `relocate`（derive 会生成）。
 - 不要在同一个堆的 `mutate` 里调用 `mark_concurrently`：它会一直等自己走空。
@@ -179,6 +180,7 @@ heap.collect();
 | `weak_follows_evacuation` · `young_collection_clears_young_targets` | 疏散后弱引用与强引用看到同一个新副本、旧副本不析构；年轻回收三种搬法下没有强引用的年轻对象清空、活着的取得到原值 |
 | `weak_targets_wait_for_tracing` | 老对象最后一个强引用没了：没有弱引用的按计数释放，有弱引用的留到完整回收 |
 | `upgrade_during_concurrent_marking_keeps_target` · `weak_churn_while_marking_concurrently` | 快照时只剩弱引用、标记期间被取出挂进别的对象的对象活过收尾（读屏障）；4 个线程建弱引用、取出挂上，另一个线程并发标记，每轮析构数恰好 |
+| `survives_full_collections_and_cut_frees_the_rest` · `young_collection_*` · `concurrent_marking_while_rewriting` | `WordSlot`：完整、年轻（三种搬法）、并发回收后标签与数原样，目标活着；指针字换成数后它指着的按计数、按追踪都能收掉 |
 | `group_collection_clears_weak` | 只经别的堆的 `Far` 可达的对象：单独回收不清，持有者死后一起回收才清 |
 | `far_keeps_target_until_holder_dies` · `far_survives_holder_heap_drop_order` | 自己没有根的目标在持有方活着时挺过所在堆的完整、年轻回收；持有方堆析构了持有方之后才收；目标堆先析构也安全 |
 | `cross_heap_cycle_needs_group_collection` · `rings_over_eight_heaps` | 跨 2 个、8 个堆的环挺过各堆单独回收；缺几个堆的组收不掉（组外的持有方是根）；整组一起回收恰好收掉没挂根的环，留下的环走得通 |
@@ -191,7 +193,7 @@ crossbeam-epoch 的全局回收器退出时还拿着延迟释放的垃圾；每�
 在 Stacked Borrows 下仍会碰到 crossbeam-epoch 内部那处违例（crossbeam-deque 压栈时），Tree Borrows 下干净：
 
 ```sh
-cargo test --test gc -- --exact <名字>          # 另有 --test far · --test weak · --test public · --test processes
+cargo test --test gc -- --exact <名字>          # 另有 --test far · --test weak · --test word · --test public · --test processes
 MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-ignore-leaks" cargo +nightly miri test --test gc -- --exact <名字>
 MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-ignore-leaks -Zmiri-tree-borrows" cargo +nightly miri test --test gc -- --exact <名字>
 ```
