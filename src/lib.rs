@@ -10,7 +10,7 @@ mod shm;
 mod sweep;
 mod sync;
 
-pub use handle::{Brand, Far, Gc, Root, Slot, Weak};
+pub use handle::{Brand, Far, Gc, Root, Slot, Weak, WordSlot, word_pointer, RAW_TAG, WORD_PAYLOAD, WORD_POINTER_MIN};
 #[cfg(target_os = "linux")]
 pub use handle::{EdgeMap, Public, PublicBrand, PublicGc, PublicRef, PublicSlot, Shared};
 pub use heap::{Heap, Mutator, Stats, Tlab, YoungEvacuation};
