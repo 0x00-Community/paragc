@@ -258,6 +258,13 @@ impl Core {
         }
     }
 
+    /// 引用计数粘住（`parity` 是当前计数的奇偶）：之后的加减都不变，只有追踪回收能收它。
+    /// 弱引用的目标用它：按计数释放在后台、与 mutator 并发，来不及先清空弱引用。
+    pub fn rc_stick(&self, parity: bool) {
+        let parity = if parity { PARITY_BIT } else { 0 };
+        self.info.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |word| Some((word & !(RC_MASK | PARITY_BIT)) | parity | RC_MASK)).ok();
+    }
+
     /// 已经被搬走（清扫时不析构、不算存活）。
     pub fn is_forwarded(&self) -> bool {
         self.mark.load(Ordering::Acquire) & FORWARDED != 0
@@ -294,6 +301,17 @@ impl Header {
         unsafe { (&raw const (*this).drop).cast_mut().cast::<*const Self>().write(to) };
         // SAFETY: this 有效
         unsafe { &*this }.core.mark.store(FORWARDED, Ordering::Release);
+    }
+
+    /// 回收标记完之后：活着就给它现在的头（搬走了的给新头），没标到 `epoch` 的给 None。
+    pub fn survivor(this: *const Self, epoch: u32) -> Option<*const Self> {
+        // SAFETY: 调用方给的是本堆还没清扫的对象头
+        let h = unsafe { &*this };
+        if h.is_forwarded() {
+            Some(h.forwardee())
+        } else {
+            h.is_marked(epoch).then_some(this)
+        }
     }
 
     fn forwardee(&self) -> *const Self {

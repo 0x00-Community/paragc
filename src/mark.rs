@@ -23,15 +23,15 @@ use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::num::{NonZeroI16, NonZeroI32, NonZeroI64, NonZeroI8, NonZeroIsize, NonZeroU16, NonZeroU32, NonZeroU64, NonZeroU8, NonZeroUsize};
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicBool, AtomicI16, AtomicI32, AtomicI64, AtomicI8, AtomicIsize, AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI16, AtomicI32, AtomicI64, AtomicI8, AtomicIsize, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use core::time::Duration;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_utils::{Backoff, CachePadded};
 
-use crate::{Gc, Slot};
-use crate::handle::{GcInternal, RootTable, SlotInternal};
+use crate::{Gc, Slot, WordSlot};
+use crate::handle::{GcInternal, RawSlot, RootTable, SlotInternal, WordSlotInternal};
 #[cfg(target_os = "linux")]
 #[cfg(target_os = "linux")]
 use crate::handle::FAR_EDGE;
@@ -155,6 +155,12 @@ pub trait TracerInternal<'t> {
     /// 一个可改写的槽（疏散回收）：搬走了就改成新地址；计数模式下计入新值并 +1。
     fn slot_mut<T: Trace>(&mut self, slot: &mut Slot<'_, T>);
 
+    /// 抹掉类型的槽（[`Slot`]、[`crate::WordSlot`]），只读；`no_edges`：目标没有边
+    fn raw(&mut self, raw: &RawSlot, no_edges: bool);
+
+    /// 抹掉类型的槽，可改写（疏散回收）
+    fn raw_mut(&mut self, raw: &RawSlot, no_edges: bool);
+
     /// 标记对象，它在疏散候选块里就搬走；返回对象现在的头。
     fn forward(&mut self, header: *const Header, no_edges: bool) -> *const Header;
 
@@ -201,7 +207,14 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
     }
 
     fn slot<T: Trace>(&mut self, slot: &Slot<'_, T>) {
-        let raw = slot.raw_slot();
+        self.raw(slot.raw_slot(), T::NO_EDGES);
+    }
+
+    fn slot_mut<T: Trace>(&mut self, slot: &mut Slot<'_, T>) {
+        self.raw_mut(slot.raw_slot(), T::NO_EDGES);
+    }
+
+    fn raw(&mut self, raw: &RawSlot, no_edges: bool) {
         if let Some(decs) = self.decs.as_deref_mut() {
             if let Some(h) = raw.counted() {
                 decs.push(h.expose_provenance());
@@ -219,25 +232,27 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
                 log.push((&raw const *raw).expose_provenance());
             }
             if let Some(cur) = cur {
-                self.visit(cur, T::NO_EDGES);
+                self.visit(cur, no_edges);
                 self.inc(cur);
             }
         } else {
             raw.promote();
-            if let Some(gc) = slot.get() {
-                self.visit(gc.header(), T::NO_EDGES);
+            if let Some(h) = raw.current() {
+                self.visit(h, no_edges);
             }
         }
     }
 
-    fn slot_mut<T: Trace>(&mut self, slot: &mut Slot<'_, T>) {
-        if let Some(gc) = slot.get() {
-            let new = self.forward_gc(gc);
-            slot.store_exclusive(Some(new));
+    fn raw_mut(&mut self, raw: &RawSlot, no_edges: bool) {
+        if let Some(old) = raw.current() {
+            let new = self.forward(old, no_edges);
+            if !core::ptr::eq(old, new) {
+                raw.relocate(new);
+            }
         }
         if self.count.is_none() {
-            slot.raw_slot().promote();
-        } else if let (Some(cur), _) = slot.raw_slot().recount() {
+            raw.promote();
+        } else if let (Some(cur), _) = raw.recount() {
             self.inc(cur);
         }
     }
@@ -310,6 +325,17 @@ unsafe impl<T: Trace> Trace for Slot<'_, T> {
 
     fn relocate(&mut self, t: &mut Tracer<'_>) {
         t.slot_mut(self);
+    }
+}
+
+// SAFETY: 字里的指针（有的话）就是一条边；目标类型不知道，按有边处理
+unsafe impl Trace for WordSlot<'_> {
+    fn trace(&self, t: &mut Tracer<'_>) {
+        t.raw(self.raw(), false);
+    }
+
+    fn relocate(&mut self, t: &mut Tracer<'_>) {
+        t.raw_mut(self.raw(), false);
     }
 }
 
@@ -567,11 +593,10 @@ impl<'g> Marking<'g> {
         let seed = Worker::new_lifo();
         let mut t = Tracer::new(&seed, epoch, None);
         for &slot in slots {
-            let slot = core::ptr::with_exposed_provenance::<AtomicPtr<u8>>(slot);
             // SAFETY: 槽在写入它的对象里；那个对象被写时可达，到这次回收前不会被释放（见 Mutator::written）
-            let p = unsafe { &*slot }.load(Ordering::Acquire);
-            if !p.is_null() {
-                t.visit(Header::of(p), false);
+            let slot = unsafe { &*core::ptr::with_exposed_provenance::<RawSlot>(slot) };
+            if let Some(h) = slot.current() {
+                t.visit(h, false);
             }
         }
         while let Some(item) = seed.pop() {
@@ -595,15 +620,12 @@ impl<'g> Marking<'g> {
         {
             roots.relocate(|h| t.forward(h, false));
             for &slot in self.slots {
-                let slot = core::ptr::with_exposed_provenance::<AtomicPtr<u8>>(slot);
                 // SAFETY: 槽在写入它的老对象里，到这次回收前不会被释放（见 Mutator::written）；停顿里没有 mutator 写它
-                let slot = unsafe { &*slot };
-                let p = slot.load(Ordering::Acquire);
-                if !p.is_null() {
-                    let old = Header::of(p);
+                let slot = unsafe { &*core::ptr::with_exposed_provenance::<RawSlot>(slot) };
+                if let Some(old) = slot.current() {
                     let new = t.forward(old, false);
                     if !core::ptr::eq(old, new) {
-                        slot.store(Header::data(new), Ordering::Release);
+                        slot.relocate(new);
                     }
                 }
             }

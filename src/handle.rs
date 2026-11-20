@@ -1,8 +1,9 @@
-//! 指针与句柄：私有堆的 [`Gc`] / [`Slot`] / [`Root`] / [`Far`]，公开堆的 [`PublicGc`] / [`PublicSlot`] / [`PublicRef`] / [`Public`] 与 [`Shared`]。
+//! 指针与句柄：私有堆的 [`Gc`] / [`Slot`] / [`Root`] / [`Weak`] / [`Far`]，公开堆的 [`PublicGc`] / [`PublicSlot`] / [`PublicRef`] / [`Public`] 与 [`Shared`]。
 //!
 //! 堆指针 [`Gc`] 与原子指针槽 [`Slot`]。
 //!
 //! 根：[`Root`] 是 mutate 之外也能持有的强引用句柄（可跨线程），回收从全部根出发。
+//! 弱引用 [`Weak`] 同样可以在 mutate 之外持有，但不保活：每次回收标记完清空没标到的目标。
 //!
 //! 根表是只追加的槽数组：新根在 mutate 里领槽（先用释放过的空槽），句柄析构时把槽清空、下标挂回去。
 //! 空槽只在回收时（没有 mutator）整理成只读数组，mutate 期间原子游标领取，所以无锁、没有 ABA。
@@ -26,9 +27,9 @@ use core::marker::PhantomData;
 use core::num::{NonZeroI16, NonZeroI32, NonZeroI64, NonZeroI8, NonZeroU16, NonZeroU32, NonZeroU64, NonZeroU8};
 use core::ops::Deref;
 use core::ptr::{NonNull, null_mut};
-use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 #[cfg(target_os = "linux")]
-use core::sync::atomic::{AtomicBool, AtomicI16, AtomicI32, AtomicI64, AtomicI8, AtomicU16, AtomicU32, AtomicU64, AtomicU8};
+use core::sync::atomic::{AtomicBool, AtomicI16, AtomicI32, AtomicI64, AtomicI8, AtomicU16, AtomicU32, AtomicU8};
 use std::sync::Arc;
 
 use crate::{Heap, Mutator, Trace, Tracer};
@@ -144,7 +145,8 @@ impl<T: fmt::Debug> fmt::Debug for Gc<'_, T> {
 /// 平时老对象里的槽每轮第一次被写时登记，回收时按「新值 +1、上次计入的值 −1」结算引用计数。
 #[repr(C)]
 pub struct Slot<'gc, T> {
-    ptr: AtomicPtr<T>,
+    /// The pointer as a word (see [`word_pointer`])
+    word: AtomicU64,
     /// 上次计入引用计数的值（地址）| [`LOGGED`]；[`UNCOUNTED`] = 不计数（年轻对象里的槽，晋升时才开始计）
     counted: AtomicUsize,
     _brand: PhantomData<Gc<'gc, T>>,
@@ -158,16 +160,44 @@ pub const PROMOTED: usize = usize::MAX - 1;
 /// [`Slot::counted`] 的最低位：本轮已登记（地址按粒度对齐，最低位空着）
 pub const LOGGED: usize = 1;
 
-/// 抹掉类型的槽：写屏障登记、回收时结算用（与 [`Slot`] 同布局）。
+/// 槽里存的是「字」：高 13 位全是 1（`>= WORD_POINTER_MIN`）的字是 GC 指针，低 48 位是对象数据的地址（用户态地址放得下）；
+/// 0 是空；别的字都不是指针，由使用者自己解释（数、布尔……：NaN-boxing 的值可以原样放进 [`WordSlot`]）。
+/// [`Slot`] 存指针时打 [`RAW_TAG`]。
+pub const WORD_POINTER_MIN: u64 = 0xFFF8 << 48;
+/// 字的低 48 位：指针字里的地址
+pub const WORD_PAYLOAD: u64 = (1 << 48) - 1;
+/// [`Slot`] 给指针打的标签（指针区间里最高的一个；别的标签留给使用者区分类型）
+pub const RAW_TAG: u64 = 0xFFFF << 48;
+
+/// 字里的 GC 指针（对象数据地址）；不是指针时 `None`。
+#[inline]
+pub fn word_pointer(word: u64) -> Option<*mut u8> {
+    (word >= WORD_POINTER_MIN).then(|| core::ptr::with_exposed_provenance_mut((word & WORD_PAYLOAD) as usize))
+}
+
+/// 换掉字里的指针、保留标签（疏散时改成新地址）。
+#[inline]
+fn word_with_pointer(word: u64, data: *const u8) -> u64 {
+    debug_assert!(word >= WORD_POINTER_MIN, "只改指针字");
+    (word & !WORD_PAYLOAD) | data.expose_provenance() as u64
+}
+
+/// 抹掉类型的槽：写屏障登记、回收时结算用（与 [`Slot`]、[`WordSlot`] 同布局）。
 #[repr(C)]
 pub struct RawSlot {
-    pub ptr: AtomicPtr<u8>,
+    pub word: AtomicU64,
     pub counted: AtomicUsize,
 }
 
 impl RawSlot {
-    fn header(p: *mut u8) -> Option<*const Header> {
-        (!p.is_null()).then(|| Header::of(p))
+    fn header(word: u64) -> Option<*const Header> {
+        word_pointer(word).map(|p| Header::of(p))
+    }
+
+    /// 改成指向搬过去的对象（`to` 是新头）；只在停顿里（没有 mutator）。
+    pub fn relocate(&self, to: *const Header) {
+        let w = self.word.load(Ordering::Acquire);
+        self.word.store(word_with_pointer(w, Header::data(to)), Ordering::Release);
     }
 
     fn uncounted(c: usize) -> bool {
@@ -202,14 +232,14 @@ impl RawSlot {
 
     /// 改成计入当前值；返回（当前值, 上次计入的值）。
     pub fn recount(&self) -> (Option<*const Header>, Option<*const Header>) {
-        let p = self.ptr.load(Ordering::Acquire);
-        let prev = self.counted.swap(p.expose_provenance(), Ordering::AcqRel);
-        (Self::header(p), Self::from_counted(prev))
+        let p = word_pointer(self.word.load(Ordering::Acquire));
+        let prev = self.counted.swap(p.map_or(0, <*mut u8>::expose_provenance), Ordering::AcqRel);
+        (p.map(|p| Header::of(p.cast_const())), Self::from_counted(prev))
     }
 
     /// 这个槽当前的值。
     pub fn current(&self) -> Option<*const Header> {
-        Self::header(self.ptr.load(Ordering::Acquire))
+        Self::header(self.word.load(Ordering::Acquire))
     }
 
     /// 上次计入的值（释放它所在的对象时 −1）。
@@ -220,13 +250,13 @@ impl RawSlot {
 
 impl<T> Default for Slot<'_, T> {
     fn default() -> Self {
-        Self { ptr: AtomicPtr::new(null_mut()), counted: AtomicUsize::new(UNCOUNTED), _brand: PhantomData }
+        Self { word: AtomicU64::new(0), counted: AtomicUsize::new(UNCOUNTED), _brand: PhantomData }
     }
 }
 
 impl<'gc, T> From<Option<Gc<'gc, T>>> for Slot<'gc, T> {
     fn from(v: Option<Gc<'gc, T>>) -> Self {
-        Self { ptr: AtomicPtr::new(Self::raw(v)), counted: AtomicUsize::new(UNCOUNTED), _brand: PhantomData }
+        Self { word: AtomicU64::new(Self::raw(v)), counted: AtomicUsize::new(UNCOUNTED), _brand: PhantomData }
     }
 }
 
@@ -237,17 +267,17 @@ impl<'gc, T> From<Gc<'gc, T>> for Slot<'gc, T> {
 }
 
 impl<'gc, T> Slot<'gc, T> {
-    fn raw(v: Option<Gc<'gc, T>>) -> *mut T {
-        v.map_or(null_mut(), |g| g.ptr.as_ptr())
+    fn raw(v: Option<Gc<'gc, T>>) -> u64 {
+        v.map_or(0, |g| RAW_TAG | g.ptr.as_ptr().expose_provenance() as u64)
     }
 
-    fn wrap(p: *mut T) -> Option<Gc<'gc, T>> {
+    fn wrap(word: u64) -> Option<Gc<'gc, T>> {
         // SAFETY: 槽里只存过同品牌的 Gc，对象被槽所在的对象引用着
-        (!p.is_null()).then(|| unsafe { Gc::from_data(p) })
+        word_pointer(word).map(|p| unsafe { Gc::from_data(p.cast()) })
     }
 
     pub fn get(&self) -> Option<Gc<'gc, T>> {
-        Self::wrap(self.ptr.load(Ordering::Acquire))
+        Self::wrap(self.word.load(Ordering::Acquire))
     }
 
     pub fn set(&self, m: &Mutator<'gc>, v: Option<Gc<'gc, T>>) {
@@ -256,35 +286,88 @@ impl<'gc, T> Slot<'gc, T> {
 
     pub fn swap(&self, m: &Mutator<'gc>, v: Option<Gc<'gc, T>>) -> Option<Gc<'gc, T>> {
         let new = Self::raw(v);
-        let old = self.ptr.swap(new, Ordering::AcqRel);
-        self.barrier(m, old, new);
+        let old = self.word.swap(new, Ordering::AcqRel);
+        m.written(self.raw_slot(), RawSlot::header(old), RawSlot::header(new));
         Self::wrap(old)
     }
 
     /// 槽里是 `current` 才换成 `new`；失败时返回槽里的值。
     pub fn compare_exchange(&self, m: &Mutator<'gc>, current: Option<Gc<'gc, T>>, new: Option<Gc<'gc, T>>) -> Result<Option<Gc<'gc, T>>, Option<Gc<'gc, T>>> {
         let new = Self::raw(new);
-        let done = self.ptr.compare_exchange(Self::raw(current), new, Ordering::AcqRel, Ordering::Acquire);
+        let done = self.word.compare_exchange(Self::raw(current), new, Ordering::AcqRel, Ordering::Acquire);
+        // 写屏障：被覆盖的旧值（并发标记的初始快照）、写进去的新值（年轻对象 ⇒ 记下这个槽，年轻回收从它出发）、
+        // 引用计数登记（老对象里的槽本轮第一次被写）
         if let Ok(old) = done {
-            self.barrier(m, old, new);
+            m.written(self.raw_slot(), RawSlot::header(old), RawSlot::header(new));
         }
         done.map(Self::wrap).map_err(Self::wrap)
     }
+}
 
-    /// 写屏障：被覆盖的旧值（并发标记的初始快照）、写进去的新值（年轻对象 ⇒ 记下这个槽，年轻回收从它出发）、
-    /// 引用计数登记（老对象里的槽本轮第一次被写）。
-    fn barrier(&self, m: &Mutator<'gc>, old: *mut T, new: *mut T) {
-        let header = |p: *mut T| (!p.is_null()).then(|| Header::of(p.cast()));
-        m.written(self.raw_slot(), header(old), header(new));
+/// 放任意「字」的槽（见 [`word_pointer`]）：使用者自己的值编码（比如 NaN-boxing）原样放进来，字里的 GC 指针照样追踪、
+/// 疏散时改地址、计数。与 [`Slot`] 一样大（字 + 上次计入的值），比「值的字 + 一个 [`Slot`]」少一个字。
+///
+/// 写只能来自持有它所在对象的那一个 mutator（同一个槽不会被两个线程同时写）：所以写是一读一写、不是原子交换。
+#[repr(C)]
+pub struct WordSlot<'gc> {
+    word: AtomicU64,
+    counted: AtomicUsize,
+    _brand: PhantomData<Gc<'gc, ()>>,
+}
+
+impl WordSlot<'_> {
+    /// 新槽放 `word`（所在对象还年轻，不计数）。
+    pub fn new(word: u64) -> Self {
+        Self { word: AtomicU64::new(word), counted: AtomicUsize::new(UNCOUNTED), _brand: PhantomData }
+    }
+
+    #[inline]
+    pub fn get(&self) -> u64 {
+        self.word.load(Ordering::Acquire)
+    }
+
+    /// 写进 `word`：旧值或新值里有指针（且不是同一个对象）时过写屏障（见 [`Slot`]）。
+    #[inline]
+    pub fn set(&self, m: &Mutator<'_>, word: u64) {
+        let old = self.word.load(Ordering::Relaxed);
+        self.word.store(word, Ordering::Release);
+        let (o, n) = (RawSlot::header(old), RawSlot::header(word));
+        if o != n {
+            m.written(self.raw_slot(), o, n);
+        }
+    }
+
+    /// 独占时写（还没放进堆，或停顿里）
+    pub fn set_mut(&mut self, word: u64) {
+        *self.word.get_mut() = word;
+    }
+
+    fn raw_slot(&self) -> &RawSlot {
+        // SAFETY: WordSlot 与 RawSlot 都是 repr(C)，字段同类型同顺序
+        unsafe { &*(&raw const *self).cast::<RawSlot>() }
+    }
+}
+
+impl fmt::Debug for WordSlot<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "WordSlot({:#x})", self.get())
+    }
+}
+
+/// [`WordSlot`] 只给本 crate 用的操作。
+pub trait WordSlotInternal {
+    fn raw(&self) -> &RawSlot;
+}
+
+impl WordSlotInternal for WordSlot<'_> {
+    fn raw(&self) -> &RawSlot {
+        self.raw_slot()
     }
 }
 
 /// [`Slot`] 只给本 crate 用的操作（同 [`GcInternal`]）。
 pub trait SlotInternal<'gc> {
     type Data;
-
-    /// 独占时改写（疏散回收改成新地址）。
-    fn store_exclusive(&mut self, v: Option<Gc<'gc, Self::Data>>);
 
     /// 抹掉类型的视图。
     fn raw_slot(&self) -> &RawSlot;
@@ -293,12 +376,8 @@ pub trait SlotInternal<'gc> {
 impl<'gc, T> SlotInternal<'gc> for Slot<'gc, T> {
     type Data = T;
 
-    fn store_exclusive(&mut self, v: Option<Gc<'gc, T>>) {
-        *self.ptr.get_mut() = Self::raw(v);
-    }
-
     fn raw_slot(&self) -> &RawSlot {
-        // SAFETY: Slot 与 RawSlot 都是 repr(C)，前两个字段同类型同顺序（AtomicPtr<T> 与 AtomicPtr<u8> 同布局）
+        // SAFETY: Slot 与 RawSlot 都是 repr(C)，字段同类型同顺序
         unsafe { &*(&raw const *self).cast::<RawSlot>() }
     }
 }
@@ -428,10 +507,7 @@ impl RootTable {
     /// 同 [`RootTable::settle`]，但持有方满足 `inside` 的入口不算根（一起回收的堆里的 Far，由追踪决定死活）。
     pub unsafe fn settle_outside(&self, inside: impl Fn(usize) -> bool) -> Vec<*const Header> {
         // SAFETY: 见 settle
-        let ready = unsafe { &mut *self.ready.get() };
-        let used = self.cursor.swap(0, Ordering::AcqRel).min(ready.len());
-        ready.drain(..used);
-        ready.extend(self.returned.take());
+        unsafe { self.recycle() };
         self.slots
             .iter()
             .filter_map(|s| {
@@ -439,6 +515,38 @@ impl RootTable {
                 (!p.is_null() && !inside(s.holder.load(Ordering::Relaxed))).then_some(p.cast_const())
             })
             .collect()
+    }
+
+    /// 还回来的槽号并进可复用的（领走的去掉）。SAFETY（调用方）：没有 mutator。
+    unsafe fn recycle(&self) {
+        // SAFETY: 见上：ready 只在这时改
+        let ready = unsafe { &mut *self.ready.get() };
+        let used = self.cursor.swap(0, Ordering::AcqRel).min(ready.len());
+        ready.drain(..used);
+        ready.extend(self.returned.take());
+    }
+
+    /// 弱表（[`Weak`] 的槽）在回收标记完、清扫之前：目标没标到 `epoch` 的清空，搬走了的改成新地址；
+    /// 活着的目标计数粘住（`parity` 是当前计数的奇偶）。句柄可能同时在别的线程析构（槽被清空），所以用 CAS。
+    /// SAFETY（调用方）：没有 mutator；标记（含疏散）做完了、还没清扫，槽里的对象内存都还在。
+    pub unsafe fn clear_unreached(&self, epoch: u32, parity: bool) {
+        // SAFETY: 见上
+        unsafe { self.recycle() };
+        for slot in self.slots.iter() {
+            let old = slot.load();
+            if old.is_null() {
+                continue;
+            }
+            let new = Header::survivor(old, epoch);
+            if let Some(new) = new {
+                // SAFETY: 活着的对象
+                unsafe { &*new }.rc_stick(parity);
+            }
+            let new = new.map_or(null_mut(), <*const Header>::cast_mut);
+            if !core::ptr::eq(old, new) {
+                let _ = slot.ptr.compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire);
+            }
+        }
     }
 
     /// 一起回收之后：持有方满足 `inside`、目标没标到的入口——持有它的 Far 已经死了（活的 Far 都被追踪到、把目标标上了）——
@@ -494,6 +602,63 @@ impl<'gc> Mutator<'gc> {
     pub fn set<B: Brand>(&self, root: &Root<B>, gc: Gc<'gc, B::Of<'gc>>) {
         assert!(Arc::ptr_eq(&root.table, self.heap().roots()), "这个 Root 不属于这个堆");
         root.table.slot(root.slot).store(gc.header().cast_mut());
+    }
+}
+
+/// 弱引用句柄：不保活对象；对象被回收后 [`Mutator::upgrade`] 给 None。像 [`Root`] 一样不带 `'gc`，可以存在任何地方
+/// （也可以放进堆对象里）、跨线程传。用 [`Mutator::weak`] 建。
+///
+/// 每次回收（完整、年轻、并发标记收尾、一起回收）在标记之后、清扫之前清空目标没被标到的弱引用，搬走的改成新地址；
+/// 所以在任何一次 mutate 里，弱引用要么是空的，要么指着活对象。
+/// 年轻对象没有强引用就在下一次年轻回收死；老对象（计数被弱引用粘住，见 [`crate::Heap::collect_young`]）要等完整回收。
+pub struct Weak<B: Brand> {
+    /// 堆的弱表
+    table: Arc<RootTable>,
+    slot: usize,
+    _brand: PhantomData<fn() -> B>,
+}
+
+impl<B: Brand> Weak<B> {
+    /// 目标已经被回收了（之后一直是）。不需要进 mutate；为假时目标也可能在下一次回收死。
+    pub fn is_cleared(&self) -> bool {
+        self.table.slot(self.slot).load().is_null()
+    }
+}
+
+impl<B: Brand> Drop for Weak<B> {
+    fn drop(&mut self) {
+        self.table.release(self.slot);
+    }
+}
+
+// SAFETY: 句柄本身不含 Gc，对目标没有强边
+unsafe impl<B: Brand> Trace for Weak<B> {
+    const NO_EDGES: bool = true;
+    fn trace(&self, _: &mut crate::Tracer<'_>) {}
+}
+
+impl<'gc> Mutator<'gc> {
+    /// 给对象建一个弱引用。
+    ///
+    /// 下一次回收起目标的引用计数粘住（不再按计数释放，留给追踪回收）：按计数释放在后台、与 mutator 并发，来不及先清空
+    /// 弱引用。每次停顿处理弱表时粘住，早于那次停顿算出的减量，所以在那之前它还不会被按计数释放。
+    pub fn weak<B: Brand>(&self, gc: Gc<'gc, B::Of<'gc>>) -> Weak<B> {
+        let table = self.heap().weaks().clone();
+        let slot = table.claim(gc.header(), NO_HOLDER);
+        Weak { table, slot, _brand: PhantomData }
+    }
+
+    /// 弱引用指着的对象；已经被回收了就是 None。并发标记期间取到的对象当作被引用了（标上），本轮不会死。
+    pub fn upgrade<B: Brand>(&self, weak: &Weak<B>) -> Option<Gc<'gc, B::Of<'gc>>> {
+        assert!(Arc::ptr_eq(&weak.table, self.heap().weaks()), "这个 Weak 不属于这个堆");
+        let header = weak.table.slot(weak.slot).load();
+        if header.is_null() {
+            return None;
+        }
+        // 读屏障：初始快照只保证快照时强可达的对象被标上，从弱引用取出、再存进黑对象的会漏
+        self.reached(header);
+        // SAFETY: 弱表里非空的槽指着活对象（每次回收清扫前清空了死的），类型是建它时的 B
+        Some(unsafe { Gc::from_data(Header::data(header).cast()) })
     }
 }
 
