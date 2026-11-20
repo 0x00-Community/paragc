@@ -53,8 +53,6 @@ pub const GRANULE: usize = 8;
 pub const GRANULES: usize = BLOCK / GRANULE;
 /// 起点位图每个字的位数
 pub const BITS: usize = u64::BITS as usize;
-/// 起点位图一个字管的字节数（两行）
-pub const START_SPAN: usize = BITS * GRANULE;
 /// 大对象阈值（含头的字节数）：超过就单独分配、不进块
 pub const LARGE: usize = BLOCK / 2;
 /// 不小于它的大对象（Linux）单独 mmap：释放时 munmap 立刻还给系统（全局分配器释放的大块常常留着不还）
@@ -83,6 +81,11 @@ pub const FRAG_NUM: usize = 3;
 pub const FRAG_DEN: usize = 2;
 /// 回收后至少留着复用的全空块数
 pub const MIN_SPARE_BLOCKS: usize = 4;
+/// 上一次年轻回收存活的超过它领用的 NUM / DEN，这一次就不搬存活的年轻对象（原地晋升）
+pub const YOUNG_COPY_NUM: usize = 3;
+pub const YOUNG_COPY_DEN: usize = 5;
+/// [`Pages`] 的热池按最近几轮的领用定上限
+pub const WARM_CYCLES: usize = 4;
 /// 溢出分配领块时最多看几个可用块（找有放得下中对象的空洞的），都不行就开新块
 pub const OVERFLOW_TRIES: usize = 8;
 
@@ -532,12 +535,10 @@ impl Block {
         self.meta().starts[g / BITS].fetch_or(1 << (g % BITS), Ordering::Relaxed);
     }
 
-    /// 同 [`Block::set_start`]，但不用加锁的读改写：`p` 所在的起点位图字管的 [`START_SPAN`] 字节整个是调用方独占的空洞
-    /// （别的线程分配不进来；引用计数释放只清老对象的位，老对象的行不在空洞里），没有别人同时改这个字。
-    pub fn set_start_owned(self, p: *const u8) {
+    /// `p` 处对象的起点位：所在的字（块活着就一直有效）与位。
+    pub fn start_bit(self, p: *const u8) -> (*const AtomicU64, u64) {
         let g = self.offset(p) / GRANULE;
-        let word = &self.meta().starts[g / BITS];
-        word.store(word.load(Ordering::Relaxed) | 1 << (g % BITS), Ordering::Relaxed);
+        (&raw const self.meta().starts[g / BITS], 1 << (g % BITS))
     }
 
     /// 把凑满整页的空行（行标记早于 `epoch`）还给系统（`madvise(MADV_DONTNEED)`；第 0 页有元数据，不碰）。
@@ -576,6 +577,31 @@ impl Block {
         false
     }
 
+    /// 预取块里每个对象头所在的缓存行（清扫逐个读头，块一般不在缓存里：不预取每个对象都是一次未命中，
+    /// 而且下一个头的地址要等位图里的下一位算出来，乱序执行也叠不起来）。
+    #[cfg_attr(not(target_arch = "x86_64"), expect(clippy::unused_self, reason = "只在 x86-64 上预取"))]
+    fn prefetch_headers(self) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            /// 缓存行
+            const LINE_BYTES: usize = 64;
+            let mut last = usize::MAX;
+            for (w, word) in self.meta().starts.iter().enumerate() {
+                let mut bits = word.load(Ordering::Relaxed);
+                while bits != 0 {
+                    let bit = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let at = (w * BITS + bit) * GRANULE / LINE_BYTES;
+                    if at != last {
+                        last = at;
+                        // SAFETY: 预取不访问内存，地址在块里
+                        unsafe { core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(self.base().wrapping_add(at * LINE_BYTES).cast()) };
+                    }
+                }
+            }
+        }
+    }
+
     /// 从第 `from` 行起的第一个空洞（一段连续空行），返回 `[起, 止)` 行号。
     /// 空行 = 行标记早于上次完成的纪元 `epoch`：并发标记期间标记方会把活行写成更新的纪元，那些也不是空行。
     pub fn hole(self, from: usize, epoch: u32) -> Option<(usize, usize)> {
@@ -591,6 +617,7 @@ impl Block {
     /// SAFETY（调用方）：标记已经做完，没有 mutator 在用这个块；块里对象的头是 `K` 认识的那种。
     pub unsafe fn sweep<K: Finalize>(self, epoch: u32, mut deferred: Option<&mut Vec<usize>>) -> (State, usize) {
         let mut live = 0;
+        self.prefetch_headers();
         for (w, word) in self.meta().starts.iter().enumerate() {
             let mut bits = word.load(Ordering::Relaxed);
             let mut dead = 0u64;
@@ -637,14 +664,24 @@ const CHUNK: usize = 2 * 1024 * 1024;
 
 /// 私有堆的块从这里领、还回这里（每个堆一份）。
 ///
-/// Linux：自己 mmap 一段段（[`CHUNK`]），切成按 [`BLOCK`] 对齐的块放进空闲池；还回来的块先 `madvise(MADV_DONTNEED)`
-/// 把物理内存还给系统，地址进池复用（不经 glibc：对齐分配有额外开销，释放的内存它也不还给系统）。
+/// Linux：自己 mmap 一段段（[`CHUNK`]），切成按 [`BLOCK`] 对齐的块放进空闲池（不经 glibc：对齐分配有额外开销，释放的内存它也
+/// 不还给系统）。还回来的块先进热池，内存留着（下一轮多半又要这么多块，`madvise` 掉再缺页拿回来是白干）；热池满了（上限见
+/// [`Pages::set_warm_cap`]）才 `madvise(MADV_DONTNEED)` 把物理内存还给系统，地址进冷池复用。领块先领热的。
 /// 映射的段在堆析构时一起解除。其他平台与 Miri 下走全局分配器。
 #[derive(Default)]
 pub struct Pages {
-    /// 空闲的块（地址）
+    /// 空闲的块（地址），没有物理内存（新切的或 `madvise` 过的）
     #[cfg(all(target_os = "linux", not(miri)))]
     free: Injector<usize>,
+    /// 空闲的块（地址），内存还在
+    #[cfg(all(target_os = "linux", not(miri)))]
+    warm: Injector<usize>,
+    /// 热池里有几块（可能短暂多算：先加后放）
+    #[cfg(all(target_os = "linux", not(miri)))]
+    warm_len: core::sync::atomic::AtomicUsize,
+    /// 热池最多留几块
+    #[cfg(all(target_os = "linux", not(miri)))]
+    warm_cap: core::sync::atomic::AtomicUsize,
     /// 映射过的段（起点地址），析构时解除
     #[cfg(all(target_os = "linux", not(miri)))]
     chunks: Injector<usize>,
@@ -652,14 +689,45 @@ pub struct Pages {
 
 impl Pages {
     #[cfg(all(target_os = "linux", not(miri)))]
-    fn take(&self) -> NonNull<Meta> {
+    fn steal(pool: &Injector<usize>) -> Option<NonNull<Meta>> {
         loop {
-            match self.free.steal() {
+            match pool.steal() {
                 // SAFETY: 池里只有本对象切出来、非零的块地址
-                Steal::Success(addr) => return unsafe { NonNull::new_unchecked(core::ptr::with_exposed_provenance_mut(addr)) },
+                Steal::Success(addr) => {
+                    return Some(unsafe { NonNull::new_unchecked(core::ptr::with_exposed_provenance_mut(addr)) });
+                }
                 Steal::Retry => {}
-                Steal::Empty => break,
+                Steal::Empty => return None,
             }
+        }
+    }
+
+    /// 热池最多留 `cap` 块；多出来的现在就还给系统。`usize::MAX`：一块都不还（马上要整段解除时）。
+    #[cfg(all(target_os = "linux", not(miri)))]
+    pub fn set_warm_cap(&self, cap: usize) {
+        self.warm_cap.store(cap, Ordering::Relaxed);
+        while self.warm_len.load(Ordering::Relaxed) > cap {
+            let Some(p) = Self::steal(&self.warm) else {
+                break;
+            };
+            self.warm_len.fetch_sub(1, Ordering::Relaxed);
+            // SAFETY: 热池里的块没人在用
+            unsafe { self.discard(p) };
+        }
+    }
+
+    #[cfg(any(not(target_os = "linux"), miri))]
+    #[expect(clippy::unused_self, reason = "与 Linux 版同签名")]
+    pub fn set_warm_cap(&self, _cap: usize) {}
+
+    #[cfg(all(target_os = "linux", not(miri)))]
+    fn take(&self) -> NonNull<Meta> {
+        if let Some(p) = Self::steal(&self.warm) {
+            self.warm_len.fetch_sub(1, Ordering::Relaxed);
+            return p;
+        }
+        if let Some(p) = Self::steal(&self.free) {
+            return p;
         }
         let base = self.map_chunk();
         // 第一块自己用，其余进池
@@ -699,6 +767,18 @@ impl Pages {
     /// SAFETY（调用方）：`p` 来自本对象的 [`Pages::take`]，之后不再使用。
     #[cfg(all(target_os = "linux", not(miri)))]
     unsafe fn give(&self, p: NonNull<Meta>) {
+        if self.warm_len.fetch_add(1, Ordering::Relaxed) < self.warm_cap.load(Ordering::Relaxed) {
+            self.warm.push(p.as_ptr().expose_provenance());
+            return;
+        }
+        self.warm_len.fetch_sub(1, Ordering::Relaxed);
+        // SAFETY: 见上
+        unsafe { self.discard(p) };
+    }
+
+    /// 物理内存还给系统，块进冷池。SAFETY（调用方）：同 [`Pages::give`]。
+    #[cfg(all(target_os = "linux", not(miri)))]
+    unsafe fn discard(&self, p: NonNull<Meta>) {
         // SAFETY: 块在本对象映射的段里；DONTNEED 只丢内容，地址仍可用
         unsafe { libc::madvise(p.as_ptr().cast(), BLOCK, libc::MADV_DONTNEED) };
         self.free.push(p.as_ptr().expose_provenance());

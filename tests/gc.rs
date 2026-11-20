@@ -1398,3 +1398,42 @@ fn shrink_keeps_objects_and_reuses_lines() {
     heap.shrink();
     assert!(check(&heap));
 }
+
+fn list_addrs(heap: &Heap, root: &Root<NodeB>) -> Vec<usize> {
+    heap.mutate(|m| {
+        let mut out = Vec::new();
+        let mut cur = Some(m.get(root));
+        while let Some(n) = cur {
+            out.push(n.as_ptr().addr());
+            cur = n.next;
+        }
+        out
+    })
+}
+
+/// 上一次年轻回收几乎全活下来时，这一次不搬年轻对象（原地晋升）；存活率低时照旧搬。
+#[test]
+fn young_collection_promotes_in_place_when_most_survive() {
+    let mut heap = Heap::new(THREADS);
+    let first = build_list(&heap, LIST_LEN);
+    heap.collect_young();
+    // 全活：下一次不搬
+    let second = build_list(&heap, LIST_LEN);
+    let before = list_addrs(&heap, &second);
+    heap.collect_young();
+    assert_eq!(list_addrs(&heap, &second), before, "上一轮全活下来，这一轮还在搬");
+    assert_eq!(sum_list(&heap, &first), LIST_LEN * (LIST_LEN - 1) / 2);
+    assert_eq!(sum_list(&heap, &second), LIST_LEN * (LIST_LEN - 1) / 2);
+    // 这一轮几乎全是垃圾：存活率低，再下一轮照旧搬
+    heap.mutate(|m| {
+        for value in 0..LIST_LEN * 8 {
+            m.alloc(Node { value, next: None });
+        }
+    });
+    heap.collect_young();
+    let third = build_list(&heap, LIST_LEN / 8);
+    let before = list_addrs(&heap, &third);
+    heap.collect_young();
+    assert_ne!(list_addrs(&heap, &third), before, "上一轮几乎全是垃圾，这一轮却没搬");
+    assert_eq!(sum_list(&heap, &third), (LIST_LEN / 8) * (LIST_LEN / 8 - 1) / 2);
+}
