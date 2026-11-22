@@ -1,11 +1,11 @@
-//! 公开堆（共享内存上的堆）。逐条跑：`cargo test --test public -- --exact <名字>`
+//! 公开堆（共享内存上的堆）。逐条跑：`cargo test --test cross_heap -- --exact <名字>`
 #![cfg(target_os = "linux")]
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use paragc::{HeapDead, Heap, Public, PublicGc, PublicHeap, PublicRef, PublicSlot, PublicSpace, CrossHeapWeak, Root, SIGNATURE_BYTES, Shared, Signature, Trace, brand, public_brand};
+use paragc::{HeapDead, Heap, CrossHeapRoot, CrossHeapGc, CrossHeap, CrossHeapRef, CrossHeapSlot, CrossHeapSpace, CrossHeapWeak, Root, SIGNATURE_BYTES, Shared, Signature, Trace, brand, cross_heap_brand};
 
 /// 每个堆的回收线程数（Miri 下减少）
 const THREADS: NonZeroUsize = NonZeroUsize::new(if cfg!(miri) { 2 } else { 4 }).unwrap();
@@ -16,16 +16,16 @@ const HEADER: usize = 16;
 #[derive(Shared)]
 struct Node<'p> {
     value: u64,
-    next: PublicSlot<'p, Node<'p>>,
+    next: CrossHeapSlot<'p, Node<'p>>,
 }
 
-public_brand!(NodeB = for<'p> Node<'p>);
+cross_heap_brand!(NodeB = for<'p> Node<'p>);
 
 /// 一个 Node 占的字节数（头 + 数据，按 8 字节）
 const NODE: usize = (HEADER + size_of::<Node<'static>>()).next_multiple_of(8);
 
 /// 建一条 `len` 个节点的链（值 0..len），返回链头的句柄。
-fn list(heap: &PublicHeap, len: u64) -> Public<NodeB> {
+fn list(heap: &CrossHeap, len: u64) -> CrossHeapRoot<NodeB> {
     heap.mutate(|m| {
         let mut top = None;
         for value in 0..len {
@@ -35,7 +35,7 @@ fn list(heap: &PublicHeap, len: u64) -> Public<NodeB> {
     })
 }
 
-fn sum(heap: &PublicHeap, root: &Public<NodeB>) -> u64 {
+fn sum(heap: &CrossHeap, root: &CrossHeapRoot<NodeB>) -> u64 {
     heap.mutate(|m| {
         let (mut sum, mut cur) = (0, Some(root.get(m)));
         while let Some(n) = cur {
@@ -56,9 +56,9 @@ fn shm_path(name: &str) -> std::path::PathBuf {
 }
 
 #[test]
-fn public_list_survives_and_garbage_is_reclaimed() {
+fn cross_heap_list_survives_and_garbage_is_reclaimed() {
     const LEN: u64 = if cfg!(miri) { 300 } else { 20_000 };
-    let space = PublicSpace::reserve().unwrap();
+    let space = CrossHeapSpace::reserve().unwrap();
     let heap = space.create_anonymous(THREADS).unwrap();
     let kept = list(&heap, LEN);
     drop(list(&heap, LEN));
@@ -79,25 +79,25 @@ fn public_list_survives_and_garbage_is_reclaimed() {
 #[derive(Shared)]
 struct Inner<'p> {
     tag: u32,
-    slot: PublicSlot<'p, Node<'p>>,
+    slot: CrossHeapSlot<'p, Node<'p>>,
 }
 
 #[repr(C)]
 #[derive(Shared)]
 struct Holder<'p> {
-    many: [PublicSlot<'p, Node<'p>>; 3],
+    many: [CrossHeapSlot<'p, Node<'p>>; 3],
     bytes: [u8; 5],
     inner: Inner<'p>,
 }
 
-public_brand!(HolderB = for<'p> Holder<'p>);
+cross_heap_brand!(HolderB = for<'p> Holder<'p>);
 
 #[test]
 fn pointer_map_covers_nested_fields_and_arrays() {
-    let space = PublicSpace::reserve().unwrap();
+    let space = CrossHeapSpace::reserve().unwrap();
     let heap = space.create_anonymous(THREADS).unwrap();
-    let holder: Public<HolderB> = heap.mutate(|m| {
-        let leaf = |value| m.alloc(Node { value, next: PublicSlot::default() });
+    let holder: CrossHeapRoot<HolderB> = heap.mutate(|m| {
+        let leaf = |value| m.alloc(Node { value, next: CrossHeapSlot::default() });
         let h = m.alloc(Holder { many: [leaf(1).into(), leaf(2).into(), leaf(3).into()], bytes: [7; 5], inner: Inner { tag: 9, slot: leaf(4).into() } });
         // 一个没挂上的：会被回收
         leaf(100);
@@ -124,17 +124,17 @@ fn pointer_map_covers_nested_fields_and_arrays() {
 #[derive(Shared)]
 struct Big<'p> {
     data: [u64; 2048],
-    next: PublicSlot<'p, Big<'p>>,
+    next: CrossHeapSlot<'p, Big<'p>>,
 }
 
-public_brand!(BigB = for<'p> Big<'p>);
+cross_heap_brand!(BigB = for<'p> Big<'p>);
 
 #[test]
 fn large_public_objects() {
     const COUNT: u64 = if cfg!(miri) { 3 } else { 40 };
-    let space = PublicSpace::reserve().unwrap();
+    let space = CrossHeapSpace::reserve().unwrap();
     let heap = space.create_anonymous(THREADS).unwrap();
-    let chain = |seed: u64| -> Public<BigB> {
+    let chain = |seed: u64| -> CrossHeapRoot<BigB> {
         heap.mutate(|m| {
             let mut top = None;
             for i in 0..COUNT {
@@ -167,7 +167,7 @@ fn large_public_objects() {
 #[cfg_attr(miri, ignore = "Miri 跑不了文件映射")]
 fn file_starts_empty_and_grows() {
     let path = shm_path("grow");
-    let space = PublicSpace::reserve().unwrap();
+    let space = CrossHeapSpace::reserve().unwrap();
     let heap = space.create(&path, THREADS).unwrap();
     let meta = std::fs::metadata(&path).unwrap();
     // 建堆只写了超级块那一页
@@ -190,13 +190,13 @@ fn file_starts_empty_and_grows() {
 #[repr(C)]
 #[derive(Shared)]
 struct Anchor<'p> {
-    heads: [PublicSlot<'p, Node<'p>>; 8],
+    heads: [CrossHeapSlot<'p, Node<'p>>; 8],
 }
 
-public_brand!(AnchorB = for<'p> Anchor<'p>);
+cross_heap_brand!(AnchorB = for<'p> Anchor<'p>);
 
 /// 第 `t` 条链：在头上压 `push` 个节点（值 = 当前长度），再从头上弹掉 `pop` 个；返回新长度。
-fn churn(heap: &PublicHeap, anchor: &Public<AnchorB>, t: usize, len: u64, push: u64, pop: u64) -> u64 {
+fn churn(heap: &CrossHeap, anchor: &CrossHeapRoot<AnchorB>, t: usize, len: u64, push: u64, pop: u64) -> u64 {
     heap.mutate(|m| {
         let top = &anchor.get(m).heads[t];
         for v in len..len + push {
@@ -212,7 +212,7 @@ fn churn(heap: &PublicHeap, anchor: &Public<AnchorB>, t: usize, len: u64, push: 
 }
 
 /// 第 `t` 条链从头到尾的值必须是 len-1, len-2, …, 0。
-fn check(heap: &PublicHeap, anchor: &Public<AnchorB>, t: usize, len: u64) {
+fn check(heap: &CrossHeap, anchor: &CrossHeapRoot<AnchorB>, t: usize, len: u64) {
     heap.mutate(|m| {
         let (mut cur, mut expect) = (anchor.get(m).heads[t].get(m), len);
         while let Some(n) = cur {
@@ -240,12 +240,12 @@ fn two_mappings_of_one_heap() {
     const ROUNDS: u64 = 30;
     let path = shm_path("two");
     // 同一进程里两个地址区：同一个堆映射在两个不同的基址；指针存的是偏移，两边看到同一个对象图
-    let (sa, sb) = (PublicSpace::reserve().unwrap(), PublicSpace::reserve().unwrap());
+    let (sa, sb) = (CrossHeapSpace::reserve().unwrap(), CrossHeapSpace::reserve().unwrap());
     let a = sa.create(&path, THREADS).unwrap();
     let b = sb.open(&path, THREADS).unwrap();
     assert_eq!(a.id(), b.id());
     let root = list(&a, LEN);
-    let rb: Public<NodeB> = b.mutate(|m| m.find(root.index())).expect("凭入口号找到");
+    let rb: CrossHeapRoot<NodeB> = b.mutate(|m| m.find(root.index())).expect("凭入口号找到");
     assert!(b.mutate(|m| m.find::<HolderB>(root.index())).is_none(), "类型对不上时找不到");
     let pa = a.mutate(|m| root.get(m).as_ptr().addr());
     let pb = b.mutate(|m| rb.get(m).as_ptr().addr());
@@ -253,7 +253,7 @@ fn two_mappings_of_one_heap() {
     assert_eq!(sum(&b, &rb), triangle(LEN));
     // 两边各 4 个线程改各自的链，另一个线程轮流从两边回收：握手字在超级块里，所以跨映射也互相排斥
     let anchor = a.mutate(|m| m.root::<AnchorB>(m.alloc(Anchor { heads: Default::default() })));
-    let anchor_b: Public<AnchorB> = b.mutate(|m| m.find(anchor.index())).expect("凭入口号找到");
+    let anchor_b: CrossHeapRoot<AnchorB> = b.mutate(|m| m.find(anchor.index())).expect("凭入口号找到");
     let done = AtomicUsize::new(0);
     std::thread::scope(|s| {
         for t in 0..8 {
@@ -286,7 +286,7 @@ fn two_mappings_of_one_heap() {
 /// 私有堆的对象里放一个指向公开堆的句柄
 #[derive(Trace)]
 struct Card {
-    public: Public<NodeB>,
+    public: CrossHeapRoot<NodeB>,
     _drops: Counted,
 }
 
@@ -309,7 +309,7 @@ unsafe impl Trace for Counted {
 #[test]
 fn private_heap_holds_public_handles() {
     const LEN: u64 = if cfg!(miri) { 50 } else { 5_000 };
-    let space = PublicSpace::reserve().unwrap();
+    let space = CrossHeapSpace::reserve().unwrap();
     let public = space.create_anonymous(THREADS).unwrap();
     let mut private = Heap::new(THREADS);
     let drops = Arc::new(AtomicUsize::new(0));
@@ -340,7 +340,7 @@ fn private_heap_holds_public_handles() {
 fn eight_threads_churn_public_heap() {
     const ROUNDS: u64 = if cfg!(miri) { 2 } else { 40 };
     const PUSH: u64 = if cfg!(miri) { 20 } else { 500 };
-    let space = PublicSpace::reserve().unwrap();
+    let space = CrossHeapSpace::reserve().unwrap();
     let heap = space.create_anonymous(THREADS).unwrap();
     let anchor = heap.mutate(|m| m.root::<AnchorB>(m.alloc(Anchor { heads: Default::default() })));
     let lens: Vec<AtomicU64> = (0..8).map(|_| AtomicU64::new(0)).collect();
@@ -369,7 +369,7 @@ fn eight_threads_churn_public_heap() {
 fn collect_fresh_file_heap_without_roots() {
     // 新文件、一个入口都没有就回收（各段还一项都没用，不能去延长 0 长度），再只分配不挂根地回收
     let path = shm_path("fresh");
-    let space = PublicSpace::reserve().unwrap();
+    let space = CrossHeapSpace::reserve().unwrap();
     let heap = space.create(&path, THREADS).unwrap();
     heap.collect();
     drop(list(&heap, 1_000));
@@ -383,16 +383,16 @@ fn collect_fresh_file_heap_without_roots() {
 #[derive(Shared)]
 struct Link<'p> {
     heap: u64,
-    next: PublicRef<'p, LinkB>,
+    next: CrossHeapRef<'p, LinkB>,
 }
 
-public_brand!(LinkB = for<'p> Link<'p>);
+cross_heap_brand!(LinkB = for<'p> Link<'p>);
 
 const LINK: usize = (HEADER + size_of::<Link<'static>>()).next_multiple_of(8);
 
 /// 在 `heaps` 里每个堆建一个 Link，第 i 个指向第 i+1 个（`ring` 时最后一个指回第一个）。返回每个堆那个 Link 的句柄。
-fn links(heaps: &[PublicHeap], ring: bool) -> Vec<Public<LinkB>> {
-    let handles: Vec<Public<LinkB>> = heaps.iter().enumerate().map(|(i, h)| h.mutate(|m| m.root(m.alloc(Link { heap: i as u64, next: PublicRef::default() })))).collect();
+fn links(heaps: &[CrossHeap], ring: bool) -> Vec<CrossHeapRoot<LinkB>> {
+    let handles: Vec<CrossHeapRoot<LinkB>> = heaps.iter().enumerate().map(|(i, h)| h.mutate(|m| m.root(m.alloc(Link { heap: i as u64, next: CrossHeapRef::default() })))).collect();
     let n = if ring { heaps.len() } else { heaps.len() - 1 };
     for i in 0..n {
         let j = (i + 1) % heaps.len();
@@ -402,43 +402,43 @@ fn links(heaps: &[PublicHeap], ring: bool) -> Vec<Public<LinkB>> {
 }
 
 /// 第 i 个 Link 的 next 就是第 i+1 个（同时在两个堆的 mutate 里读）。
-fn linked(heaps: &[PublicHeap], handles: &[Public<LinkB>], i: usize) -> bool {
+fn linked(heaps: &[CrossHeap], handles: &[CrossHeapRoot<LinkB>], i: usize) -> bool {
     let j = (i + 1) % heaps.len();
-    heaps[i].mutate(|mi| heaps[j].mutate(|mj| handles[i].get(mi).next.get(mj).is_some_and(|n| PublicGc::ptr_eq(n, handles[j].get(mj)) && n.heap == j as u64)))
+    heaps[i].mutate(|mi| heaps[j].mutate(|mj| handles[i].get(mi).next.get(mj).is_some_and(|n| CrossHeapGc::ptr_eq(n, handles[j].get(mj)) && n.heap == j as u64)))
 }
 
 impl Link<'_> {
     /// 一个还没指向谁的 Link。
     fn alone(heap: u64) -> Self {
-        Self { heap, next: PublicRef::default() }
+        Self { heap, next: CrossHeapRef::default() }
     }
 }
 
-fn anonymous_heaps(space: &PublicSpace, n: usize) -> Vec<PublicHeap> {
+fn anonymous_heaps(space: &CrossHeapSpace, n: usize) -> Vec<CrossHeap> {
     (0..n).map(|_| space.create_anonymous(THREADS).unwrap()).collect()
 }
 
-fn live(heaps: &[PublicHeap]) -> Vec<usize> {
+fn live(heaps: &[CrossHeap]) -> Vec<usize> {
     heaps.iter().map(|h| h.stats().live).collect()
 }
 
-fn collect_each(heaps: &[PublicHeap]) {
+fn collect_each(heaps: &[CrossHeap]) {
     for h in heaps {
         h.collect();
     }
 }
 
-fn collect_all(heaps: &[PublicHeap]) {
-    let group: Vec<&PublicHeap> = heaps.iter().collect();
-    PublicHeap::collect_group(&group);
+fn collect_all(heaps: &[CrossHeap]) {
+    let group: Vec<&CrossHeap> = heaps.iter().collect();
+    CrossHeap::collect_group(&group);
 }
 
 #[test]
-fn public_ref_keeps_target_until_group_collection() {
-    let space = PublicSpace::reserve().unwrap();
+fn cross_heap_ref_keeps_target_until_group_collection() {
+    let space = CrossHeapSpace::reserve().unwrap();
     let heaps = anonymous_heaps(&space, 2);
     let mut handles = links(&heaps, false);
-    // B 里那个 Link 的句柄扔掉：只剩 A 的对象经 PublicRef 指着它
+    // B 里那个 Link 的句柄扔掉：只剩 A 的对象经 CrossHeapRef 指着它
     drop(handles.pop());
     collect_each(&heaps);
     assert_eq!(live(&heaps), [LINK, LINK], "B 单独回收时，A 持有的登记是根");
@@ -454,7 +454,7 @@ fn public_ref_keeps_target_until_group_collection() {
 }
 
 /// 从第一个堆的 Link 出发绕三个堆一圈：0 → 1 → 2 → 回到 0 的同一个对象（三层 mutate 一起读）。
-fn ring_intact(heaps: &[PublicHeap], first: &Public<LinkB>) -> bool {
+fn ring_intact(heaps: &[CrossHeap], first: &CrossHeapRoot<LinkB>) -> bool {
     heaps[0].mutate(|m0| {
         heaps[1].mutate(|m1| {
             heaps[2].mutate(|m2| {
@@ -462,7 +462,7 @@ fn ring_intact(heaps: &[PublicHeap], first: &Public<LinkB>) -> bool {
                 let Some(b) = a.next.get(m1) else { return false };
                 let Some(c) = b.next.get(m2) else { return false };
                 let Some(back) = c.next.get(m0) else { return false };
-                (a.heap, b.heap, c.heap) == (0, 1, 2) && PublicGc::ptr_eq(back, a)
+                (a.heap, b.heap, c.heap) == (0, 1, 2) && CrossHeapGc::ptr_eq(back, a)
             })
         })
     })
@@ -470,7 +470,7 @@ fn ring_intact(heaps: &[PublicHeap], first: &Public<LinkB>) -> bool {
 
 #[test]
 fn cycles_across_public_heaps_need_group_collection() {
-    let space = PublicSpace::reserve().unwrap();
+    let space = CrossHeapSpace::reserve().unwrap();
     let heaps = anonymous_heaps(&space, 3);
     // 留下的环只在第一个堆挂句柄：后两个堆里的对象只靠跨堆引用（登记）活着
     let first = links(&heaps, true).swap_remove(0);
@@ -480,8 +480,8 @@ fn cycles_across_public_heaps_need_group_collection() {
     assert_eq!(live(&heaps), [2 * LINK; 3], "跨三个堆的环，各自回收收不掉");
     // 只拿两个堆一起回收：环经过组外的第三个堆，它持有的登记是根
     {
-        let two: Vec<&PublicHeap> = heaps.iter().take(2).collect();
-        PublicHeap::collect_group(&two);
+        let two: Vec<&CrossHeap> = heaps.iter().take(2).collect();
+        CrossHeap::collect_group(&two);
     }
     assert_eq!(live(&heaps), [2 * LINK; 3]);
     collect_all(&heaps);
@@ -499,12 +499,12 @@ fn cycles_across_public_heaps_need_group_collection() {
 #[test]
 fn group_collection_returns_stale_registrations() {
     const SETS: u64 = if cfg!(miri) { 20 } else { 2_000 };
-    let space = PublicSpace::reserve().unwrap();
+    let space = CrossHeapSpace::reserve().unwrap();
     let heaps = anonymous_heaps(&space, 2);
-    let holder = heaps[0].mutate(|m| m.root::<LinkB>(m.alloc(Link { heap: 0, next: PublicRef::default() })));
+    let holder = heaps[0].mutate(|m| m.root::<LinkB>(m.alloc(Link { heap: 0, next: CrossHeapRef::default() })));
     // 反复改指向 B 里的新对象：每次写入都在 B 登记一项，旧的登记要等一起回收才还
     for i in 0..SETS {
-        heaps[0].mutate(|ma| heaps[1].mutate(|mb| holder.get(ma).next.set(ma, mb, Some(mb.alloc(Link { heap: i, next: PublicRef::default() })))));
+        heaps[0].mutate(|ma| heaps[1].mutate(|mb| holder.get(ma).next.set(ma, mb, Some(mb.alloc(Link { heap: i, next: CrossHeapRef::default() })))));
     }
     collect_each(&heaps);
     assert_eq!(live(&heaps), [LINK, LINK * usize::try_from(SETS).unwrap()], "单独回收时旧登记还当根");
@@ -520,7 +520,7 @@ fn group_collection_returns_stale_registrations() {
 #[test]
 fn nested_mutates_with_collectors_do_not_deadlock() {
     const ROUNDS: usize = if cfg!(miri) { 3 } else { 300 };
-    let space = PublicSpace::reserve().unwrap();
+    let space = CrossHeapSpace::reserve().unwrap();
     let heaps = anonymous_heaps(&space, 2);
     let handles = links(&heaps, true);
     std::thread::scope(|s| {
@@ -531,7 +531,7 @@ fn nested_mutates_with_collectors_do_not_deadlock() {
                 for _ in 0..ROUNDS {
                     heaps[outer].mutate(|mo| {
                         heaps[inner].mutate(|mi| {
-                            let fresh = mi.alloc(Link { heap: inner as u64, next: PublicRef::default() });
+                            let fresh = mi.alloc(Link { heap: inner as u64, next: CrossHeapRef::default() });
                             handles[outer].get(mo).next.set(mo, mi, Some(fresh));
                             handles[outer].get(mo).next.set(mo, mi, Some(handles[inner].get(mi)));
                         });
@@ -583,7 +583,7 @@ impl Drop for Dir {
 #[cfg_attr(miri, ignore = "Miri 跑不了文件映射")]
 fn references_to_a_dead_heap_do_not_crash() {
     let dir = Dir::new("dead");
-    let space = PublicSpace::reserve().unwrap();
+    let space = CrossHeapSpace::reserve().unwrap();
     let x = space.create(dir.file("x"), THREADS).unwrap();
     let y = space.create(dir.file("y"), THREADS).unwrap();
     // y_link（y 里、挂句柄）→ x_link（x 里）→ y_only（y 里、只被 x_link 指着：登记的持有方是 x）
@@ -595,9 +595,9 @@ fn references_to_a_dead_heap_do_not_crash() {
     }));
     let x_number = x.id();
     // 同一个进程里另一个地址区也映射着 x
-    let other = PublicSpace::reserve().unwrap();
+    let other = CrossHeapSpace::reserve().unwrap();
     let x2 = other.open(dir.file("x"), THREADS).unwrap();
-    let held: Public<LinkB> = x2.mutate(|m| m.find(x_link.index())).expect("凭入口号找到");
+    let held: CrossHeapRoot<LinkB> = x2.mutate(|m| m.find(x_link.index())).expect("凭入口号找到");
     // x 的主人（建堆的句柄与它建的句柄）放手：x 跟着死，文件删掉
     drop(x_link);
     drop(x);
@@ -611,11 +611,11 @@ fn references_to_a_dead_heap_do_not_crash() {
     // x 的号被新堆 z 用上：y_link 指向 x 的引用身份对不上，读出来是 None
     let z = space.create(dir.file("z"), THREADS).unwrap();
     assert_eq!(z.id(), x_number, "死堆的号收回重用");
-    let z_obj: Public<LinkB> = z.mutate(|m| m.root(m.alloc(Link::alone(7))));
+    let z_obj: CrossHeapRoot<LinkB> = z.mutate(|m| m.root(m.alloc(Link::alone(7))));
     let (points, read) = y.mutate(|my| z.mutate(|mz| (y_link.get(my).next.points_into(&z), y_link.get(my).next.get(mz).is_some())));
     assert!(!points && !read, "指向死堆的引用不能读成新堆里的对象");
     // 一起回收不跟这条旧引用（否则会把 z 里同一偏移处的东西当对象去标）
-    PublicHeap::collect_group(&[&y, &z]);
+    CrossHeap::collect_group(&[&y, &z]);
     assert_eq!(z.stats().live, LINK, "z 里只有自己挂着的对象");
     // y 回收：x 生前登记在 y 里的引用（持有方 x 已死）还掉，只被 x 指着的 y_only 收掉
     y.collect();
@@ -630,11 +630,11 @@ struct Watcher {
     target: CrossHeapWeak<NodeB>,
 }
 
-public_brand!(WatcherB = for<'p> Watcher);
+cross_heap_brand!(WatcherB = for<'p> Watcher);
 
 #[test]
 fn weak_reference_across_heaps_does_not_keep_target() {
-    let space = PublicSpace::reserve().unwrap();
+    let space = CrossHeapSpace::reserve().unwrap();
     let (a, b) = (space.create_anonymous(THREADS).unwrap(), space.create_anonymous(THREADS).unwrap());
     let target = b.mutate(|m| m.root::<NodeB>(m.alloc(Node { value: 7, next: None.into() })));
     let watcher = a.mutate_with(&b, |ma, mb| ma.root::<WatcherB>(ma.alloc(Watcher { target: target.get(mb).into() })));
@@ -662,7 +662,7 @@ const NEARBY: usize = 4096 * 8;
 #[cfg_attr(miri, ignore = "偏移位数按 64 位地址区写的")]
 fn signature_round_trip_and_forgeries() {
     const LEN: u64 = 2000;
-    let space = PublicSpace::reserve().unwrap();
+    let space = CrossHeapSpace::reserve().unwrap();
     let heap = space.create_anonymous(THREADS).unwrap();
     let root = list(&heap, LEN);
     let sig = heap.mutate(|m| m.sign(root.get(m)));
@@ -704,7 +704,7 @@ fn signature_round_trip_and_forgeries() {
 
 #[test]
 fn mailbox_delivers_in_order() {
-    let space = PublicSpace::reserve().unwrap();
+    let space = CrossHeapSpace::reserve().unwrap();
     let heap = space.create_anonymous(THREADS).unwrap();
     let seen = heap.mail();
     heap.mutate(|m| {
@@ -734,7 +734,7 @@ fn mailbox_delivers_in_order() {
 fn shrink_returns_empty_blocks_and_open_by_fd() {
     use std::os::unix::fs::MetadataExt;
     let path = shm_path("shrink");
-    let (sa, sb) = (PublicSpace::reserve().unwrap(), PublicSpace::reserve().unwrap());
+    let (sa, sb) = (CrossHeapSpace::reserve().unwrap(), CrossHeapSpace::reserve().unwrap());
     let a = sa.create(&path, THREADS).unwrap();
     let b = sb.open_fd(a.fd().unwrap().try_clone_to_owned().unwrap(), THREADS).unwrap();
     let kept = list(&a, 100);

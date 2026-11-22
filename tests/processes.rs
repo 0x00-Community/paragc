@@ -9,7 +9,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use paragc::{Heap, HeapDead, Public, PublicHeap, PublicRef, PublicSlot, PublicSpace, Root, Shared, Trace, brand, public_brand};
+use paragc::{Heap, HeapDead, CrossHeapRoot, CrossHeap, CrossHeapRef, CrossHeapSlot, CrossHeapSpace, Root, Shared, Trace, brand, cross_heap_brand};
 
 const THREADS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 /// 公开堆的对象头
@@ -42,19 +42,19 @@ const DEADLINE: Duration = Duration::from_secs(10);
 #[derive(Shared)]
 struct Node<'p> {
     value: u64,
-    next: PublicSlot<'p, Node<'p>>,
+    next: CrossHeapSlot<'p, Node<'p>>,
 }
 
-public_brand!(NodeB = for<'p> Node<'p>);
+cross_heap_brand!(NodeB = for<'p> Node<'p>);
 
 /// 每条链一个头；0 号归父进程，其余给子进程
 #[repr(C)]
 #[derive(Shared)]
 struct Anchor<'p> {
-    heads: [PublicSlot<'p, Node<'p>>; 8],
+    heads: [CrossHeapSlot<'p, Node<'p>>; 8],
 }
 
-public_brand!(AnchorB = for<'p> Anchor<'p>);
+cross_heap_brand!(AnchorB = for<'p> Anchor<'p>);
 
 const NODE: usize = (HEADER + size_of::<Node<'static>>()).next_multiple_of(8);
 const ANCHOR_BYTES: usize = (HEADER + size_of::<Anchor<'static>>()).next_multiple_of(8);
@@ -98,12 +98,12 @@ impl FromStr for Role {
 }
 
 /// 链现在的长度：链上的值从头起是 len-1, len-2, …, 0（任何一步被杀都保持这个形状），头的值 + 1 就是长度。
-fn length(heap: &PublicHeap, anchor: &Public<AnchorB>, chain: usize) -> u64 {
+fn length(heap: &CrossHeap, anchor: &CrossHeapRoot<AnchorB>, chain: usize) -> u64 {
     heap.mutate(|m| anchor.get(m).heads[chain].get(m).map_or(0, |n| n.value + 1))
 }
 
 /// 在链头压入 `push` 个、再弹掉 `pop` 个；返回新长度。
-fn churn(heap: &PublicHeap, anchor: &Public<AnchorB>, chain: usize, push: u64, pop: u64) -> u64 {
+fn churn(heap: &CrossHeap, anchor: &CrossHeapRoot<AnchorB>, chain: usize, push: u64, pop: u64) -> u64 {
     heap.mutate(|m| {
         let top = &anchor.get(m).heads[chain];
         let len = top.get(m).map_or(0, |n| n.value + 1);
@@ -120,7 +120,7 @@ fn churn(heap: &PublicHeap, anchor: &Public<AnchorB>, chain: usize, push: u64, p
 }
 
 /// 链的形状对：从头起 len-1, …, 0。返回长度。
-fn check(heap: &PublicHeap, anchor: &Public<AnchorB>, chain: usize) -> u64 {
+fn check(heap: &CrossHeap, anchor: &CrossHeapRoot<AnchorB>, chain: usize) -> u64 {
     heap.mutate(|m| {
         let mut cur = anchor.get(m).heads[chain].get(m);
         let len = cur.map_or(0, |n| n.value + 1);
@@ -155,15 +155,15 @@ impl Rng {
 /// 父进程这一侧：堆文件、地址区、堆、锚。
 struct Parent {
     path: PathBuf,
-    heap: PublicHeap,
-    anchor: Public<AnchorB>,
+    heap: CrossHeap,
+    anchor: CrossHeapRoot<AnchorB>,
 }
 
 impl Parent {
     fn new(name: &str) -> Self {
         let path = PathBuf::from(format!("/dev/shm/paragc-proc-{}-{name}", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        let space = PublicSpace::reserve().unwrap();
+        let space = CrossHeapSpace::reserve().unwrap();
         let heap = space.create(&path, THREADS).unwrap();
         let anchor = heap.mutate(|m| m.root::<AnchorB>(m.alloc(Anchor { heads: Default::default() })));
         Self { path, heap, anchor }
@@ -252,7 +252,7 @@ fn child() {
     let env = |k: &str| std::env::var(k).unwrap();
     let path = PathBuf::from(env(PATH));
     let (chain, rounds): (usize, u64) = (env(CHAIN).parse().unwrap(), env(ROUNDS).parse().unwrap());
-    let space = PublicSpace::reserve().unwrap();
+    let space = CrossHeapSpace::reserve().unwrap();
     if let Role::Pair = role {
         Pair::run(&space, &path, chain);
         return;
@@ -284,7 +284,7 @@ fn child() {
         }
     }
     let heap = space.open(Path::new(&path), THREADS).unwrap();
-    let anchor: Public<AnchorB> = heap.mutate(|m| m.find(env(ANCHOR).parse().unwrap())).expect("凭入口号找到锚");
+    let anchor: CrossHeapRoot<AnchorB> = heap.mutate(|m| m.find(env(ANCHOR).parse().unwrap())).expect("凭入口号找到锚");
     match role {
         Role::Churn => {
             for r in 0..rounds {
@@ -364,10 +364,10 @@ fn created(kid: &mut Kid) -> (u32, usize) {
 }
 
 /// 打开 `path` 的堆，凭入口号找到链、核对 0..CREATED_LEN，回收后核对存活字节数与挂接数。
-fn reopen_and_check(path: &Path, index: u32) -> PublicHeap {
-    let space = PublicSpace::reserve().unwrap();
+fn reopen_and_check(path: &Path, index: u32) -> CrossHeap {
+    let space = CrossHeapSpace::reserve().unwrap();
     let heap = space.open(path, THREADS).unwrap();
-    let chain: Public<NodeB> = heap.mutate(|m| m.find(index)).expect("建堆的进程挂的链还在");
+    let chain: CrossHeapRoot<NodeB> = heap.mutate(|m| m.find(index)).expect("建堆的进程挂的链还在");
     let sum = heap.mutate(|m| {
         let (mut s, mut cur) = (0, Some(chain.get(m)));
         while let Some(n) = cur {
@@ -393,7 +393,7 @@ fn restart_after_the_creator_is_gone() {
     let (_, number) = created(&mut kid);
     kid.line(READY);
     kid.kill();
-    let space = PublicSpace::reserve().unwrap();
+    let space = CrossHeapSpace::reserve().unwrap();
     let err = space.open(&crashed, THREADS).err().expect("主人死了，堆跟着死");
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     assert!(!crashed.exists() && !dir.file(&format!(".paragc-{number}")).exists(), "死堆的文件与标记删掉了");
@@ -434,7 +434,7 @@ fn heap_numbers_do_not_collide_across_processes() {
     let (_, taken) = created(&mut kid);
     assert!(kid.child.wait().unwrap().success());
     // 本进程在同一个目录建堆：堆号不能和别的进程建的撞，两个堆在本进程能同时打开
-    let space = PublicSpace::reserve().unwrap();
+    let space = CrossHeapSpace::reserve().unwrap();
     let second = space.create(dir.file("second"), THREADS).unwrap();
     assert_ne!(second.id(), taken);
     let reopened = space.open(&first, THREADS).unwrap();
@@ -565,10 +565,10 @@ const EXIT: &str = "EXIT";
 #[repr(C)]
 #[derive(Shared)]
 struct Hub<'p> {
-    refs: [PublicRef<'p, NodeB>; PAIRS],
+    refs: [CrossHeapRef<'p, NodeB>; PAIRS],
 }
 
-public_brand!(HubB = for<'p> Hub<'p>);
+cross_heap_brand!(HubB = for<'p> Hub<'p>);
 
 const HUB: usize = (HEADER + size_of::<Hub<'static>>()).next_multiple_of(8);
 
@@ -576,7 +576,7 @@ const HUB: usize = (HEADER + size_of::<Hub<'static>>()).next_multiple_of(8);
 #[derive(Trace)]
 struct Card {
     peer: usize,
-    chain: Public<NodeB>,
+    chain: CrossHeapRoot<NodeB>,
 }
 
 brand!(CardB = for<'gc> Card);
@@ -598,19 +598,19 @@ fn gift_value(from: usize, to: usize) -> u64 {
 /// 八进程场景里的一个进程。
 struct Pair {
     me: usize,
-    mine: PublicHeap,
-    chain: Public<NodeB>,
-    hub: Public<HubB>,
+    mine: CrossHeap,
+    chain: CrossHeapRoot<NodeB>,
+    hub: CrossHeapRoot<HubB>,
     private: Heap,
     beads: Root<BeadB>,
     /// 别的进程的公开堆（死了的放掉）
-    peers: Vec<Option<PublicHeap>>,
+    peers: Vec<Option<CrossHeap>>,
     cards: Vec<Option<Root<CardB>>>,
 }
 
 impl Pair {
     /// 子进程这一侧：建堆、报信息、等 PEERS、连上别人、等 RELEASE、报 READY，之后边干活边听命令。
-    fn run(space: &PublicSpace, path: &Path, me: usize) {
+    fn run(space: &CrossHeapSpace, path: &Path, me: usize) {
         let mine = space.create(path, THREADS).unwrap();
         let chain = mine.mutate(|m| {
             let mut top = None;
@@ -621,8 +621,8 @@ impl Pair {
         });
         let hub = mine.mutate(|m| m.root::<HubB>(m.alloc(Hub { refs: Default::default() })));
         // 给每个别的进程一份礼物：等它的集线器指上来、本进程放掉句柄后，只靠它的引用活着
-        let gifts: Vec<Option<Public<NodeB>>> = (0..PAIRS).map(|j| (j != me).then(|| mine.mutate(|m| m.root(m.alloc(Node { value: gift_value(me, j), next: PublicSlot::default() }))))).collect();
-        let gift_list: Vec<String> = gifts.iter().map(|g| g.as_ref().map_or(u32::MAX, Public::index).to_string()).collect();
+        let gifts: Vec<Option<CrossHeapRoot<NodeB>>> = (0..PAIRS).map(|j| (j != me).then(|| mine.mutate(|m| m.root(m.alloc(Node { value: gift_value(me, j), next: CrossHeapSlot::default() }))))).collect();
+        let gift_list: Vec<String> = gifts.iter().map(|g| g.as_ref().map_or(u32::MAX, CrossHeapRoot::index).to_string()).collect();
         println!("{PAIR_INFO}{me} {} {}", chain.index(), gift_list.join(","));
         let mut stdin = std::io::stdin().lines();
         let peers_line = stdin.next().unwrap().unwrap();
@@ -638,7 +638,7 @@ impl Pair {
                 (path, chain, gifts)
             })
             .collect();
-        let peers: Vec<Option<PublicHeap>> = infos.iter().enumerate().map(|(j, (p, _, _))| (j != me).then(|| space.open(p, THREADS).unwrap())).collect();
+        let peers: Vec<Option<CrossHeap>> = infos.iter().enumerate().map(|(j, (p, _, _))| (j != me).then(|| space.open(p, THREADS).unwrap())).collect();
         let mut private = Heap::new(THREADS);
         let beads = private.mutate(|m| {
             let mut top = None;
@@ -650,13 +650,13 @@ impl Pair {
         let mut cards = Vec::new();
         for (j, peer) in peers.iter().enumerate() {
             cards.push(peer.as_ref().map(|h| {
-                let chain: Public<NodeB> = h.mutate(|m| m.find(infos[j].1)).expect("别人的链");
+                let chain: CrossHeapRoot<NodeB> = h.mutate(|m| m.find(infos[j].1)).expect("别人的链");
                 private.mutate(|m| m.root(m.alloc(Card { peer: j, chain })))
             }));
             // 集线器第 j 格指向 j 给本进程的礼物
             if let Some(h) = peer {
                 mine.mutate_with(h, |mi, mj| {
-                    let gift: Public<NodeB> = mj.find(infos[j].2[me]).expect("礼物");
+                    let gift: CrossHeapRoot<NodeB> = mj.find(infos[j].2[me]).expect("礼物");
                     hub.get(mi).refs[j].set(mi, mj, Some(gift.get(mj)));
                 });
             }
@@ -696,7 +696,7 @@ impl Pair {
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
             self.mine.mutate(|m| {
                 for value in 0..1_000 {
-                    m.alloc(Node { value, next: PublicSlot::default() });
+                    m.alloc(Node { value, next: CrossHeapSlot::default() });
                 }
             });
             for (j, peer) in self.peers.iter().enumerate() {
@@ -755,7 +755,7 @@ impl Pair {
         // 和活着的别人一起回收也照常
         let mut group = vec![&self.mine];
         group.extend(self.peers.iter().flatten());
-        PublicHeap::collect_group(&group);
+        CrossHeap::collect_group(&group);
         assert_eq!(self.mine.mutate(|m| self.chain.get(m).value), PAIR_NODES - 1);
         live
     }

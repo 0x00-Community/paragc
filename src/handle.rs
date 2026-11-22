@@ -1,4 +1,4 @@
-//! 指针与句柄：私有堆的 [`Gc`] / [`Slot`] / [`Root`] / [`Weak`] / [`Far`]，公开堆的 [`PublicGc`] / [`PublicSlot`] / [`PublicRef`] / [`Public`] 与 [`Shared`]。
+//! 指针与句柄：私有堆的 [`Gc`] / [`Slot`] / [`Root`] / [`Weak`] / [`Far`]，公开堆的 [`CrossHeapGc`] / [`CrossHeapSlot`] / [`CrossHeapRef`] / [`CrossHeapRoot`] 与 [`Shared`]。
 //!
 //! 堆指针 [`Gc`] 与原子指针槽 [`Slot`]。
 //!
@@ -16,7 +16,7 @@
 //! - 读要带目标堆的 [`Mutator`]：证明此刻在目标堆的 mutate 里（对象不会被清扫或搬走）。
 //! - 跨堆的环（A 的对象经 Far 指向 B、B 的又指回 A）单独回收收不掉，用 [`crate::Heap::collect_group`] 一起回收。
 //!
-//! 公开堆里的类型与指针：对象头、[`Shared`]（能放进公开堆的类型）、[`PublicGc`]、[`PublicSlot`]、[`Public`]。
+//! 公开堆里的类型与指针：对象头、[`Shared`]（能放进公开堆的类型）、[`CrossHeapGc`]、[`CrossHeapSlot`]、[`CrossHeapRoot`]。
 //!
 //! 公开堆的对象可能被别的进程读、被不认识这个类型的进程回收，所以：头里不存代码，只存类型号；回收照类型表里的指针图找边；
 //! 对象不许有析构；指针一律存「相对公开地址区起点的偏移」，同一个值在每个进程里都指向同一个对象。
@@ -35,7 +35,7 @@ use std::sync::Arc;
 use crate::{Heap, Mutator, Trace, Tracer};
 use crate::heap::{HeapInternal, MutatorInternal};
 #[cfg(target_os = "linux")]
-use crate::heap::{Inner, PublicHeap, PublicHeapInternal, PublicMutator, PublicMutatorInternal};
+use crate::heap::{Inner, CrossHeap, CrossHeapInternal, CrossHeapMutator, CrossHeapMutatorInternal};
 use crate::layout::Header;
 #[cfg(target_os = "linux")]
 use crate::layout::{GRANULE, PHeader};
@@ -724,21 +724,21 @@ unsafe impl<B: Brand> Trace for Far<'_, B> {
     }
 }
 
-/// 能放进公开堆的类型：`#[repr(C)]`、只有纯数据、[`PublicSlot`] 与这样的嵌套类型、定长数组，没有析构。
+/// 能放进公开堆的类型：`#[repr(C)]`、只有纯数据、[`CrossHeapSlot`] 与这样的嵌套类型、定长数组，没有析构。
 /// 用 `#[derive(Shared)]` 生成，别手写。
 ///
 /// # Safety
-/// `edges` 必须把每个 [`PublicSlot`] 的字节偏移（相对 `at`）报给 `map`，漏了就是悬垂指针；`NO_EDGES` 只能在确实没有时为 true。
+/// `edges` 必须把每个 [`CrossHeapSlot`] 的字节偏移（相对 `at`）报给 `map`，漏了就是悬垂指针；`NO_EDGES` 只能在确实没有时为 true。
 #[cfg(target_os = "linux")]
 pub unsafe trait Shared: Send + Sync {
-    /// 类型里没有任何 [`PublicSlot`]
+    /// 类型里没有任何 [`CrossHeapSlot`]
     const NO_EDGES: bool = false;
 
     /// 把自己里面每个指针槽的偏移（`at` + 槽在自己里面的偏移）报给 `map`。
     fn edges(map: &mut EdgeMap, at: u32);
 }
 
-/// 指针图里的偏移带这一位：那里是一个 [`PublicRef`]（偏移 + 目标堆身份），指向别的堆；不带的是同堆的 [`PublicSlot`]
+/// 指针图里的偏移带这一位：那里是一个 [`CrossHeapRef`]（偏移 + 目标堆身份），指向别的堆；不带的是同堆的 [`CrossHeapSlot`]
 #[cfg(target_os = "linux")]
 pub const FAR_EDGE: u32 = 1 << 31;
 
@@ -753,7 +753,7 @@ impl EdgeMap {
         self.0.push(at);
     }
 
-    /// 一个指向别的公开堆的 [`PublicRef`]（偏移后面还有目标堆的身份）。
+    /// 一个指向别的公开堆的 [`CrossHeapRef`]（偏移后面还有目标堆的身份）。
     pub fn far(&mut self, at: u32) {
         self.0.push(at | FAR_EDGE);
     }
@@ -808,32 +808,32 @@ unsafe impl<T: Shared, const N: usize> Shared for [T; N] {
     }
 }
 
-/// 公开堆里的对象，只在一次 [`PublicHeap::mutate`] 里有效（`'p` 是那次调用的品牌）。是本进程里的绝对地址。
+/// 公开堆里的对象，只在一次 [`CrossHeap::mutate`] 里有效（`'p` 是那次调用的品牌）。是本进程里的绝对地址。
 #[cfg(target_os = "linux")]
-pub struct PublicGc<'p, T> {
+pub struct CrossHeapGc<'p, T> {
     ptr: NonNull<T>,
     _brand: PhantomData<(&'p T, Invariant<'p>)>,
 }
 
 // SAFETY: 只给出 &T，T: Shared 要求 Send + Sync
 #[cfg(target_os = "linux")]
-unsafe impl<T: Send + Sync> Send for PublicGc<'_, T> {}
+unsafe impl<T: Send + Sync> Send for CrossHeapGc<'_, T> {}
 // SAFETY: 同上
 #[cfg(target_os = "linux")]
-unsafe impl<T: Send + Sync> Sync for PublicGc<'_, T> {}
+unsafe impl<T: Send + Sync> Sync for CrossHeapGc<'_, T> {}
 
 #[cfg(target_os = "linux")]
-impl<T> Clone for PublicGc<'_, T> {
+impl<T> Clone for CrossHeapGc<'_, T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
 #[cfg(target_os = "linux")]
-impl<T> Copy for PublicGc<'_, T> {}
+impl<T> Copy for CrossHeapGc<'_, T> {}
 
 #[cfg(target_os = "linux")]
-impl<'p, T> PublicGc<'p, T> {
+impl<'p, T> CrossHeapGc<'p, T> {
 
     pub fn as_ptr(self) -> *const T {
         self.ptr.as_ptr()
@@ -853,7 +853,7 @@ impl<'p, T> PublicGc<'p, T> {
 
 /// 只给本 crate 用的操作：trait 在私有模块里、不导出，crate 外拿不到。
 #[cfg(target_os = "linux")]
-pub trait PublicGcInternal {
+pub trait CrossHeapGcInternal {
     /// SAFETY（调用方）：`ptr` 是这个公开堆里一个活对象的数据指针，品牌 `'p` 正确。
     unsafe fn from_data(ptr: *mut u8) -> Self;
 
@@ -862,7 +862,7 @@ pub trait PublicGcInternal {
 }
 
 #[cfg(target_os = "linux")]
-impl<T> PublicGcInternal for PublicGc<'_, T> {
+impl<T> CrossHeapGcInternal for CrossHeapGc<'_, T> {
     unsafe fn from_data(ptr: *mut u8) -> Self {
         // SAFETY: 见上
         Self { ptr: unsafe { NonNull::new_unchecked(ptr.cast()) }, _brand: PhantomData }
@@ -876,7 +876,7 @@ impl<T> PublicGcInternal for PublicGc<'_, T> {
 
 
 #[cfg(target_os = "linux")]
-impl<T> Deref for PublicGc<'_, T> {
+impl<T> Deref for CrossHeapGc<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -886,67 +886,67 @@ impl<T> Deref for PublicGc<'_, T> {
 }
 
 #[cfg(target_os = "linux")]
-impl<T: fmt::Debug> fmt::Debug for PublicGc<'_, T> {
+impl<T: fmt::Debug> fmt::Debug for CrossHeapGc<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
 
 /// 公开堆对象里的原子指针槽：存目标的公开偏移（0 = 空），所以同一个值在每个映射这个堆的进程里都对。
-/// 读写都要带 [`PublicMutator`]（换算成本进程地址要用它的区起点）。
+/// 读写都要带 [`CrossHeapMutator`]（换算成本进程地址要用它的区起点）。
 #[repr(transparent)]
 #[cfg(target_os = "linux")]
-pub struct PublicSlot<'p, T> {
+pub struct CrossHeapSlot<'p, T> {
     off: AtomicU64,
-    _brand: PhantomData<PublicGc<'p, T>>,
+    _brand: PhantomData<CrossHeapGc<'p, T>>,
 }
 
 #[cfg(target_os = "linux")]
-impl<T> Default for PublicSlot<'_, T> {
+impl<T> Default for CrossHeapSlot<'_, T> {
     fn default() -> Self {
         Self { off: AtomicU64::new(0), _brand: PhantomData }
     }
 }
 
 #[cfg(target_os = "linux")]
-impl<'p, T> From<Option<PublicGc<'p, T>>> for PublicSlot<'p, T> {
-    fn from(v: Option<PublicGc<'p, T>>) -> Self {
+impl<'p, T> From<Option<CrossHeapGc<'p, T>>> for CrossHeapSlot<'p, T> {
+    fn from(v: Option<CrossHeapGc<'p, T>>) -> Self {
         Self { off: AtomicU64::new(Self::raw(v)), _brand: PhantomData }
     }
 }
 
 #[cfg(target_os = "linux")]
-impl<'p, T> From<PublicGc<'p, T>> for PublicSlot<'p, T> {
-    fn from(v: PublicGc<'p, T>) -> Self {
+impl<'p, T> From<CrossHeapGc<'p, T>> for CrossHeapSlot<'p, T> {
+    fn from(v: CrossHeapGc<'p, T>) -> Self {
         Some(v).into()
     }
 }
 
 #[cfg(target_os = "linux")]
-impl<'p, T> PublicSlot<'p, T> {
-    fn raw(v: Option<PublicGc<'p, T>>) -> u64 {
-        v.map_or(0, PublicGc::offset)
+impl<'p, T> CrossHeapSlot<'p, T> {
+    fn raw(v: Option<CrossHeapGc<'p, T>>) -> u64 {
+        v.map_or(0, CrossHeapGc::offset)
     }
 
-    fn wrap(m: &PublicMutator<'p>, off: u64) -> Option<PublicGc<'p, T>> {
-        // SAFETY: 槽里只存过同品牌的 PublicGc 的偏移，对象被槽所在的对象引用着
-        (off != 0).then(|| unsafe { PublicGc::from_data(m.at(off)) })
+    fn wrap(m: &CrossHeapMutator<'p>, off: u64) -> Option<CrossHeapGc<'p, T>> {
+        // SAFETY: 槽里只存过同品牌的 CrossHeapGc 的偏移，对象被槽所在的对象引用着
+        (off != 0).then(|| unsafe { CrossHeapGc::from_data(m.at(off)) })
     }
 
-    pub fn get(&self, m: &PublicMutator<'p>) -> Option<PublicGc<'p, T>> {
+    pub fn get(&self, m: &CrossHeapMutator<'p>) -> Option<CrossHeapGc<'p, T>> {
         Self::wrap(m, self.off.load(Ordering::Acquire))
     }
 
-    pub fn set(&self, m: &PublicMutator<'p>, v: Option<PublicGc<'p, T>>) {
+    pub fn set(&self, m: &CrossHeapMutator<'p>, v: Option<CrossHeapGc<'p, T>>) {
         self.swap(m, v);
     }
 
-    pub fn swap(&self, m: &PublicMutator<'p>, v: Option<PublicGc<'p, T>>) -> Option<PublicGc<'p, T>> {
+    pub fn swap(&self, m: &CrossHeapMutator<'p>, v: Option<CrossHeapGc<'p, T>>) -> Option<CrossHeapGc<'p, T>> {
         Self::wrap(m, self.off.swap(Self::raw(v), Ordering::AcqRel))
     }
 
     /// 槽里是 `current` 才换成 `new`；失败时返回槽里的值。
-    pub fn compare_exchange(&self, m: &PublicMutator<'p>, current: Option<PublicGc<'p, T>>, new: Option<PublicGc<'p, T>>) -> Result<Option<PublicGc<'p, T>>, Option<PublicGc<'p, T>>> {
+    pub fn compare_exchange(&self, m: &CrossHeapMutator<'p>, current: Option<CrossHeapGc<'p, T>>, new: Option<CrossHeapGc<'p, T>>) -> Result<Option<CrossHeapGc<'p, T>>, Option<CrossHeapGc<'p, T>>> {
         self.off
             .compare_exchange(Self::raw(current), Self::raw(new), Ordering::AcqRel, Ordering::Acquire)
             .map(|o| Self::wrap(m, o))
@@ -956,7 +956,7 @@ impl<'p, T> PublicSlot<'p, T> {
 
 // SAFETY: 槽本身就是一个指针
 #[cfg(target_os = "linux")]
-unsafe impl<T: Send + Sync> Shared for PublicSlot<'_, T> {
+unsafe impl<T: Send + Sync> Shared for CrossHeapSlot<'_, T> {
     fn edges(map: &mut EdgeMap, at: u32) {
         map.edge(at);
     }
@@ -965,13 +965,13 @@ unsafe impl<T: Send + Sync> Shared for PublicSlot<'_, T> {
 /// 公开堆 A（品牌 `'a`）对象里指向另一个公开堆 B 的对象的引用：存目标的公开偏移与 B 的身份，直接指过去，不复制。
 ///
 /// 写入时在 B 的入口表登记一项、持有方记作「堆 A」，所以 B 单独回收时它是根（回收 B 的进程不需要能打开 A）；
-/// A 单独回收不跟进 B。跨堆的环、以及已经不用的登记，由 [`PublicHeap::collect_group`] 收。读要带 B 的 mutator。
+/// A 单独回收不跟进 B。跨堆的环、以及已经不用的登记，由 [`CrossHeap::collect_group`] 收。读要带 B 的 mutator。
 /// 品牌 `'a` 保证它只能放进 A 的对象里（登记的持有方才对）。
 ///
 /// B 死了以后它的堆号可能被新堆用上：身份对不上的引用读出来是 None，回收时也不跟，不会被当成新堆里的地址。
 #[repr(C)]
 #[cfg(target_os = "linux")]
-pub struct PublicRef<'a, B: PublicBrand> {
+pub struct CrossHeapRef<'a, B: CrossHeapBrand> {
     off: AtomicU64,
     /// 目标堆的身份（[`crate::layout::Super::incarnation`]）
     incarnation: AtomicU64,
@@ -983,25 +983,25 @@ pub struct PublicRef<'a, B: PublicBrand> {
 type HolderBrand<'a> = fn(&'a ()) -> &'a ();
 
 #[cfg(target_os = "linux")]
-impl<B: PublicBrand> Default for PublicRef<'_, B> {
+impl<B: CrossHeapBrand> Default for CrossHeapRef<'_, B> {
     fn default() -> Self {
         Self { off: AtomicU64::new(0), incarnation: AtomicU64::new(0), _brand: PhantomData }
     }
 }
 
 #[cfg(target_os = "linux")]
-impl<'a, B: PublicBrand> PublicRef<'a, B> {
+impl<'a, B: CrossHeapBrand> CrossHeapRef<'a, B> {
     /// 指向 `gc`（在 `target` 堆里）的新引用，放进 `holder` 堆的对象里。
-    pub fn to<'b>(holder: &PublicMutator<'a>, target: &PublicMutator<'b>, gc: PublicGc<'b, B::Of<'b>>) -> Self {
+    pub fn to<'b>(holder: &CrossHeapMutator<'a>, target: &CrossHeapMutator<'b>, gc: CrossHeapGc<'b, B::Of<'b>>) -> Self {
         let r = Self::default();
         r.set(holder, target, Some(gc));
         r
     }
 
     /// 改指向（`None` 清空）。旧值的登记留到下一次一起回收再还。
-    pub fn set<'b>(&self, holder: &PublicMutator<'a>, target: &PublicMutator<'b>, v: Option<PublicGc<'b, B::Of<'b>>>) {
-        assert!(holder.index() != target.index(), "同一个公开堆里的边用 PublicSlot");
-        let off = v.map_or(0, PublicGc::offset);
+    pub fn set<'b>(&self, holder: &CrossHeapMutator<'a>, target: &CrossHeapMutator<'b>, v: Option<CrossHeapGc<'b, B::Of<'b>>>) {
+        assert!(holder.index() != target.index(), "同一个公开堆里的边用 CrossHeapSlot");
+        let off = v.map_or(0, CrossHeapGc::offset);
         if off != 0 {
             target.register(off, holder);
         }
@@ -1011,24 +1011,24 @@ impl<'a, B: PublicBrand> PublicRef<'a, B> {
     }
 
     /// 取目标对象；`target` 是它指向的那个堆的 mutator。空的、指向别的堆的、指向一个已经死掉的旧堆（堆号被 `target` 重用了）的，都是 None。
-    pub fn get<'b>(&self, target: &PublicMutator<'b>) -> Option<PublicGc<'b, B::Of<'b>>> {
+    pub fn get<'b>(&self, target: &CrossHeapMutator<'b>) -> Option<CrossHeapGc<'b, B::Of<'b>>> {
         let off = self.off.load(Ordering::Acquire);
         if off == 0 || Inner::heap_of(off) != Some(target.index()) || self.incarnation.load(Ordering::Acquire) != target.incarnation() {
             return None;
         }
         // SAFETY: 目标堆的入口保活它（登记在写入时、一起回收时重建），公开堆不搬对象；target 证明在目标堆的 mutate 里
-        Some(unsafe { PublicGc::from_data(target.at(off)) })
+        Some(unsafe { CrossHeapGc::from_data(target.at(off)) })
     }
 
     /// 指向 `heap` 里的对象（同一个身份的堆）。
-    pub fn points_into(&self, heap: &PublicHeap) -> bool {
+    pub fn points_into(&self, heap: &CrossHeap) -> bool {
         Inner::heap_of(self.off.load(Ordering::Acquire)) == Some(heap.id()) && self.incarnation.load(Ordering::Acquire) == heap.incarnation()
     }
 }
 
 // SAFETY: 它本身就是一个跨堆的指针槽（回收时按身份认目标堆）
 #[cfg(target_os = "linux")]
-unsafe impl<B: PublicBrand> Shared for PublicRef<'_, B> {
+unsafe impl<B: CrossHeapBrand> Shared for CrossHeapRef<'_, B> {
     fn edges(map: &mut EdgeMap, at: u32) {
         map.far(at);
     }
@@ -1076,8 +1076,8 @@ impl From<WeakWord> for u64 {
 }
 
 #[cfg(target_os = "linux")]
-impl<T> From<PublicGc<'_, T>> for WeakWord {
-    fn from(gc: PublicGc<'_, T>) -> Self {
+impl<T> From<CrossHeapGc<'_, T>> for WeakWord {
+    fn from(gc: CrossHeapGc<'_, T>) -> Self {
         // SAFETY: gc 是公开堆里一个活对象，头在数据前面
         let stamp = unsafe { (*PHeader::of(gc.as_ptr().cast())).stamp };
         (gc.offset(), stamp).into()
@@ -1108,45 +1108,45 @@ impl WeakWord {
 /// 读写都是一次原子操作，不加锁：多个进程同时改，读到的是某一次写进去的值。
 #[repr(transparent)]
 #[cfg(target_os = "linux")]
-pub struct CrossHeapWeak<B: PublicBrand> {
+pub struct CrossHeapWeak<B: CrossHeapBrand> {
     word: AtomicU64,
     _brand: PhantomData<fn() -> B>,
 }
 
 #[cfg(target_os = "linux")]
-impl<B: PublicBrand> Default for CrossHeapWeak<B> {
+impl<B: CrossHeapBrand> Default for CrossHeapWeak<B> {
     fn default() -> Self {
         Self { word: AtomicU64::new(0), _brand: PhantomData }
     }
 }
 
 #[cfg(target_os = "linux")]
-impl<B: PublicBrand> From<Option<PublicGc<'_, B::Of<'_>>>> for CrossHeapWeak<B> {
-    fn from(v: Option<PublicGc<'_, B::Of<'_>>>) -> Self {
+impl<B: CrossHeapBrand> From<Option<CrossHeapGc<'_, B::Of<'_>>>> for CrossHeapWeak<B> {
+    fn from(v: Option<CrossHeapGc<'_, B::Of<'_>>>) -> Self {
         Self { word: AtomicU64::new(v.map_or(0, |gc| WeakWord::from(gc).into())), _brand: PhantomData }
     }
 }
 
 #[cfg(target_os = "linux")]
-impl<B: PublicBrand> From<PublicGc<'_, B::Of<'_>>> for CrossHeapWeak<B> {
-    fn from(gc: PublicGc<'_, B::Of<'_>>) -> Self {
+impl<B: CrossHeapBrand> From<CrossHeapGc<'_, B::Of<'_>>> for CrossHeapWeak<B> {
+    fn from(gc: CrossHeapGc<'_, B::Of<'_>>) -> Self {
         Some(gc).into()
     }
 }
 
 #[cfg(target_os = "linux")]
-impl<B: PublicBrand> CrossHeapWeak<B> {
+impl<B: CrossHeapBrand> CrossHeapWeak<B> {
     /// 改指向（`None` 清空）。不用目标堆的 mutator：偏移和出生戳都从对象本身读。
-    pub fn set(&self, v: Option<PublicGc<'_, B::Of<'_>>>) {
+    pub fn set(&self, v: Option<CrossHeapGc<'_, B::Of<'_>>>) {
         self.word.store(v.map_or(0, |gc| WeakWord::from(gc).into()), Ordering::Release);
     }
 
     /// 取目标对象；`target` 是它所在那个堆的 mutator。空的、指向别的堆的、目标已经被回收的（位置空着或被新对象占了）、
     /// 类型对不上的，都是 None。
-    pub fn get<'b>(&self, target: &PublicMutator<'b>) -> Option<PublicGc<'b, B::Of<'b>>> {
+    pub fn get<'b>(&self, target: &CrossHeapMutator<'b>) -> Option<CrossHeapGc<'b, B::Of<'b>>> {
         let data = target.locate(self.word.load(Ordering::Acquire).into())?;
         // SAFETY: locate 认过：target 堆里此刻一个活对象的数据；在 target 的 mutate 里不会被回收
-        target.is_type::<B::Of<'b>>(data).then(|| unsafe { PublicGc::from_data(data) })
+        target.is_type::<B::Of<'b>>(data).then(|| unsafe { CrossHeapGc::from_data(data) })
     }
 
     /// 指向哪个公开堆（要读得先打开它）；空的是 None。
@@ -1166,14 +1166,14 @@ impl<B: PublicBrand> CrossHeapWeak<B> {
 
 // SAFETY: 弱引用不是边：回收不跟它
 #[cfg(target_os = "linux")]
-unsafe impl<B: PublicBrand> Shared for CrossHeapWeak<B> {
+unsafe impl<B: CrossHeapBrand> Shared for CrossHeapWeak<B> {
     const NO_EDGES: bool = true;
     fn edges(_: &mut EdgeMap, _: u32) {}
 }
 
 // SAFETY: 对私有堆没有边
 #[cfg(target_os = "linux")]
-unsafe impl<B: PublicBrand> Trace for CrossHeapWeak<B> {
+unsafe impl<B: CrossHeapBrand> Trace for CrossHeapWeak<B> {
     const NO_EDGES: bool = true;
     fn trace(&self, _: &mut Tracer<'_>) {}
 }
@@ -1182,7 +1182,7 @@ unsafe impl<B: PublicBrand> Trace for CrossHeapWeak<B> {
 /// 内容是弱引用的那个字（偏移 + 出生戳）、目标堆的身份、对象的类型键（类型名、大小、指针图的哈希），32 字节。
 ///
 /// 签名不保活对象（同 [`CrossHeapWeak`]）：发出的一方不再引用它，它在下一次回收死，对方再凭签名找就是 None。
-/// 对方不需要知道 Rust 类型也能核对（[`PublicMutator::verify`]）；按类型取用 [`PublicMutator::resolve`]。
+/// 对方不需要知道 Rust 类型也能核对（[`CrossHeapMutator::verify`]）；按类型取用 [`CrossHeapMutator::resolve`]。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg(target_os = "linux")]
 pub struct Signature {
@@ -1247,29 +1247,29 @@ impl From<&[u8; SIGNATURE_BYTES]> for Signature {
     }
 }
 
-/// 把带 `'p` 的公开堆类型换个品牌：[`Public<B>`] 不带生命周期，取出来时再套上当次 mutate 的 `'p`。用 [`public_brand!`](crate::public_brand) 声明。
+/// 把带 `'p` 的公开堆类型换个品牌：[`CrossHeapRoot<B>`] 不带生命周期，取出来时再套上当次 mutate 的 `'p`。用 [`cross_heap_brand!`](crate::cross_heap_brand) 声明。
 #[cfg(target_os = "linux")]
-pub trait PublicBrand {
+pub trait CrossHeapBrand {
     type Of<'p>: Shared + 'p;
 }
 
-/// 声明一个公开堆的品牌类型：`public_brand!(pub NodeB = for<'p> Node<'p>);`
+/// 声明一个公开堆的品牌类型：`cross_heap_brand!(pub NodeB = for<'p> Node<'p>);`
 #[cfg(target_os = "linux")]
 #[macro_export]
-macro_rules! public_brand {
+macro_rules! cross_heap_brand {
     ($(#[$meta:meta])* $vis:vis $name:ident = for<$l:lifetime> $ty:ty) => {
         $(#[$meta])*
         $vis struct $name;
-        impl $crate::PublicBrand for $name {
+        impl $crate::CrossHeapBrand for $name {
             type Of<$l> = $ty;
         }
     };
 }
 
 /// 指向公开堆对象的句柄：在入口表里占一项，只要它活着对象就不会被回收。不带生命周期，可以放进私有堆的对象里、跨线程传。
-/// 用 [`PublicMutator::root`] 建、[`Public::get`] 取。
+/// 用 [`CrossHeapMutator::root`] 建、[`CrossHeapRoot::get`] 取。
 #[cfg(target_os = "linux")]
-pub struct Public<B: PublicBrand> {
+pub struct CrossHeapRoot<B: CrossHeapBrand> {
     /// 进程这一侧的堆：Arc 让窗口在句柄还在时一直映射着
     heap: Arc<Inner>,
     entry: u32,
@@ -1280,33 +1280,33 @@ pub struct Public<B: PublicBrand> {
 
 // SAFETY: 只给出 B::Of 的共享引用（Shared: Send + Sync）；入口表是原子的
 #[cfg(target_os = "linux")]
-unsafe impl<B: PublicBrand> Send for Public<B> {}
+unsafe impl<B: CrossHeapBrand> Send for CrossHeapRoot<B> {}
 // SAFETY: 同上
 #[cfg(target_os = "linux")]
-unsafe impl<B: PublicBrand> Sync for Public<B> {}
+unsafe impl<B: CrossHeapBrand> Sync for CrossHeapRoot<B> {}
 
 #[cfg(target_os = "linux")]
-impl<B: PublicBrand> Public<B> {
+impl<B: CrossHeapBrand> CrossHeapRoot<B> {
 
     /// 取目标对象；`m` 必须是目标堆的 mutator。
-    pub fn get<'p>(&self, m: &PublicMutator<'p>) -> PublicGc<'p, B::Of<'p>> {
-        assert!(m.is(&self.heap), "这个 Public 不指向这个堆");
+    pub fn get<'p>(&self, m: &CrossHeapMutator<'p>) -> CrossHeapGc<'p, B::Of<'p>> {
+        assert!(m.is(&self.heap), "这个 CrossHeapRoot 不指向这个堆");
         // SAFETY: 入口保活这个对象、公开堆不搬对象；m 证明在这个堆的 mutate 里
-        unsafe { PublicGc::from_data(self.data.as_ptr()) }
+        unsafe { CrossHeapGc::from_data(self.data.as_ptr()) }
     }
 
     /// 目标对象在不在 `heap` 里。
-    pub fn points_into(&self, heap: &PublicHeap) -> bool {
+    pub fn points_into(&self, heap: &CrossHeap) -> bool {
         heap.is(&self.heap)
     }
 
-    /// 入口号：在每个映射这个堆的地方都一样，别处可以用 [`PublicMutator::find`] 凭它拿到同一个对象。
+    /// 入口号：在每个映射这个堆的地方都一样，别处可以用 [`CrossHeapMutator::find`] 凭它拿到同一个对象。
     pub fn index(&self) -> u32 {
         self.entry
     }
 
     /// 把这个入口变成不归任何进程的根，返回入口号：本进程退出（或被杀）也不还，主进程重启后凭入口号
-    /// （[`PublicMutator::find`]）接着用；不要了用 [`PublicMutator::release`] 还掉。
+    /// （[`CrossHeapMutator::find`]）接着用；不要了用 [`CrossHeapMutator::release`] 还掉。
     pub fn persist(self) -> u32 {
         let me = core::mem::ManuallyDrop::new(self);
         me.heap.disown_entry(me.entry);
@@ -1319,12 +1319,12 @@ impl<B: PublicBrand> Public<B> {
 
 /// 只给本 crate 用的操作：trait 在私有模块里、不导出，crate 外拿不到。
 #[cfg(target_os = "linux")]
-pub trait PublicInternal {
+pub trait CrossHeapRootInternal {
     fn new(heap: Arc<Inner>, entry: u32, data: NonNull<u8>) -> Self;
 }
 
 #[cfg(target_os = "linux")]
-impl<B: PublicBrand> PublicInternal for Public<B> {
+impl<B: CrossHeapBrand> CrossHeapRootInternal for CrossHeapRoot<B> {
     fn new(heap: Arc<Inner>, entry: u32, data: NonNull<u8>) -> Self {
         Self { heap, entry, data, _brand: PhantomData }
     }
@@ -1332,7 +1332,7 @@ impl<B: PublicBrand> PublicInternal for Public<B> {
 
 
 #[cfg(target_os = "linux")]
-impl<B: PublicBrand> Drop for Public<B> {
+impl<B: CrossHeapBrand> Drop for CrossHeapRoot<B> {
     fn drop(&mut self) {
         self.heap.release_entry(self.entry);
     }
@@ -1340,7 +1340,7 @@ impl<B: PublicBrand> Drop for Public<B> {
 
 // SAFETY: 句柄对私有堆没有边（它本身是公开堆的一个根）
 #[cfg(target_os = "linux")]
-unsafe impl<B: PublicBrand> Trace for Public<B> {
+unsafe impl<B: CrossHeapBrand> Trace for CrossHeapRoot<B> {
     const NO_EDGES: bool = true;
     fn trace(&self, _: &mut Tracer<'_>) {}
 }

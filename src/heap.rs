@@ -1,4 +1,4 @@
-//! 两种堆：私有堆 [`Heap`] / [`Mutator`]，公开堆 [`PublicHeap`] / [`PublicMutator`]（共享内存文件上、多进程），共用的分配缓冲 [`Tlab`]。
+//! 两种堆：私有堆 [`Heap`] / [`Mutator`]，公开堆 [`CrossHeap`] / [`CrossHeapMutator`]（共享内存文件上、多进程），共用的分配缓冲 [`Tlab`]。
 //!
 //! 堆：多个线程可以同时 [`Heap::mutate`]（各自碰撞分配）。
 //!
@@ -37,7 +37,7 @@ use crossbeam_utils::{Backoff, CachePadded};
 use crate::{Gc, Trace};
 use crate::handle::{GcInternal, Invariant, RawSlot, RootTable};
 #[cfg(target_os = "linux")]
-use crate::handle::{EdgeMap, Public, PublicBrand, PublicGc, PublicGcInternal, PublicInternal, STAMP_MASK, Shared, Signature, WeakWord};
+use crate::handle::{EdgeMap, CrossHeapRoot, CrossHeapBrand, CrossHeapGc, CrossHeapGcInternal, CrossHeapRootInternal, STAMP_MASK, Shared, Signature, WeakWord};
 use crate::layout::{BLOCK, Block, Pages, WARM_CYCLES, YOUNG_COPY_DEN, YOUNG_COPY_NUM, LINE, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, HEADER, Header, LARGE, MAX_EPOCH, MIN_SPARE_BLOCKS, MIN_TRIGGER, OVERFLOW_TRIES, FRAG_NUM, FRAG_DEN, YOUNG_PER_FULL, YOUNG_PER_FULL_RC};
 #[cfg(target_os = "linux")]
 use crate::layout::{Core, State};
@@ -1168,7 +1168,7 @@ const SPLITMIX_MULS: [u64; 2] = [0xbf58_476d_1ce4_e5b9, 0x94d0_49bb_1331_11eb];
 #[cfg(target_os = "linux")]
 pub enum Backing {
     /// 共享内存文件系统上的文件；`owner` = 本句柄建的（本进程是主人），析构时堆跟着死、删文件与标记（除非 persist）。
-    /// 凭别人交来的文件描述符打开的没有路径（[`crate::PublicSpace::open_fd`]）
+    /// 凭别人交来的文件描述符打开的没有路径（[`crate::CrossHeapSpace::open_fd`]）
     File { file: File, path: Option<PathBuf>, owner: bool },
     /// 匿名共享内存（只在本进程）
     Anonymous,
@@ -1428,7 +1428,7 @@ impl Inner {
     /// 几个堆一起回收：按堆号从小到大拿每个堆的回收权，全部走空才动手，有一个等不到就全放开重来（不会和别的一起回收互相等死）。
     ///
     /// 一个一个来：拿到第 k 个堆的请求、等它走空，再去拿第 k+1 个。这样 mutator 只要按堆号从小到大嵌套进入
-    /// （[`PublicHeap::mutate_with`]），在小号堆里等着进大号堆的线程不会卡住它：那时大号堆还没被挡。逆序嵌套才会互等，
+    /// （[`CrossHeap::mutate_with`]），在小号堆里等着进大号堆的线程不会卡住它：那时大号堆还没被挡。逆序嵌套才会互等，
     /// 等不到就全部放开、退让后重来。
     fn collect_group(members: &[&Self]) {
         let mut retry = Retry::new();
@@ -2013,12 +2013,12 @@ impl Drop for Inner {
     }
 }
 
-/// 公开堆。多个线程可以同时 [`PublicHeap::mutate`]；同一个堆在别处（另一个地址区、以后另一个进程）也映射着时，握手照样互相排斥。
+/// 公开堆。多个线程可以同时 [`CrossHeap::mutate`]；同一个堆在别处（另一个地址区、以后另一个进程）也映射着时，握手照样互相排斥。
 #[cfg(target_os = "linux")]
-pub struct PublicHeap(Arc<Inner>);
+pub struct CrossHeap(Arc<Inner>);
 
 #[cfg(target_os = "linux")]
-impl From<Inner> for PublicHeap {
+impl From<Inner> for CrossHeap {
     fn from(inner: Inner) -> Self {
         Self(Arc::new(inner))
     }
@@ -2042,7 +2042,7 @@ impl std::error::Error for HeapDead {}
 /// 公开堆的统计。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg(target_os = "linux")]
-pub struct PublicStats {
+pub struct CrossHeapStats {
     /// 上次回收后存活的字节数（含头）
     pub live: usize,
     /// 上次回收后新领用的字节数
@@ -2055,18 +2055,18 @@ pub struct PublicStats {
 }
 
 #[cfg(target_os = "linux")]
-impl PublicHeap {
+impl CrossHeap {
     /// 堆号（= 窗口号）。
     pub fn id(&self) -> usize {
         self.0.index
     }
 
-    /// 建堆的句柄析构时保留堆文件与堆号标记（主进程退出或重启后，别的进程照样 [`crate::PublicSpace::open`] 回来接着用）。
+    /// 建堆的句柄析构时保留堆文件与堆号标记（主进程退出或重启后，别的进程照样 [`crate::CrossHeapSpace::open`] 回来接着用）。
     pub fn persist(&self) {
         self.0.sup().persist.store(1, Ordering::Release);
     }
 
-    /// 堆还活着：主人（建堆的进程）还在，或调过 [`PublicHeap::persist`]。主人不在了堆就死了：这里发现时标死、删掉堆文件与标记；
+    /// 堆还活着：主人（建堆的进程）还在，或调过 [`CrossHeap::persist`]。主人不在了堆就死了：这里发现时标死、删掉堆文件与标记；
     /// 之后本进程该放掉指向它的句柄（放掉最后一个，映射才拆、内存才还）。
     pub fn is_alive(&self) -> bool {
         self.0.is_alive()
@@ -2074,13 +2074,13 @@ impl PublicHeap {
 
     /// 同时在这个堆与 `other` 里做事（两个不同的公开堆）：总是先进堆号小的那个。嵌套进几个公开堆时都照这个顺序，
     /// 一起回收（按堆号逐个挡、逐个等走空）就不会和 mutator 互等；逆序嵌套也不会出错，只是回收要放开重来、慢一些。
-    pub fn mutate_with<R>(&self, other: &PublicHeap, f: impl for<'a, 'b> FnOnce(&PublicMutator<'a>, &PublicMutator<'b>) -> R) -> R {
+    pub fn mutate_with<R>(&self, other: &CrossHeap, f: impl for<'a, 'b> FnOnce(&CrossHeapMutator<'a>, &CrossHeapMutator<'b>) -> R) -> R {
         assert!(self.id() != other.id(), "两个不同的公开堆");
         if self.id() < other.id() { self.mutate(|ma| other.mutate(|mb| f(ma, mb))) } else { other.mutate(|mb| self.mutate(|ma| f(ma, mb))) }
     }
 
-    /// 同 [`PublicHeap::mutate`]，但堆已经死了（主人不在了）时不进去，返回 [`HeapDead`]。别的进程建的堆用这个。
-    pub fn try_mutate<R>(&self, f: impl for<'p> FnOnce(&PublicMutator<'p>) -> R) -> Result<R, HeapDead> {
+    /// 同 [`CrossHeap::mutate`]，但堆已经死了（主人不在了）时不进去，返回 [`HeapDead`]。别的进程建的堆用这个。
+    pub fn try_mutate<R>(&self, f: impl for<'p> FnOnce(&CrossHeapMutator<'p>) -> R) -> Result<R, HeapDead> {
         if !self.0.alive_cached() {
             return Err(HeapDead);
         }
@@ -2092,8 +2092,8 @@ impl PublicHeap {
         (0..ATTACH_CAP).filter(|&i| self.0.attachment(i).pid.load(Ordering::Acquire) != 0).count()
     }
 
-    /// 在堆上做事；可以在多个线程上同时调用。闭包里分配的对象只有挂到 [`Public`] 上（直接或间接）才能活过下一次回收。
-    pub fn mutate<R>(&self, f: impl for<'p> FnOnce(&PublicMutator<'p>) -> R) -> R {
+    /// 在堆上做事；可以在多个线程上同时调用。闭包里分配的对象只有挂到 [`CrossHeapRoot`] 上（直接或间接）才能活过下一次回收。
+    pub fn mutate<R>(&self, f: impl for<'p> FnOnce(&CrossHeapMutator<'p>) -> R) -> R {
         let spare = self.0.spare.swap(null_mut(), Ordering::AcqRel);
         let mut tlab = if spare.is_null() {
             Box::default()
@@ -2106,7 +2106,7 @@ impl PublicHeap {
             tlab.adopt((Arc::as_ptr(&self.0).addr(), self.0.sup().collections.load(Ordering::Acquire)));
             // 回收只在没有 mutator 时进行，所以一次 mutate 里纪元不变
             let epoch = self.0.sup().epoch.load(Ordering::Acquire);
-            f(&PublicMutator { heap: &self.0, tlab: &tlab, epoch, stamp: self.0.stamp(epoch), _brand: PhantomData })
+            f(&CrossHeapMutator { heap: &self.0, tlab: &tlab, epoch, stamp: self.0.stamp(epoch), _brand: PhantomData })
         };
         let tlab = Box::into_raw(tlab);
         if self.0.spare.compare_exchange(null_mut(), tlab, Ordering::AcqRel, Ordering::Relaxed).is_err() {
@@ -2123,13 +2123,13 @@ impl PublicHeap {
         self.0.collect();
     }
 
-    /// 同 [`PublicHeap::collect`]，并把清扫出来的空块全部还给系统（平时的回收按上次以来的分配量留一些备用）。
+    /// 同 [`CrossHeap::collect`]，并把清扫出来的空块全部还给系统（平时的回收按上次以来的分配量留一些备用）。
     /// 还掉的块之后再分配进去要重新缺页。
     pub fn shrink(&self) {
         self.0.collect_with(true);
     }
 
-    /// 堆文件的描述符（匿名堆没有）：经 `SCM_RIGHTS` 交给别的进程，对方用 [`crate::PublicSpace::open_fd`] 打开，
+    /// 堆文件的描述符（匿名堆没有）：经 `SCM_RIGHTS` 交给别的进程，对方用 [`crate::CrossHeapSpace::open_fd`] 打开，
     /// 不需要能访问堆文件的路径。
     pub fn fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
         use std::os::fd::AsFd;
@@ -2139,20 +2139,20 @@ impl PublicHeap {
         }
     }
 
-    /// 信箱收到过的件数（见 [`PublicMutator::post`]）。
+    /// 信箱收到过的件数（见 [`CrossHeapMutator::post`]）。
     pub fn mail(&self) -> u32 {
         self.0.sup().mail.load(Ordering::SeqCst)
     }
 
-    /// 信箱收到过的件数还是 `seen` 就睡，最多 `timeout`（醒来不保证有新信，再看 [`PublicHeap::mail`]）。
+    /// 信箱收到过的件数还是 `seen` 就睡，最多 `timeout`（醒来不保证有新信，再看 [`CrossHeap::mail`]）。
     /// 不要在这个堆的 mutate 里等（回收会一直等你走空）。
     pub fn wait_mail(&self, seen: u32, timeout: Duration) {
         self.0.sup().mail.wait(seen, timeout);
     }
 
-    /// 几个公开堆（都映射在本进程里）一起回收，收掉跨堆的环：持有方是组里某个堆的 [`crate::PublicRef`] 登记不当根，
+    /// 几个公开堆（都映射在本进程里）一起回收，收掉跨堆的环：持有方是组里某个堆的 [`crate::CrossHeapRef`] 登记不当根，
     /// 由追踪决定死活；标完后组内的跨堆登记换成这次追踪到的。同一个堆不能出现两次。
-    pub fn collect_group(heaps: &[&PublicHeap]) {
+    pub fn collect_group(heaps: &[&CrossHeap]) {
         // 已经死了的堆不参加：它持有的登记由各堆回收时按死活还掉
         let mut members: Vec<&Inner> = heaps.iter().map(|h| &*h.0).filter(|m| m.is_alive()).collect();
         members.sort_by_key(|m| m.index);
@@ -2167,9 +2167,9 @@ impl PublicHeap {
         self.0.incarnation()
     }
 
-    pub fn stats(&self) -> PublicStats {
+    pub fn stats(&self) -> CrossHeapStats {
         let sup = self.0.sup();
-        PublicStats {
+        CrossHeapStats {
             live: usize::try_from(sup.live.load(Ordering::Relaxed)).unwrap_or(usize::MAX),
             allocated: usize::try_from(sup.allocated.load(Ordering::Relaxed)).unwrap_or(usize::MAX),
             blocks: sup.blocks.load(Ordering::Relaxed) as usize,
@@ -2181,12 +2181,12 @@ impl PublicHeap {
 
 /// 只给本 crate 用的操作：trait 在私有模块里、不导出，crate 外拿不到。
 #[cfg(target_os = "linux")]
-pub trait PublicHeapInternal {
+pub trait CrossHeapInternal {
     fn is(&self, inner: &Arc<Inner>) -> bool;
 }
 
 #[cfg(target_os = "linux")]
-impl PublicHeapInternal for PublicHeap {
+impl CrossHeapInternal for CrossHeap {
     fn is(&self, inner: &Arc<Inner>) -> bool {
         Arc::ptr_eq(&self.0, inner)
     }
@@ -2255,7 +2255,7 @@ impl Drop for Gate<'_> {
 
 /// 一次公开堆 mutate 里的分配器与品牌；只在调用线程上用。
 #[cfg(target_os = "linux")]
-pub struct PublicMutator<'p> {
+pub struct CrossHeapMutator<'p> {
     heap: &'p Arc<Inner>,
     tlab: &'p Tlab,
     /// 上次完成的纪元（空行判定）
@@ -2266,10 +2266,10 @@ pub struct PublicMutator<'p> {
 }
 
 #[cfg(target_os = "linux")]
-impl<'p> PublicMutator<'p> {
+impl<'p> CrossHeapMutator<'p> {
 
     /// 分配一个对象。类型不能有析构（编译期检查）。
-    pub fn alloc<T: Shared>(&self, value: T) -> PublicGc<'p, T> {
+    pub fn alloc<T: Shared>(&self, value: T) -> CrossHeapGc<'p, T> {
         const {
             assert!(!core::mem::needs_drop::<T>(), "公开堆的对象不能有析构");
             assert!(align_of::<T>() <= GRANULE, "对象数据的对齐不能超过 8 字节");
@@ -2288,7 +2288,7 @@ impl<'p> PublicMutator<'p> {
             p.cast::<PHeader>().write(PHeader::new(bytes, large, ty, self.stamp));
             let data = PHeader::data(p.cast());
             data.cast::<T>().write(value);
-            PublicGc::from_data(data)
+            CrossHeapGc::from_data(data)
         };
         // 写完才登记（小对象的起点位、大对象的块种类）：进程死在中间，清扫也不会去读一个没写完的对象
         match run {
@@ -2299,15 +2299,15 @@ impl<'p> PublicMutator<'p> {
     }
 
     /// 给对象建一个句柄（入口）。
-    pub fn root<B: PublicBrand>(&self, gc: PublicGc<'p, B::Of<'p>>) -> Public<B> {
+    pub fn root<B: CrossHeapBrand>(&self, gc: CrossHeapGc<'p, B::Of<'p>>) -> CrossHeapRoot<B> {
         let entry = self.heap.claim_entry(gc.offset());
         // SAFETY: Gc 的数据指针非空
-        Public::new(self.heap.clone(), entry, unsafe { NonNull::new_unchecked(gc.as_ptr().cast_mut().cast()) })
+        CrossHeapRoot::new(self.heap.clone(), entry, unsafe { NonNull::new_unchecked(gc.as_ptr().cast_mut().cast()) })
     }
 
-    /// 凭入口号（[`Public::index`]，可能来自另一个映射或进程）拿到那个对象的新句柄。入口空着、
+    /// 凭入口号（[`CrossHeapRoot::index`]，可能来自另一个映射或进程）拿到那个对象的新句柄。入口空着、
     /// 或对象的类型（类型名 + 大小 + 指针图）和 `B` 对不上时返回 None。
-    pub fn find<B: PublicBrand>(&self, index: u32) -> Option<Public<B>> {
+    pub fn find<B: CrossHeapBrand>(&self, index: u32) -> Option<CrossHeapRoot<B>> {
         let sup = self.heap.sup();
         if index >= sup.entries.load(Ordering::Acquire) {
             return None;
@@ -2324,10 +2324,10 @@ impl<'p> PublicMutator<'p> {
             return None;
         }
         let entry = self.heap.claim_entry(off);
-        Some(Public::new(self.heap.clone(), entry, NonNull::new(data).expect("对象地址非空")))
+        Some(CrossHeapRoot::new(self.heap.clone(), entry, NonNull::new(data).expect("对象地址非空")))
     }
 
-    /// 还掉一个不归任何人的入口（[`Public::persist`] 留下的）；入口空着或还归某个进程 / 堆时不动，返回 false。
+    /// 还掉一个不归任何人的入口（[`CrossHeapRoot::persist`] 留下的）；入口空着或还归某个进程 / 堆时不动，返回 false。
     pub fn release(&self, index: u32) -> bool {
         let heap = self.heap;
         if index >= heap.sup().entries.load(Ordering::Acquire) {
@@ -2341,8 +2341,8 @@ impl<'p> PublicMutator<'p> {
         true
     }
 
-    /// 对象的签名：发给别的进程，对方打开本堆后凭它找到这个对象（[`PublicMutator::resolve`]）。签名不保活对象。
-    pub fn sign<T: Shared>(&self, gc: PublicGc<'p, T>) -> Signature {
+    /// 对象的签名：发给别的进程，对方打开本堆后凭它找到这个对象（[`CrossHeapMutator::resolve`]）。签名不保活对象。
+    pub fn sign<T: Shared>(&self, gc: CrossHeapGc<'p, T>) -> Signature {
         (WeakWord::from(gc), self.heap.incarnation(), self.heap.key_of(gc.as_ptr().cast())).into()
     }
 
@@ -2352,11 +2352,11 @@ impl<'p> PublicMutator<'p> {
     }
 
     /// 凭签名取对象：签名指着本堆里一个活对象、类型是 `B` 时给出它，否则 None（对象已经被回收、堆号换了主人、类型不对、伪造的）。
-    /// 取到的只在这次 mutate 里有效，要留着就挂到 [`Public`] 上或写进别的对象。
-    pub fn resolve<B: PublicBrand>(&self, sig: &Signature) -> Option<PublicGc<'p, B::Of<'p>>> {
+    /// 取到的只在这次 mutate 里有效，要留着就挂到 [`CrossHeapRoot`] 上或写进别的对象。
+    pub fn resolve<B: CrossHeapBrand>(&self, sig: &Signature) -> Option<CrossHeapGc<'p, B::Of<'p>>> {
         let data = self.find_signed(sig)?;
         // SAFETY: find_signed 认过本堆此刻一个活对象，在这次 mutate 里不会被回收
-        self.heap.is_type::<B::Of<'p>>(data).then(|| unsafe { PublicGc::from_data(data) })
+        self.heap.is_type::<B::Of<'p>>(data).then(|| unsafe { CrossHeapGc::from_data(data) })
     }
 
     fn find_signed(&self, sig: &Signature) -> Option<*mut u8> {
@@ -2367,9 +2367,9 @@ impl<'p> PublicMutator<'p> {
     }
 
     /// 把对象投进本堆的信箱，交给堆的主人处理（别的进程请主人代办）：领一个不归任何进程的入口指着它（投递方退出或被杀，
-    /// 信照样在），压进信箱，叫醒等信的主人。返回入口号。主人用 [`PublicMutator::take_mail`] 取，处理完用
-    /// [`PublicMutator::release`] 还掉入口。
-    pub fn post<T: Shared>(&self, gc: PublicGc<'p, T>) -> u32 {
+    /// 信照样在），压进信箱，叫醒等信的主人。返回入口号。主人用 [`CrossHeapMutator::take_mail`] 取，处理完用
+    /// [`CrossHeapMutator::release`] 还掉入口。
+    pub fn post<T: Shared>(&self, gc: CrossHeapGc<'p, T>) -> u32 {
         let i = self.heap.claim_entry_for(gc.offset(), 0, 0);
         let sup = self.heap.sup();
         Stack::on(&sup.mailbox).push(i, &self.heap.entry(i).next);
@@ -2378,7 +2378,7 @@ impl<'p> PublicMutator<'p> {
         i
     }
 
-    /// 取走信箱里全部的信（入口号，先投的在前）。用 [`PublicMutator::find`] 按类型拿到对象，处理完 [`PublicMutator::release`]。
+    /// 取走信箱里全部的信（入口号，先投的在前）。用 [`CrossHeapMutator::find`] 按类型拿到对象，处理完 [`CrossHeapMutator::release`]。
     pub fn take_mail(&self) -> Vec<u32> {
         Stack::on(&self.heap.sup().mailbox).take_all(|i| &self.heap.entry(i).next)
     }
@@ -2390,7 +2390,7 @@ impl<'p> PublicMutator<'p> {
 
 /// 只给本 crate 用的操作：trait 在私有模块里、不导出，crate 外拿不到。
 #[cfg(target_os = "linux")]
-pub trait PublicMutatorInternal {
+pub trait CrossHeapMutatorInternal {
     fn is(&self, inner: &Arc<Inner>) -> bool;
 
     /// 公开偏移在本进程里的地址。
@@ -2400,7 +2400,7 @@ pub trait PublicMutatorInternal {
     fn index(&self) -> usize;
 
     /// 给 `holder` 堆持有的引用在本堆登记一个入口。
-    fn register(&self, off: u64, holder: &PublicMutator<'_>);
+    fn register(&self, off: u64, holder: &CrossHeapMutator<'_>);
 
     /// 堆身份。
     fn incarnation(&self) -> u64;
@@ -2413,7 +2413,7 @@ pub trait PublicMutatorInternal {
 }
 
 #[cfg(target_os = "linux")]
-impl PublicMutatorInternal for PublicMutator<'_> {
+impl CrossHeapMutatorInternal for CrossHeapMutator<'_> {
     fn is(&self, inner: &Arc<Inner>) -> bool {
         Arc::ptr_eq(self.heap, inner)
     }
@@ -2426,7 +2426,7 @@ impl PublicMutatorInternal for PublicMutator<'_> {
         self.heap.index
     }
 
-    fn register(&self, off: u64, holder: &PublicMutator<'_>) {
+    fn register(&self, off: u64, holder: &CrossHeapMutator<'_>) {
         self.heap.claim_entry_for(off, holder.heap.holder_word(self.heap), holder.heap.incarnation());
     }
 

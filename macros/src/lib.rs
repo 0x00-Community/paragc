@@ -8,7 +8,7 @@ use quote::{format_ident, quote};
 use syn::{Data, DeriveInput, Fields, Ident, Type, parse_macro_input, parse_quote};
 
 /// `#[derive(Shared)]`：能放进公开堆的类型（共享内存上、可能被别的进程读和回收）。要求 `#[repr(C)]`（跨进程、跨二进制布局才一致），
-/// 只支持结构体；生成指针图（每个 `PublicSlot` 字段的偏移，嵌套类型与定长数组展开）。没有析构由 `PublicMutator::alloc` 在编译期检查。
+/// 只支持结构体；生成指针图（每个 `CrossHeapSlot` 字段的偏移，嵌套类型与定长数组展开）。没有析构由 `CrossHeapMutator::alloc` 在编译期检查。
 #[proc_macro_derive(Shared)]
 pub fn derive_shared(input: TokenStream) -> TokenStream {
     SharedDerive::from(parse_macro_input!(input as DeriveInput)).expand().unwrap_or_else(syn::Error::into_compile_error).into()

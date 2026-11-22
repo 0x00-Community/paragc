@@ -32,7 +32,7 @@
 | --- | --- | --- | --- |
 | `Slot<'gc, T>` | 任意堆 | 同一个堆 | 私有堆：绝对地址（现状）；公开堆：公开偏移 |
 | `Far<'a, B>` | 私有堆（品牌 `'a` = 持有方堆） | 同进程的另一个私有堆 | 目标堆根表 + 槽号 + 绝对地址（建好后不变） |
-| `Public<T>` | 私有堆或公开堆 | 某个公开堆 | 公开偏移（u64，高位即堆号） |
+| `CrossHeapRoot<T>` | 私有堆或公开堆 | 某个公开堆 | 公开偏移（u64，高位即堆号） |
 
 ## 3. 公开堆的地址与布局
 
@@ -65,9 +65,9 @@
 ## 4. 公开堆的对象
 
 - 头 16 B：`type: u32`（类型号；搬走后改存转发偏移）、`mark: u32`、`info: u32`、填充。不存函数指针。
-- `#[derive(Trace)]` 额外生成**指针图**（每个 `Slot` / `Public` 字段的偏移，数组按步长重复）；类型表放在超级块里：
+- `#[derive(Trace)]` 额外生成**指针图**（每个 `Slot` / `CrossHeapRoot` 字段的偏移，数组按步长重复）；类型表放在超级块里：
   `类型键（类型路径 + 布局哈希） → 类型号 + 指针图`。回收照指针图走，回收方不需要链接用户的类型。
-- 类型限制（`Shared` trait，derive 检查）：`#[repr(C)]`，字段只有纯数据、`Slot`、`Public`、堆内数组；不许 `Drop`。
+- 类型限制（`Shared` trait，derive 检查）：`#[repr(C)]`，字段只有纯数据、`Slot`、`CrossHeapRoot`、堆内数组；不许 `Drop`。
 
 ## 5. 回收：每个堆独立，入口表当根
 
@@ -110,9 +110,9 @@
 | 期 | 内容 | 验证 |
 | --- | --- | --- |
 | P0 ✅ | 私有堆之间：`Far<'a, B>`、入口表、入口对象不疏散、`Heap::collect_group` 收环 | `tests/far.rs` 6 条；压力 4 并发 × 100 轮全过；Miri |
-| P1 ✅ | 公开堆（先单进程）：类型表 + 指针图、16 B 头、公开地址区与偏移、元数据进映射区；`Public<B>` | `tests/public.rs` 7 条（含同一堆映射两次）；压力、Miri；`bench-paragc-public` 对比私有堆 |
+| P1 ✅ | 公开堆（先单进程）：类型表 + 指针图、16 B 头、公开地址区与偏移、元数据进映射区；`CrossHeapRoot<B>` | `tests/cross_heap.rs` 7 条（含同一堆映射两次）；压力、Miri；`bench-paragc-public` 对比私有堆 |
 | P2 ✅ | 多进程：挂接表、futex 握手、崩溃恢复（回收方被杀由别人接手） | `tests/processes.rs` 4 条（子进程是测试程序自己）；`kill -9` 打在 mutate 中、回收中、改链中 |
-| P3 ✅ | 公开堆之间的引用（`PublicRef`）与一起回收（`collect_group`）、堆号注册（目录里的标记文件）、热重启（`persist`） | `tests/public.rs` 跨堆 4 条、`tests/processes.rs` 重启与堆号 2 条 |
+| P3 ✅ | 公开堆之间的引用（`CrossHeapRef`）与一起回收（`collect_group`）、堆号注册（目录里的标记文件）、热重启（`persist`） | `tests/cross_heap.rs` 跨堆 4 条、`tests/processes.rs` 重启与堆号 2 条 |
 
 ## 9. P0 的实现
 
@@ -126,16 +126,16 @@
 
 ## 10. P1 的实现
 
-- 代码（11-17 平铺之后，公开堆的条目标 `cfg(target_os = "linux")`）：`shm.rs`（地址区与窗口映射、`PublicSpace`、堆号登记、进程死活）、
-  `layout.rs`（窗口内各段的固定偏移与表项、`PHeader`）、`heap.rs`（`PublicHeap`：分配、入口、类型登记、回收）、
-  `mark.rs`（`Marker`：按指针图并行标记，和私有堆共用工作窃取的 `Crew`）、`handle.rs`（`PublicGc` / `PublicSlot` / `PublicRef` / `Public`）。
+- 代码（11-17 平铺之后，公开堆的条目标 `cfg(target_os = "linux")`）：`shm.rs`（地址区与窗口映射、`CrossHeapSpace`、堆号登记、进程死活）、
+  `layout.rs`（窗口内各段的固定偏移与表项、`PHeader`）、`heap.rs`（`CrossHeap`：分配、入口、类型登记、回收）、
+  `mark.rs`（`Marker`：按指针图并行标记，和私有堆共用工作窃取的 `Crew`）、`handle.rs`（`CrossHeapGc` / `CrossHeapSlot` / `CrossHeapRef` / `CrossHeapRoot`）。
 - 地址区 64 个窗口 × 16 GiB（1 TiB 地址，按 1 TiB 对齐）；Miri 下 4 × 16 MiB 的普通分配。窗口内：超级块 | 类型表（1024 项）|
   指针图（64K 个偏移）| 入口表（窗口每 16 KiB 一项）| 块状态表 | 块区。各段第一次用到时 `fallocate`，超级块里记着每段延长到哪。
 - 头：两种堆共用 `Core`（标记字 + 信息字）放在最前面，私有堆的头是 `Core` + 追踪 / 析构函数（仍是 24 B），公开堆是 `Core` + 类型号（16 B）；
   块的清扫按 `Finalize` 区分（私有堆调析构，公开堆什么都不做）。
-- `Public::index` + `PublicMutator::find`：入口号在每个映射里一样，`find` 先核对类型键再领自己的入口——这是另一个映射 / 进程拿到对象的办法（P2 要用）。
+- `CrossHeapRoot::index` + `CrossHeapMutator::find`：入口号在每个映射里一样，`find` 先核对类型键再领自己的入口——这是另一个映射 / 进程拿到对象的办法（P2 要用）。
 - 和原设计不同 / 还没做：公开堆只有暂停式回收（没有并发标记、年轻回收、引用计数、疏散）；大对象总是从块游标开新的一串块，死了拆成普通块，
-  不复用成大块；建堆的句柄全部析构时删文件（P2 改成由主进程决定去留）；`PublicSlot` 是 8 字节，还没做私有堆那样的计数字。
+  不复用成大块；建堆的句柄全部析构时删文件（P2 改成由主进程决定去留）；`CrossHeapSlot` 是 8 字节，还没做私有堆那样的计数字。
 
 ## 11. P2 的实现
 
@@ -152,14 +152,14 @@
 
 ## 12. P3 的实现
 
-- `PublicRef<'a, B>`：品牌 `'a` 是持有方堆，存目标的公开偏移；写入时在目标堆登记入口，持有方 = `HEAP_HOLDER | 持有方堆号`
+- `CrossHeapRef<'a, B>`：品牌 `'a` 是持有方堆，存目标的公开偏移；写入时在目标堆登记入口，持有方 = `HEAP_HOLDER | 持有方堆号`
   （与挂接槽号区分）。目标堆单独回收时它是根；持有方堆单独回收不跟进。
 - `collect_group`：按堆号顺序拿每个堆的回收请求，全部走空才开始，否则全放开重来；组内堆持有的入口不当根，`Marker` 一次标几个堆
   （队列项高位带组内序号，跨窗口的边按目标堆的纪元标并报到 `found`）；标完先登记新的（每对来源堆 + 目标一项）、再还旧的。
 - 嵌套 mutate 死锁：回收方 50 ms 内等不到走空就放开请求重来（反向对照里不退让时 20 次卡死 6 次）。
 - 堆号：`create` 在堆文件旁 `O_EXCL` 建 `.paragc-<k>`，记建堆进程号 + 启动时间；过期（文件堆号不对、或文件不在且建堆进程已死）收回。
-- 重启：`PublicHeap::persist` 保留文件与标记；`Public::persist` 把入口持有方改成 0（不归任何进程，不被收拾、不被一起回收重建），
-  `PublicMutator::release` 只还持有方为 0 的入口。
+- 重启：`CrossHeap::persist` 保留文件与标记；`CrossHeapRoot::persist` 把入口持有方改成 0（不归任何进程，不被收拾、不被一起回收重建），
+  `CrossHeapMutator::release` 只还持有方为 0 的入口。
 - 和原设计不同 / 还没做：一起回收只能收本进程映射着的堆（没有主进程统一收）；单独回收不还跨堆的旧登记，改写频繁时要靠一起回收；
   一起回收时所有组内堆停住；主进程这一角色（只由它回收、回收租约）仍然没有。
 
@@ -167,11 +167,11 @@
 
 - 用户要求：2 GB 内存的机器上 8 个进程各持一个公开堆、一个私有堆，杀掉 4 个后它们的公开堆一起死，别的堆对它们的引用不崩。
 - 公开堆归建它的进程（超级块记主人进程号 + 启动时间）：主人退出或被杀、又没 persist，堆就死——发现的人标 dead、删文件与标记。
-  `PublicHeap::is_alive` / `try_mutate`（`HeapDead`）。
-- 堆身份（建堆时随机）：`PublicRef` 存目标身份，堆号被重用后读成 None、回收不跟；入口记持有方身份，持有方是同目录里已死的堆时，
+  `CrossHeap::is_alive` / `try_mutate`（`HeapDead`）。
+- 堆身份（建堆时随机）：`CrossHeapRef` 存目标身份，堆号被重用后读成 None、回收不跟；入口记持有方身份，持有方是同目录里已死的堆时，
   登记在下一次回收还掉。
 - 同目录领号放进标记文件的 `flock`（锁到后核对路径还是这个文件）：原来「看一眼再删」两步之间会被别人插进来，8 个进程同时建堆撞号。
-- 回收与 mutator 像有序加锁：一起回收按堆号逐个挡住、逐个等走空；`PublicHeap::mutate_with` 按堆号顺序进两个堆。
+- 回收与 mutator 像有序加锁：一起回收按堆号逐个挡住、逐个等走空；`CrossHeap::mutate_with` 按堆号顺序进两个堆。
   原来一起回收先挡住全部再等走空，8 个进程互相嵌套访问时会反复放开重来（一次 209 轮、38 秒），改后稳定 1.4–1.6 秒。
 - 源码平铺：没有 `src/public/`，同类合并成 `layout.rs`、`sync.rs`、`mark.rs`（私有与公开堆共用工作窃取的 `Crew`）、`sweep.rs`、
   `handle.rs`、`heap.rs`（两种堆共用分配缓冲 `Tlab`）、`shm.rs`（只在 Linux）；公开堆的条目逐个标 `cfg(target_os = "linux")`。

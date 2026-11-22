@@ -12,11 +12,11 @@ mod sync;
 
 pub use handle::{Brand, Far, Gc, Root, Slot, Weak, WordSlot, word_pointer, RAW_TAG, WORD_PAYLOAD, WORD_POINTER_MIN};
 #[cfg(target_os = "linux")]
-pub use handle::{EdgeMap, Public, PublicBrand, PublicGc, PublicRef, PublicSlot, CrossHeapWeak, SIGNATURE_BYTES, Shared, Signature};
+pub use handle::{EdgeMap, CrossHeapRoot, CrossHeapBrand, CrossHeapGc, CrossHeapRef, CrossHeapSlot, CrossHeapWeak, SIGNATURE_BYTES, Shared, Signature};
 pub use heap::{Heap, Mutator, Stats, Tlab, YoungEvacuation};
 #[cfg(target_os = "linux")]
-pub use heap::{HeapDead, PublicHeap, PublicMutator, PublicStats};
+pub use heap::{HeapDead, CrossHeap, CrossHeapMutator, CrossHeapStats};
 pub use mark::{Trace, Tracer};
 pub use paragc_macros::{Shared, Trace};
 #[cfg(target_os = "linux")]
-pub use shm::PublicSpace;
+pub use shm::CrossHeapSpace;

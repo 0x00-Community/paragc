@@ -882,7 +882,7 @@ pub struct Super {
     pub incarnation: AtomicU64,
     /// 主人（建堆进程）的进程号与启动时间（见 [`crate::shm::Process`]）：主人不在了、又没有 [`Super::persist`]，堆就死了
     pub owner_pid: AtomicU32,
-    /// 非 0：主人不在了堆也留着（[`crate::PublicHeap::persist`]）
+    /// 非 0：主人不在了堆也留着（[`crate::CrossHeap::persist`]）
     pub persist: AtomicU32,
     pub owner_start: AtomicU64,
     /// 非 0：堆已经死了（主人走了），文件已经或正在删除；还映射着它的进程只能放手

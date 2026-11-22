@@ -1,4 +1,4 @@
-//! 共享内存与进程（只在 Linux）：公开地址区与窗口映射 [`Region`]、[`PublicSpace`]、目录里的堆号登记 [`Registry`]、进程死活 [`Process`]。
+//! 共享内存与进程（只在 Linux）：公开地址区与窗口映射 [`Region`]、[`CrossHeapSpace`]、目录里的堆号登记 [`Registry`]、进程死活 [`Process`]。
 //!
 //! 公开地址区：每个进程保留一块同样大小、按自身大小对齐的地址，按堆号切成固定大小的窗口；公开堆 k 永远映射在第 k 个窗口。
 //!
@@ -15,7 +15,7 @@
 //! 领号、判过期、删标记都在标记文件的 `flock` 里做（锁到之后核对路径还是这个文件，没被别人删掉重建）：
 //! 「看一眼再删」这种两步不会和别人的领号交错。进程被杀时内核替它放锁。
 //!
-//! [`PublicSpace`]：本进程的公开地址区；在它上面建、打开公开堆。
+//! [`CrossHeapSpace`]：本进程的公开地址区；在它上面建、打开公开堆。
 #![cfg(target_os = "linux")]
 use core::mem::offset_of;
 use core::num::NonZeroUsize;
@@ -29,7 +29,7 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::heap::{Backing, Inner, PublicHeap};
+use crate::heap::{Backing, Inner, CrossHeap};
 use crate::layout::{MAGIC, Super};
 
 /// 一个窗口的大小（一个公开堆的全部地址）
@@ -474,9 +474,9 @@ impl Space {
 /// 本进程的公开地址区：保留一块地址（不占内存），按堆号切成窗口；公开堆 k 映射在第 k 个窗口，
 /// 所以公开堆里存的偏移在每个进程里都指向同一个对象。一个进程通常只要一个。
 #[derive(Clone)]
-pub struct PublicSpace(Arc<Space>);
+pub struct CrossHeapSpace(Arc<Space>);
 
-impl PublicSpace {
+impl CrossHeapSpace {
     pub fn reserve() -> io::Result<Self> {
         Ok(Self(Arc::new(Space { region: Region::reserve()?, used: AtomicU64::new(0) })))
     }
@@ -485,9 +485,9 @@ impl PublicSpace {
     /// 文件刚建时是空的，用到哪里延长到哪里；权限 0600，有文件权限的进程才能打开。
     ///
     /// 堆号在同一个目录里跨进程唯一：在 `.paragc-<堆号>` 标记文件的锁里领号（标记指着的堆已经死了时收回重用）。
-    /// 本进程是这个堆的主人：这个句柄（连同它建出的 [`crate::Public`]）全部析构、或本进程退出 / 被杀，堆就跟着死，
-    /// 除非调过 [`PublicHeap::persist`]。
-    pub fn create(&self, path: impl AsRef<Path>, threads: NonZeroUsize) -> io::Result<PublicHeap> {
+    /// 本进程是这个堆的主人：这个句柄（连同它建出的 [`crate::CrossHeapRoot`]）全部析构、或本进程退出 / 被杀，堆就跟着死，
+    /// 除非调过 [`CrossHeap::persist`]。
+    pub fn create(&self, path: impl AsRef<Path>, threads: NonZeroUsize) -> io::Result<CrossHeap> {
         use std::os::unix::fs::OpenOptionsExt;
         let path = path.as_ref();
         let k = self.claim_number(path)?;
@@ -532,24 +532,24 @@ impl PublicSpace {
     }
 
     /// 没有文件的公开堆（只在本进程里用；测试与 Miri 用它）。
-    pub fn create_anonymous(&self, threads: NonZeroUsize) -> io::Result<PublicHeap> {
+    pub fn create_anonymous(&self, threads: NonZeroUsize) -> io::Result<CrossHeap> {
         let k = self.0.claim_any().ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "公开地址区的窗口用完了"))?;
         self.attach(k, Backing::Anonymous, threads, true)
     }
 
     /// 打开别人（或本进程另一个地址区）建的公开堆，映射到它的堆号对应的窗口。
-    pub fn open(&self, path: impl AsRef<Path>, threads: NonZeroUsize) -> io::Result<PublicHeap> {
+    pub fn open(&self, path: impl AsRef<Path>, threads: NonZeroUsize) -> io::Result<CrossHeap> {
         let path = path.as_ref();
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         self.open_file(file, Some(path), threads)
     }
 
-    /// 凭文件描述符打开公开堆（别的进程经 `SCM_RIGHTS` 交来的 [`PublicHeap::fd`]），不需要能访问堆文件的路径。
-    pub fn open_fd(&self, fd: std::os::fd::OwnedFd, threads: NonZeroUsize) -> io::Result<PublicHeap> {
+    /// 凭文件描述符打开公开堆（别的进程经 `SCM_RIGHTS` 交来的 [`CrossHeap::fd`]），不需要能访问堆文件的路径。
+    pub fn open_fd(&self, fd: std::os::fd::OwnedFd, threads: NonZeroUsize) -> io::Result<CrossHeap> {
         self.open_file(File::from(fd), None, threads)
     }
 
-    fn open_file(&self, file: File, path: Option<&Path>, threads: NonZeroUsize) -> io::Result<PublicHeap> {
+    fn open_file(&self, file: File, path: Option<&Path>, threads: NonZeroUsize) -> io::Result<CrossHeap> {
         let header = FileHeader::read(&file)?;
         if header.is_dead() {
             if let Some(path) = path {
@@ -565,7 +565,7 @@ impl PublicSpace {
     }
 
     /// 把窗口 `k` 映射上 `backing`，`fresh` 时写新的超级块。失败时还掉窗口。
-    fn attach(&self, k: usize, backing: Backing, threads: NonZeroUsize, fresh: bool) -> io::Result<PublicHeap> {
+    fn attach(&self, k: usize, backing: Backing, threads: NonZeroUsize, fresh: bool) -> io::Result<CrossHeap> {
         // SAFETY: 窗口 k 刚被占下，没人用
         let mapped = unsafe {
             match &backing {
@@ -577,6 +577,6 @@ impl PublicSpace {
             self.0.release(k);
             return Err(e);
         }
-        Inner::new(self.0.clone(), k, backing, threads, fresh).map(PublicHeap::from)
+        Inner::new(self.0.clone(), k, backing, threads, fresh).map(CrossHeap::from)
     }
 }

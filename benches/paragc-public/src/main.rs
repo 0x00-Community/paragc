@@ -4,17 +4,17 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use bench_common::{Args, Bench, Clock, GcBench, LONG_LIVED_DEPTH, PAUSE_DEPTH, STRETCH_DEPTH, Took, Tree};
-use paragc::{Public, PublicGc, PublicHeap, PublicMutator, PublicSlot, PublicSpace, Shared, public_brand};
+use paragc::{CrossHeapRoot, CrossHeapGc, CrossHeap, CrossHeapMutator, CrossHeapSlot, CrossHeapSpace, Shared, cross_heap_brand};
 
 #[repr(C)]
 #[derive(Shared)]
 struct Node<'p> {
-    left: PublicSlot<'p, Node<'p>>,
-    right: PublicSlot<'p, Node<'p>>,
+    left: CrossHeapSlot<'p, Node<'p>>,
+    right: CrossHeapSlot<'p, Node<'p>>,
     value: u64,
 }
 
-public_brand!(NodeB = for<'p> Node<'p>);
+cross_heap_brand!(NodeB = for<'p> Node<'p>);
 
 /// 回收触发的下限与倍数（同私有堆）：新领用的超过「上次存活 × GROWTH」且不少于 MIN_TRIGGER 就回收
 const MIN_TRIGGER: usize = 4 * 1024 * 1024;
@@ -22,25 +22,25 @@ const GROWTH: usize = 2;
 
 struct ParagcPublic {
     threads: NonZeroUsize,
-    space: PublicSpace,
+    space: CrossHeapSpace,
 }
 
 impl ParagcPublic {
-    fn heap(&self) -> PublicHeap {
+    fn heap(&self) -> CrossHeap {
         let path = PathBuf::from(format!("/dev/shm/paragc-bench-{}", std::process::id()));
         self.space.create(path, self.threads).expect("建公开堆")
     }
 
-    fn tree<'p>(m: &PublicMutator<'p>, depth: u32) -> PublicGc<'p, Node<'p>> {
+    fn tree<'p>(m: &CrossHeapMutator<'p>, depth: u32) -> CrossHeapGc<'p, Node<'p>> {
         let (left, right) = if depth > 1 { (Some(Self::tree(m, depth - 1)), Some(Self::tree(m, depth - 1))) } else { (None, None) };
         m.alloc(Node { left: left.into(), right: right.into(), value: depth.into() })
     }
 
-    fn rooted(heap: &PublicHeap, depth: u32) -> Public<NodeB> {
+    fn rooted(heap: &CrossHeap, depth: u32) -> CrossHeapRoot<NodeB> {
         heap.mutate(|m| m.root(Self::tree(m, depth)))
     }
 
-    fn count(heap: &PublicHeap, root: &Public<NodeB>) -> usize {
+    fn count(heap: &CrossHeap, root: &CrossHeapRoot<NodeB>) -> usize {
         heap.mutate(|m| {
             let mut stack = vec![root.get(m)];
             let mut n = 0;
@@ -53,7 +53,7 @@ impl ParagcPublic {
         })
     }
 
-    fn collect_if_needed(heap: &PublicHeap) {
+    fn collect_if_needed(heap: &CrossHeap) {
         let s = heap.stats();
         if s.allocated >= s.live.max(MIN_TRIGGER) * GROWTH {
             heap.collect();
@@ -101,5 +101,5 @@ impl Bench for ParagcPublic {
 
 fn main() {
     let args = Args::parse();
-    args.report(&ParagcPublic { threads: args.threads, space: PublicSpace::reserve().expect("保留公开地址区") });
+    args.report(&ParagcPublic { threads: args.threads, space: CrossHeapSpace::reserve().expect("保留公开地址区") });
 }

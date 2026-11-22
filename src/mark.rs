@@ -17,7 +17,7 @@
 //! 公开堆的并行标记：照类型表里的指针图找边，不调用对象的代码（回收方不需要认识这些类型）。
 //! 工作窃取与结束判定同私有堆（[`crate::mark`]）：每个工人一个双端队列，空了成批偷，全部空闲即结束。
 //!
-//! 可以几个堆一起标（[`super::PublicHeap::collect_group`]）：队列里每一项是「组里第几个堆 + 对象头地址」，
+//! 可以几个堆一起标（[`super::CrossHeap::collect_group`]）：队列里每一项是「组里第几个堆 + 对象头地址」，
 //! 指向组里别的堆的边交给那个堆（按它的纪元标），并报到 `found` 里（之后重建跨堆登记）；指向组外的不跟。
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
@@ -817,7 +817,7 @@ impl<'h> Marker<'h> {
             }
             let Some(t) = Inner::heap_of(v).and_then(|k| self.by_heap[k]) else { continue };
             // 指向的那个堆已经死了、号被组里这个新堆用上：不是它的对象，不跟
-            // SAFETY: 跨堆的槽是 PublicRef（repr(C)：偏移后面紧跟目标堆身份，也是一个 AtomicU64）
+            // SAFETY: 跨堆的槽是 CrossHeapRef（repr(C)：偏移后面紧跟目标堆身份，也是一个 AtomicU64）
             if far && unsafe { &*data.add(off + size_of::<AtomicU64>()).cast::<AtomicU64>() }.load(Ordering::Acquire) != self.members[t].heap.incarnation() {
                 continue;
             }
