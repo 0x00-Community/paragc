@@ -795,7 +795,16 @@ impl<'g> Marking<'g> {
                 // SAFETY: the slot lives in the old object written to and is not freed before this collection (see Mutator::written); no mutator writes it during the pause
                 let slot = unsafe { &*core::ptr::with_exposed_provenance::<RawSlot>(slot) };
                 if let Some(old) = slot.current() {
+                    // A remembered slot inside a cross-heap object must end up pointing into the cross-heap
+                    #[cfg(crossheap)]
+                    {
+                        t.in_shared = Region::holds_fixed((&raw const *slot).addr());
+                    }
                     let new = t.forward(old, false);
+                    #[cfg(crossheap)]
+                    {
+                        t.in_shared = false;
+                    }
                     if !core::ptr::eq(old, new) {
                         slot.relocate(new);
                     }

@@ -799,9 +799,7 @@ fn in_fixed(addr: usize) -> bool {
 #[cfg_attr(miri, ignore = "Miri has no fixed-address region")]
 fn promotion_into_attached_cross_heap() {
     young_survivors_promote_into_attached_cross_heap();
-    let panic = std::panic::catch_unwind(private_values_cannot_be_written_into_cross_heap_objects).expect_err("writing a private object into a cross-heap object must panic");
-    let message = panic.downcast_ref::<&str>().map(ToString::to_string).or_else(|| panic.downcast_ref::<String>().cloned()).unwrap_or_default();
-    assert!(message.contains("private heap objects cannot be written into cross-heap objects"), "unexpected panic: {message}");
+    private_writes_into_cross_heap_objects_wait_for_the_next_young_collection();
 }
 
 fn young_survivors_promote_into_attached_cross_heap() {
@@ -849,15 +847,37 @@ fn young_survivors_promote_into_attached_cross_heap() {
     assert_eq!(cross.stats().live, 0);
 }
 
-fn private_values_cannot_be_written_into_cross_heap_objects() {
+fn private_writes_into_cross_heap_objects_wait_for_the_next_young_collection() {
     let space = CrossHeapSpace::reserve_fixed().unwrap();
     let cross = space.create_anonymous(THREADS).unwrap();
     let mut heap = Heap::new(THREADS);
     heap.attach_cross_heap(&cross).unwrap();
     let root = heap.mutate(|m| m.root::<SNodeB>(m.alloc_shared(SNode { value: 1, next: None.into() })));
     heap.collect_young();
+    assert!(!heap.promotion_pending());
     heap.mutate(|m| {
         let fresh = m.alloc_shared(SNode { value: 2, next: None.into() });
         m.get(&root).next.set(m, Some(fresh));
     });
+    assert!(heap.promotion_pending(), "a private object was written into a cross-heap object");
+    heap.mutate(|m| {
+        let next = m.get(&root).next.get().expect("just written");
+        assert_eq!(next.value, 2, "the owner reads the private object as usual");
+        assert!(!in_fixed(next.as_ptr().addr()), "still private until the next young collection");
+        assert!(cross.mutate(|cm| cm.adopt::<SNodeX, _>(next).is_none()), "other processes cannot see it yet");
+    });
+    heap.collect_young();
+    assert!(!heap.promotion_pending());
+    heap.mutate(|m| {
+        let next = m.get(&root).next.get().expect("still there");
+        assert_eq!(next.value, 2);
+        assert!(in_fixed(next.as_ptr().addr()), "the young collection promoted it and rewrote the cross-heap slot");
+        assert!(cross.mutate(|cm| cm.adopt::<SNodeX, _>(next).is_some()));
+    });
+    let node_bytes = (HEADER + size_of::<SNode<'static>>()).next_multiple_of(8);
+    heap.collect();
+    assert_eq!(cross.stats().live, 2 * node_bytes);
+    drop(root);
+    heap.collect();
+    assert_eq!(cross.stats().live, 0);
 }

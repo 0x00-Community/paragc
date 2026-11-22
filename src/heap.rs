@@ -121,6 +121,9 @@ pub struct Heap {
     /// The cross-heap used as the old generation ([`Heap::attach_cross_heap`])
     #[cfg(crossheap)]
     cross: Option<CrossHeap>,
+    /// A private object was written into a cross-heap object since the last young collection
+    #[cfg(crossheap)]
+    promotion_pending: AtomicBool,
 }
 
 /// Whether young collections move surviving young objects into compact blocks ([`Heap::set_young_evacuation`]).
@@ -212,7 +215,16 @@ impl Heap {
             spare: AtomicPtr::new(null_mut()),
             #[cfg(crossheap)]
             cross: None,
+            #[cfg(crossheap)]
+            promotion_pending: AtomicBool::new(false),
         }
+    }
+
+    /// A private object was written into a cross-heap object since the last young collection: it is visible to other processes only after the next
+    /// young collection promotes it (call [`Heap::collect_young`] when a turn ends).
+    #[cfg(crossheap)]
+    pub fn promotion_pending(&self) -> bool {
+        self.promotion_pending.load(Ordering::Acquire)
     }
 
     /// Attach a cross-heap created by this process as the old generation: from then on, every young collection moves surviving shareable young objects (allocated with [`Mutator::alloc_shared`])
@@ -569,6 +581,8 @@ impl Heap {
         #[cfg(crossheap)]
         let _inside = cross.as_deref().map(Gate::enter);
         let remembered = Self::drain(&self.remembered);
+        #[cfg(crossheap)]
+        self.promotion_pending.store(false, Ordering::Release);
         let counting = *self.rc_valid.get_mut();
         let parity = *self.rc_parity.get_mut();
         let pool = self.pool.get_or_init(|| Pool::new(self.threads));
@@ -1181,10 +1195,15 @@ impl<'gc> MutatorInternal<'gc> for Mutator<'gc> {
 
     fn written(&self, slot: &RawSlot, old: Option<*const Header>, new: Option<*const Header>) {
         let addr = (&raw const *slot).expose_provenance();
-        // A slot inside a cross-heap object: the private heap does not record it (no counting, no remembered set); what is written must also live in the cross-heap (private objects must be promoted first)
+        // A slot inside a cross-heap object: no counting. A private object written into it stays a private address (other processes read it as empty) until the next young collection
+        // promotes it and rewrites the slot through the remembered set
         #[cfg(crossheap)]
         if Region::holds_fixed(addr) {
-            assert!(new.is_none(), "private heap objects cannot be written into cross-heap objects: run a young collection to promote them first");
+            if new.is_some() {
+                assert!(self.heap.cross.is_some(), "writing a private object into a cross-heap object needs a cross-heap attached (Heap::attach_cross_heap)");
+                self.heap.remembered.push(addr);
+                self.heap.promotion_pending.store(true, Ordering::Release);
+            }
             return;
         }
         if let Some(epoch) = self.marking {
