@@ -1,24 +1,24 @@
-//! 标记与追踪：[`Trace`] / [`Tracer`]、工作窃取的标记工人 [`Crew`]、私有堆的标记 [`Marking`] 与疏散复制 [`Copier`]、公开堆按指针图的标记 [`Marker`]。
+//! Marking and tracing: [`Trace`] / [`Tracer`], the work-stealing marking workers [`Crew`], private-heap marking [`Marking`] and evacuation copying [`Copier`], and public-heap marking by pointer map [`Marker`].
 //!
-//! [`Trace`]：对象告诉回收器自己引用了谁；[`Tracer`]：回收器那一侧，标记并把新对象交给工作队列。
+//! [`Trace`]: an object tells the collector what it references; [`Tracer`]: the collector's side, marking and handing new objects to the work queue.
 //!
-//! 并行标记：每个工人一个 crossbeam 双端队列（自己 LIFO 弹），根与写屏障记下的旧值放堆的公共灰队列；
-//! 自己的空了就成批偷（`steal_batch_and_pop`，一次搬走别人队列的一半）。
+//! Parallel marking: each worker has a crossbeam deque (popping its own LIFO); roots and old values recorded by the write barrier go to the heap's shared grey queue;
+//! when its own queue is empty a worker steals in batches (`steal_batch_and_pop`, taking half of another queue at once).
 //!
-//! 并发标记时 mutator 还在跑，写屏障会继续往灰队列里放东西：这一轮全部空闲就先停，剩下的由结束回收（独占堆）时再跑一轮清空。
+//! During concurrent marking mutators keep running and the write barrier keeps adding to the grey queue: when everyone is idle this round stops, and the rest is drained in one more round when the collection finishes (with the heap held exclusively).
 //!
-//! 结束判定：自己的队列空、也偷不到时把空闲计数加一，然后边退避边偷；空闲计数等于工人数时
-//! 所有队列都空、也没人还在追踪（追踪中的工人没计入空闲），标记结束。偷到了就先减一再干活；
-//! 偷到还没来得及减一时别人可能先看到「全空闲」退出，但手里的活仍由偷到的人做完，结果不受影响。
+//! Termination: a worker whose own queue is empty and that cannot steal increments the idle count, then keeps stealing with backoff; when the idle count equals the number of workers,
+//! all queues are empty and nobody is still tracing (tracing workers are not counted idle), so marking is done. A worker that steals something decrements first and then works;
+//! if someone sees "all idle" and exits before the decrement, the stolen work is still finished by the thief, so the result is unaffected.
 //!
-//! 疏散时每个回收线程一个复制缓冲：在目标块的空洞里碰撞分配，把被搬的对象整个抄过去，
-//! 新副本标成本轮（含行标记与起点位）。目标块先从「可搬入」队列领（清扫后没再用过的非候选块），没有就开新块。
+//! During evacuation each collector thread has a copy buffer: it bump-allocates in the holes of target blocks and copies each moved object whole;
+//! the new copy is marked with this round (including line marks and start bits). Target blocks come first from the "can move into" queue (non-candidate blocks unused since sweeping), otherwise new blocks are opened.
 //!
-//! 公开堆的并行标记：照类型表里的指针图找边，不调用对象的代码（回收方不需要认识这些类型）。
-//! 工作窃取与结束判定同私有堆（[`crate::mark`]）：每个工人一个双端队列，空了成批偷，全部空闲即结束。
+//! Parallel marking of public heaps: edges are found through the pointer maps in the type table, without calling object code (the collector need not know these types).
+//! Work stealing and termination are as for the private heap ([`crate::mark`]): one deque per worker, batch stealing when empty, done when all are idle.
 //!
-//! 可以几个堆一起标（[`super::CrossHeap::collect_group`]）：队列里每一项是「组里第几个堆 + 对象头地址」，
-//! 指向组里别的堆的边交给那个堆（按它的纪元标），并报到 `found` 里（之后重建跨堆登记）；指向组外的不跟。
+//! Several heaps can be marked together ([`super::CrossHeap::collect_group`]): each queue item is "index of the heap in the group + object header address";
+//! edges into another heap of the group go to that heap (marked with its epoch) and are reported to `found` (to rebuild cross-heap registrations later); edges leaving the group are not followed.
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::num::{NonZeroI16, NonZeroI32, NonZeroI64, NonZeroI8, NonZeroIsize, NonZeroU16, NonZeroU32, NonZeroU64, NonZeroU8, NonZeroUsize};
@@ -46,63 +46,63 @@ use crate::layout::PHeader;
 use crate::shm::WINDOWS;
 use crate::sync::{Pool, SegVec};
 
-/// 能放进堆的类型。用 `#[derive(Trace)]` 生成，别手写。
+/// A type that can live in the heap. Generate it with `#[derive(Trace)]`; do not write it by hand.
 ///
-/// - `Send + Sync`：对象可能在任何线程上被读、被回收线程追踪和析构
-/// - 有 `Gc` 字段的类型不许实现 `Drop`（析构的先后不定，`Drop` 里可能碰到已经析构的对象）；derive 会检查
+/// - `Send + Sync`: objects may be read on any thread and traced and finalized by collector threads
+/// - types with `Gc` fields must not implement `Drop` (finalization order is unspecified, so `Drop` could touch an already finalized object); the derive checks this
 ///
 /// # Safety
-/// `trace` 必须对每个直接持有的 `Gc` / `Slot` 调一次 [`Tracer::edge`]（或对字段调 `trace`），漏了就是悬垂指针；
-/// `relocate` 同样对每条边调一次 [`Tracer::relocate`]（或对字段调 `relocate`），回收器会把搬走的对象改成新地址。
-/// `NO_EDGES` 只能在类型里确实没有 `Gc` 时为 true。
+/// `trace` must call [`Tracer::edge`] once for every directly held `Gc` / `Slot` (or call `trace` on the field); a missed one is a dangling pointer;
+/// `relocate` likewise calls [`Tracer::relocate`] once per edge (or `relocate` on the field), and the collector rewrites moved objects to their new address.
+/// `NO_EDGES` may be true only when the type really holds no `Gc`.
 pub unsafe trait Trace: Send + Sync {
-    /// 类型里没有任何 `Gc`：回收器标记后不必再追踪它
+    /// The type holds no `Gc`: the collector need not trace it after marking
     const NO_EDGES: bool = false;
 
     fn trace(&self, t: &mut Tracer<'_>);
 
-    /// 疏散回收（独占堆，没有 mutator）时代替 `trace`：可以改写边。没有边的类型用缺省实现。
+    /// Replaces `trace` during evacuating collections (heap held exclusively, no mutators): may rewrite edges. Types without edges use the default.
     fn relocate(&mut self, t: &mut Tracer<'_>) {
         let _ = t;
-        assert!(Self::NO_EDGES, "有 Gc 的类型必须实现 Trace::relocate（用 #[derive(Trace)]）");
+        assert!(Self::NO_EDGES, "types holding Gc must implement Trace::relocate (use #[derive(Trace)])");
     }
 }
 
-/// 标记阶段的一个工人：标记对象、标记它跨的行，把需要追踪的对象压进自己的工作队列；
-/// 疏散回收时还把候选块里的对象搬走，并把边改成新地址。
+/// A marking worker: marks objects and the lines they span, and pushes objects that need tracing onto its own work queue;
+/// during evacuation it also moves objects out of candidate blocks and rewrites edges to the new address.
 pub struct Tracer<'t> {
     work: &'t Worker<usize>,
     epoch: u32,
-    /// 疏散回收时的复制缓冲（有它 = 重定位模式）
+    /// Copy buffer during evacuation (present = relocating mode)
     copier: Option<&'t mut Copier>,
-    /// 计数模式（晋升 / 重新计数）：扫描到的每条边给目标 +1，值是当前计数的奇偶
+    /// Counting mode (promotion / recount): each scanned edge increments its target; the value is the parity of the current count
     count: Option<bool>,
-    /// 释放模式（引用计数减到 0 的对象）：每条边的目标交给它 −1，不标记
+    /// Release mode (objects whose count dropped to 0): the target of each edge is handed over for a decrement, no marking
     decs: Option<&'t mut Vec<usize>>,
-    /// 只有这一个线程在改计数（单线程标记）：+1 用普通读写
+    /// Only this thread changes counts (single-threaded marking): increment with plain reads and writes
     exclusive: bool,
-    /// 并发标记时的引用计数登记：重新计数的槽在读与改之间被 mutator 改写了，由这里补登记（见 [`Tracer::slot`]）
+    /// Count logging during concurrent marking: slots rewritten by a mutator between the read and the update of a recount are logged again here (see [`Tracer::slot`])
     log: Option<&'t Injector<usize>>,
-    /// 一起回收几个堆（[`crate::Heap::collect_group`]）：追踪到的 Far 把（目标堆的根表, 目标对象的头）报到这里
+    /// Collecting several heaps together ([`crate::Heap::collect_group`]): traced Fars report (target heap's root table, target header) here
     group: Option<&'t Injector<(usize, usize)>>,
-    /// 年轻回收把可共享的年轻对象晋升进跨堆（挂着跨堆的私有堆）
+    /// Young collections promote shareable young objects into the cross-heap (private heaps with a cross-heap attached)
     #[cfg(crossheap)]
     promoter: Option<&'t Promoter<'t>>,
-    /// 正在问对象的类型可不可以共享：可以的回答它在跨堆里的类型号（见 [`Header::new_shared`]）
+    /// Asking whether an object's type is shareable: shareable types answer with their type number in the cross-heap (see [`Header::new_shared`])
     #[cfg(crossheap)]
     asking: bool,
-    /// 问到的答案
+    /// The answer received
     #[cfg(crossheap)]
     answer: Option<u32>,
-    /// 正在重定位一个晋升过去的对象：它的边不许留在私有堆
+    /// Relocating an object promoted into the cross-heap: its edges must not stay in the private heap
     #[cfg(crossheap)]
     in_shared: bool,
-    /// 主人一起回收跨堆：追踪到的、指着跨堆对象的边（数据地址）报到这里，当跨堆的根
+    /// The owner collecting its cross-heap: traced edges into cross-heap objects (data addresses) are reported here as cross-heap roots
     #[cfg(crossheap)]
     crossing: Option<&'t Injector<usize>>,
 }
 
-/// 晋升过去的对象在工作队列里的标记（头按粒度对齐，最低位空着）：项是旧头，要重定位的是它搬到跨堆的那份
+/// Marks a promoted object in the work queue (headers are granule aligned, so the lowest bit is free): the item is the old header, and the copy in the cross-heap is what gets relocated
 #[cfg(crossheap)]
 const PROMOTED_ITEM: usize = 1;
 
@@ -114,7 +114,7 @@ impl Tracer<'_> {
             return;
         }
         if let Some(parity) = self.count {
-            // SAFETY: header 是活对象
+            // SAFETY: header is a live object
             let h = unsafe { &*header };
             if self.exclusive {
                 h.rc_inc_exclusive(parity);
@@ -124,7 +124,7 @@ impl Tracer<'_> {
         }
     }
 
-    /// 一条边（只读：并发标记、不疏散的回收）。
+    /// An edge (read only: concurrent marking, non-evacuating collections).
     pub fn edge<T: Trace>(&mut self, gc: Gc<'_, T>) {
         if let Some(decs) = self.decs.as_deref_mut() {
             #[cfg(crossheap)]
@@ -138,27 +138,27 @@ impl Tracer<'_> {
         self.inc(gc.header());
     }
 
-    /// 一条可改写的边（疏散回收）：对象被搬走了就改成新地址。
+    /// A rewritable edge (evacuating collections): rewritten to the new address if the object moved.
     pub fn relocate<T: Trace>(&mut self, gc: &mut Gc<'_, T>) {
         *gc = self.forward_gc(*gc);
         self.inc(gc.header());
     }
 
-    /// 标记（必要时搬走）并返回对象现在的位置；不计数。
+    /// Mark (moving if needed) and return the object's current location; no counting.
     fn forward_gc<'gc, T: Trace>(&mut self, gc: Gc<'gc, T>) -> Gc<'gc, T> {
         let old = gc.header();
         let new = self.forward(old, T::NO_EDGES);
-        // SAFETY: new 是同一个对象（或搬过去的新头），品牌与类型不变
+        // SAFETY: new is the same object (or its moved header), with the same brand and type
         if core::ptr::eq(old, new) { gc } else { unsafe { Gc::from_data(Header::data(new).cast()) } }
     }
 
-    /// 回收器在问类型可不可以共享（[`Header::new_shared`] 的类型回答，别的不回答）。
+    /// The collector is asking whether the type is shareable (types from [`Header::new_shared`] answer, others do not).
     #[cfg(crossheap)]
     pub fn asking(&self) -> bool {
         self.asking
     }
 
-    /// 回答：类型是 `T`（可共享）。
+    /// Answer: the type is `T` (shareable).
     #[cfg(crossheap)]
     pub fn answer<T: crate::Shared>(&mut self) {
         self.answer = self.promoter.map(Promoter::type_of::<T>);
@@ -168,7 +168,7 @@ impl Tracer<'_> {
 
 #[cfg(crossheap)]
 impl Tracer<'_> {
-    /// 碰到一个跨堆的对象（`header` 是按私有堆的头算的位置，只用来认地址）：私有堆不碰它；主人一起回收时报上去当根。
+    /// Met a cross-heap object (`header` is computed as for a private header and used only to recognize the address): the private heap leaves it alone; when the owner collects both it is reported as a root.
     fn crossed(&self, header: *const Header) -> bool {
         if !Region::holds_fixed(header.addr()) {
             return false;
@@ -179,19 +179,19 @@ impl Tracer<'_> {
         true
     }
 
-    /// 对象的类型可以共享时，它在跨堆里的类型号。
+    /// The object's type number in the cross-heap when its type is shareable.
     fn shareable(&mut self, header: *const Header) -> Option<u32> {
         self.asking = true;
-        // SAFETY: header 是活对象；问类型时 visit 不碰数据
+        // SAFETY: header is a live object; visit does not touch the data when asked for the type
         unsafe { Header::visit(header, self) };
         self.asking = false;
         self.answer.take()
     }
 
-    /// 年轻回收里的可共享年轻对象：晋升进跨堆，返回新位置（按私有堆的头算，见 [`Promoter::copy`]）。
+    /// A shareable young object in a young collection: promote it into the cross-heap and return its new location (computed as a private header, see [`Promoter::copy`]).
     fn promote(&mut self, header: *const Header, no_edges: bool) -> Option<*const Header> {
         let p = self.promoter?;
-        // SAFETY: header 是活对象
+        // SAFETY: header is a live object
         let h = unsafe { &*header };
         if h.is_marked(self.epoch) || !(h.is_large() || Block::containing(header.cast()).is_evacuating()) {
             return None;
@@ -200,9 +200,9 @@ impl Tracer<'_> {
         Some(match h.claim() {
             Claim::Moved(to) => to,
             Claim::Mine => {
-                // SAFETY: 本线程认领了它；类型号是它自己回答的
+                // SAFETY: this thread claimed it; the type number is its own answer
                 let to = Header::of(unsafe { p.copy(header, ty) });
-                // SAFETY: 同上
+                // SAFETY: as above
                 unsafe { Header::forward(header, to) };
                 if !no_edges {
                     self.work.push(header.expose_provenance() | PROMOTED_ITEM);
@@ -213,48 +213,48 @@ impl Tracer<'_> {
     }
 }
 
-/// 只给本 crate 用的操作：trait 在私有模块里、不导出，crate 外拿不到。
+/// Operations for this crate only: the trait lives in a private module and is not exported, so it is unreachable outside the crate.
 pub trait TracerInternal<'t> {
     fn new(work: &'t Worker<usize>, epoch: u32, copier: Option<&'t mut Copier>) -> Self;
 
-    /// 计数模式：扫描时每条边给目标 +1（种子——根与记忆集——直接走 visit，不计）。
-    /// `exclusive`：只有这一个线程在改计数。
+    /// Counting mode: every edge scanned increments its target (seeds — roots and the remembered set — go straight through visit, uncounted).
+    /// `exclusive`: only this thread changes counts.
     fn counting(self, parity: Option<bool>, exclusive: bool) -> Self;
 
-    /// 释放模式：访问一个死对象时把它每条边的目标（槽取上次计入的值）放进 `decs`。
+    /// Release mode: when visiting a dead object, put the target of each edge (for slots, the last counted value) into `decs`.
     fn releasing(work: &'t Worker<usize>, decs: &'t mut Vec<usize>) -> Self;
 
-    /// 并发标记：给登记队列（见 [`Tracer::log`]）。
+    /// Concurrent marking: the count logging queue (see [`Tracer::log`]).
     fn logging(self, log: Option<&'t Injector<usize>>) -> Self;
 
-    /// 一起回收：给报告 Far 目标的队列。
+    /// Group collection: the queue that receives Far targets.
     fn grouping(self, group: Option<&'t Injector<(usize, usize)>>) -> Self;
 
-    /// 追踪到一个 [`crate::Far`]：一起回收时报上去（由目标堆接着标），平时什么都不做（目标堆的入口就是根）。
+    /// Traced a [`crate::Far`]: reported in a group collection (the target heap continues marking); otherwise nothing (the target heap's entry is a root).
     fn far(&mut self, table: usize, header: *const Header);
 
-    /// 重定位模式（疏散回收）：取出来的对象走 `relocate` 而不是 `trace`。
+    /// Relocating mode (evacuating collections): objects taken from the queue go through `relocate` instead of `trace`.
     fn relocating(&self) -> bool;
 
-    /// 一个槽（只读）：平时等于一条边；计数模式下改成计入当前值并 +1；释放模式下把上次计入的值交出去 −1。
+    /// A slot (read only): normally just an edge; in counting mode it switches to counting the current value and increments it; in release mode it hands over the last counted value for a decrement.
     fn slot<T: Trace>(&mut self, slot: &Slot<'_, T>);
 
-    /// 一个可改写的槽（疏散回收）：搬走了就改成新地址；计数模式下计入新值并 +1。
+    /// A rewritable slot (evacuating collections): rewritten to the new address if moved; in counting mode counts the new value and increments it.
     fn slot_mut<T: Trace>(&mut self, slot: &mut Slot<'_, T>);
 
-    /// 抹掉类型的槽（[`Slot`]、[`crate::WordSlot`]），只读；`no_edges`：目标没有边
+    /// A type-erased slot ([`Slot`], [`crate::WordSlot`]), read only; `no_edges`: the target has no edges
     fn raw(&mut self, raw: &RawSlot, no_edges: bool);
 
-    /// 抹掉类型的槽，可改写（疏散回收）
+    /// A type-erased slot, rewritable (evacuating collections)
     fn raw_mut(&mut self, raw: &RawSlot, no_edges: bool);
 
-    /// 标记对象，它在疏散候选块里就搬走；返回对象现在的头。
+    /// Mark an object, moving it if it is in an evacuation candidate block; return its current header.
     fn forward(&mut self, header: *const Header, no_edges: bool) -> *const Header;
 
-    /// 标记对象；本轮第一次见到且它有边时压进工作队列。
+    /// Mark an object; push it on the work queue when it is first seen this round and has edges.
     fn visit(&mut self, header: *const Header, no_edges: bool);
 
-    /// 追踪（或重定位）工作队列里取出来的一个对象。
+    /// Trace (or relocate) one object taken from the work queue.
     fn scan(&mut self, item: usize);
 }
 
@@ -335,8 +335,8 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
         }
         if self.count.is_some() {
             let (cur, _) = raw.recount();
-            // 并发标记：读出当前值与改「上次计入」之间 mutator 可能改写了槽；那时槽若还不计数（年轻对象的槽），
-            // 它不会登记 ⇒ 新值永远没人计。值变了就替它登记，收尾时按「新值 +1、计入的值 −1」结算（重复登记无害）
+            // Concurrent marking: between reading the current value and updating "last counted" a mutator may rewrite the slot; if the slot was not counted yet (a young object's slot),
+            // it would not log ⇒ nobody would ever count the new value. If the value changed, log it on its behalf and settle "new +1, counted −1" at the end (logging twice is harmless)
             if let Some(log) = self.log
                 && raw.current() != cur
                 && raw.log()
@@ -382,11 +382,11 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
             if let Some(to) = self.promote(header, no_edges) {
                 return to;
             }
-            assert!(!self.in_shared, "可共享的对象指着一个晋升不了的私有对象（不可共享的类型、老对象或别的堆直接指着的）");
+            assert!(!self.in_shared, "a shareable object points at a private object that cannot be promoted (a non-shareable type, an old object, or one pointed to directly from another heap)");
         }
-        // SAFETY: header 来自本堆的 Gc / 根，对象活着
+        // SAFETY: header comes from this heap's Gc / roots, the object is alive
         let h = unsafe { &*header };
-        // 本轮已经原地标过的不搬（年轻疏散里老对象直接指着的、别的堆指着的年轻对象先原地标上了）
+        // Objects already marked in place this round are not moved (young objects pointed to directly from old objects or from another heap are marked in place first during young evacuation)
         if let Some(copier) = self.copier.as_deref_mut()
             && !h.is_large()
             && Block::containing(header.cast()).is_evacuating()
@@ -395,9 +395,9 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
             return match h.claim() {
                 Claim::Moved(to) => to,
                 Claim::Mine => {
-                    // SAFETY: 本线程认领了它；它在块里
+                    // SAFETY: this thread claimed it; it lives in a block
                     let to = unsafe { copier.copy(header) };
-                    // SAFETY: 同上
+                    // SAFETY: as above
                     unsafe { Header::forward(header, to) };
                     if !no_edges {
                         self.work.push(to.expose_provenance());
@@ -415,7 +415,7 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
         if self.crossed(header) {
             return;
         }
-        // SAFETY: header 来自本堆的 Gc / 根，对象活着
+        // SAFETY: header comes from this heap's Gc / roots, the object is alive
         let h = unsafe { &*header };
         if !h.mark(self.epoch) {
             return;
@@ -432,22 +432,22 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
         #[cfg(crossheap)]
         if item & PROMOTED_ITEM != 0 {
             let old = core::ptr::with_exposed_provenance::<Header>(item & !PROMOTED_ITEM);
-            // SAFETY: 晋升时压进来的旧头，转发地址已经写好；旧数据要到清扫才释放，它的访问函数还在
+            // SAFETY: an old header pushed during promotion, with the forwarding address written; the old data is freed only by sweeping, so its visit function is still there
             let to = unsafe { &*old }.forwardee();
             self.in_shared = true;
-            // SAFETY: 跨堆那份是同一个类型、刚复制好，只被本线程取出（独占）
+            // SAFETY: the cross-heap copy is the same type, just copied, and taken out by this thread only (exclusive)
             unsafe { Header::visit_data(old, Header::data(to), self) };
             self.in_shared = false;
             return;
         }
         let header = core::ptr::with_exposed_provenance::<Header>(item);
-        // SAFETY: 队列里只有本轮标记过的活对象；重定位模式时它只被这一个线程取出（独占）
+        // SAFETY: the queue holds only live objects marked this round; in relocating mode each is taken out by one thread only (exclusive)
         unsafe { Header::visit(header, self) };
     }
 }
 
 
-// SAFETY: Gc 本身就是一条边
+// SAFETY: a Gc is itself an edge
 unsafe impl<T: Trace> Trace for Gc<'_, T> {
     fn trace(&self, t: &mut Tracer<'_>) {
         t.edge(*self);
@@ -458,7 +458,7 @@ unsafe impl<T: Trace> Trace for Gc<'_, T> {
     }
 }
 
-// SAFETY: 槽里的值就是一条边
+// SAFETY: the value in the slot is an edge
 unsafe impl<T: Trace> Trace for Slot<'_, T> {
     fn trace(&self, t: &mut Tracer<'_>) {
         t.slot(self);
@@ -469,7 +469,7 @@ unsafe impl<T: Trace> Trace for Slot<'_, T> {
     }
 }
 
-// SAFETY: 字里的指针（有的话）就是一条边；目标类型不知道，按有边处理
+// SAFETY: the pointer in the word (if any) is an edge; the target type is unknown, so it is treated as having edges
 unsafe impl Trace for WordSlot<'_> {
     fn trace(&self, t: &mut Tracer<'_>) {
         t.raw(self.raw(), false);
@@ -480,10 +480,10 @@ unsafe impl Trace for WordSlot<'_> {
     }
 }
 
-/// 不含 `Gc` 的类型：什么都不用追踪。
+/// Types without `Gc`: nothing to trace.
 macro_rules! leaf {
     ($($ty:ty),* $(,)?) => {$(
-        // SAFETY: 没有 Gc
+        // SAFETY: no Gc
         unsafe impl Trace for $ty {
             const NO_EDGES: bool = true;
             fn trace(&self, _: &mut Tracer<'_>) {}
@@ -497,16 +497,16 @@ leaf!(
     AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, AtomicI8, AtomicI16, AtomicI32, AtomicI64, AtomicIsize,
 );
 
-// SAFETY: 没有值
+// SAFETY: no value
 unsafe impl<T: ?Sized + Send + Sync> Trace for PhantomData<T> {
     const NO_EDGES: bool = true;
     fn trace(&self, _: &mut Tracer<'_>) {}
 }
 
-/// 逐个追踪元素的容器：`$ty` 用 `T` 作元素类型，`$iter` 把 `&self` 变成元素迭代器。
+/// Containers traced element by element: `$ty` uses `T` as the element type, and `$iter` turns `&self` into an iterator over the elements.
 macro_rules! each {
     ($([$($gen:tt)*] $ty:ty => |$s:ident| $iter:expr, |$m:ident| $iter_mut:expr;)*) => {$(
-        // SAFETY: 逐个追踪了全部元素
+        // SAFETY: traces every element
         unsafe impl<$($gen)*> Trace for $ty {
             const NO_EDGES: bool = T::NO_EDGES;
             fn trace(&self, t: &mut Tracer<'_>) {
@@ -540,10 +540,10 @@ each! {
     [K: Send + Sync, T: Trace, H: Send + Sync] HashMap<K, T, H> => |s| s.values(), |m| m.values_mut();
 }
 
-/// 元组：逐个字段追踪。
+/// Tuples: traced field by field.
 macro_rules! tuple {
     ($($name:ident)+) => {
-        // SAFETY: 逐个追踪了全部字段
+        // SAFETY: traces every field
         unsafe impl<$($name: Trace),+> Trace for ($($name,)+) {
             const NO_EDGES: bool = $($name::NO_EDGES)&&+;
             #[allow(non_snake_case)]
@@ -567,22 +567,22 @@ tuple!(A B C D);
 tuple!(A B C D E);
 tuple!(A B C D E F);
 
-/// 一组标记工人：每个工号一个本地双端队列（自己 LIFO 弹），根与写屏障记下的放在公共灰队列；
-/// 自己的空了就成批偷（`steal_batch_and_pop`，一次搬走别人队列的一半）。私有堆与公开堆的标记共用它，只是「扫一项」不同。
+/// A crew of marking workers: each worker id has a local deque (popping its own LIFO); roots and values recorded by the write barrier go to the shared grey queue;
+/// when its own queue is empty a worker steals in batches (`steal_batch_and_pop`, taking half of another queue at once). Private and public heap marking both use it; only "scan one item" differs.
 ///
-/// 结束判定：自己的队列空、也偷不到时把空闲计数加一，然后边退避边偷；空闲计数等于工人数时
-/// 所有队列都空、也没人还在追踪（追踪中的工人没计入空闲），标记结束。偷到了就先减一再干活；
-/// 偷到还没来得及减一时别人可能先看到「全空闲」退出，但手里的活仍由偷到的人做完，结果不受影响。
+/// Termination: a worker whose own queue is empty and that cannot steal increments the idle count, then keeps stealing with backoff; when the idle count equals the number of workers,
+/// all queues are empty and nobody is still tracing (tracing workers are not counted idle), so marking is done. A worker that steals something decrements first and then works;
+/// if someone sees "all idle" and exits before the decrement, the stolen work is still finished by the thief, so the result is unaffected.
 pub struct Crew<'g> {
-    /// 每个工号一个本地队列，由那个工号的线程取走（只取一次）
+    /// One local queue per worker id, taken (once) by that worker's thread
     locals: Vec<CachePadded<UnsafeCell<Option<Worker<usize>>>>>,
     stealers: Vec<Stealer<usize>>,
-    /// 公共灰队列
+    /// The shared grey queue
     grey: &'g Injector<usize>,
     idle: CachePadded<AtomicUsize>,
 }
 
-// SAFETY: 每个工号的本地队列只被一个线程取走（工号互不相同）；其余是线程安全的
+// SAFETY: each worker id's local queue is taken by one thread only (ids are distinct); the rest is thread safe
 unsafe impl Sync for Crew<'_> {}
 
 impl<'g> Crew<'g> {
@@ -596,13 +596,13 @@ impl<'g> Crew<'g> {
         self.locals.len()
     }
 
-    /// 工号 `me` 的本地队列（每个工号只取一次，只在那个工号的线程上取）。
+    /// The local queue of worker `me` (taken once per id, only on that worker's thread).
     pub fn take(&self, me: usize) -> Worker<usize> {
-        // SAFETY: 工号 me 只在这一个线程上
-        unsafe { (*self.locals[me].get()).take() }.expect("每个工号只取一次本地队列")
+        // SAFETY: worker id me runs on this one thread only
+        unsafe { (*self.locals[me].get()).take() }.expect("each worker id takes its local queue once")
     }
 
-    /// 工号 `me` 一直干到全部工人空闲：先弹自己的，空了去偷，偷不到就进入空闲等别人。
+    /// Worker `me` works until every worker is idle: pop its own first, steal when empty, and go idle to wait for the others when there is nothing to steal.
     pub fn drain(&self, me: usize, local: &Worker<usize>, mut scan: impl FnMut(usize)) {
         loop {
             while let Some(item) = local.pop() {
@@ -620,7 +620,7 @@ impl<'g> Crew<'g> {
         }
     }
 
-    /// 空闲时边退避边偷；全部空闲返回 None。
+    /// While idle, keep stealing with backoff; returns None once everyone is idle.
     fn wait(&self, me: usize, local: &Worker<usize>) -> Option<usize> {
         let backoff = Backoff::new();
         loop {
@@ -635,7 +635,7 @@ impl<'g> Crew<'g> {
         }
     }
 
-    /// 先偷公共灰队列，再从下一个工人开始轮着偷；成批搬进自己的队列，返回其中一个。
+    /// Steal from the shared grey queue first, then from the other workers starting with the next one; move a batch into its own queue and return one of them.
     fn steal(&self, me: usize, local: &Worker<usize>) -> Option<usize> {
         let n = self.stealers.len();
         loop {
@@ -654,27 +654,27 @@ impl<'g> Crew<'g> {
 pub struct Marking<'g> {
     crew: Crew<'g>,
     epoch: u32,
-    /// 疏散回收：每个工号一个复制缓冲（空 = 不疏散）
+    /// Evacuating collections: one copy buffer per worker id (empty = no evacuation)
     copiers: Vec<CachePadded<UnsafeCell<Option<Copier>>>>,
-    /// 疏散回收：0 号工人先把根表里的槽改成搬走后的新地址（同时把根标灰）
+    /// Evacuating collections: worker 0 first rewrites the root table's slots to the moved addresses (greying the roots at the same time)
     roots: Option<&'g RootTable>,
-    /// 计数模式：扫描的每条边给目标 +1（值是计数奇偶）
+    /// Counting mode: every scanned edge increments its target (the value is the count parity)
     count: Option<bool>,
-    /// 并发标记：引用计数登记队列（重新计数时被 mutator 改写的槽补登记）
+    /// Concurrent marking: the count logging queue (slots rewritten by a mutator during a recount are logged again)
     log: Option<&'g Injector<usize>>,
-    /// 一起回收：追踪到的 Far 报到这里
+    /// Group collection: traced Fars are reported here
     group: Option<&'g Injector<(usize, usize)>>,
-    /// 年轻疏散（[`crate::YoungEvacuation::Full`]）：0 号工人把记忆集里这些槽改成搬走后的新地址
+    /// Young evacuation ([`crate::YoungEvacuation::Full`]): worker 0 rewrites these remembered slots to the moved addresses
     slots: &'g [usize],
-    /// 可共享的年轻对象晋升进这个跨堆
+    /// Shareable young objects are promoted into this cross-heap
     #[cfg(crossheap)]
     promote: Option<&'g Inner>,
-    /// 指着跨堆的边报到这里
+    /// Edges into the cross-heap are reported here
     #[cfg(crossheap)]
     crossing: Option<&'g Injector<usize>>,
 }
 
-// SAFETY: 每个工号的复制缓冲只被一个线程取走（工号互不相同）；其余是线程安全的
+// SAFETY: each worker id's copy buffer is taken by one thread only (ids are distinct); the rest is thread safe
 unsafe impl Sync for Marking<'_> {}
 
 impl<'g> Marking<'g> {
@@ -695,53 +695,53 @@ impl<'g> Marking<'g> {
         }
     }
 
-    /// 年轻疏散时把可共享的年轻对象晋升进 `cross`。
+    /// During young evacuation, promote shareable young objects into `cross`.
     #[cfg(crossheap)]
     pub fn promoting(mut self, cross: Option<&'g Inner>) -> Self {
         self.promote = cross;
         self
     }
 
-    /// 追踪到的、指着跨堆对象的边报到 `crossing`。
+    /// Report traced edges into cross-heap objects to `crossing`.
     #[cfg(crossheap)]
     pub fn crossing(mut self, crossing: Option<&'g Injector<usize>>) -> Self {
         self.crossing = crossing;
         self
     }
 
-    /// 年轻疏散：记忆集里的槽（地址）由 0 号工人改成搬走后的新地址（同时把目标标灰）。
+    /// Young evacuation: worker 0 rewrites these remembered slots (addresses) to the moved addresses (greying the targets at the same time).
     pub fn relocating_slots(mut self, slots: &'g [usize]) -> Self {
         self.slots = slots;
         self
     }
 
-    /// 并发标记：给引用计数登记队列。
+    /// Concurrent marking: the count logging queue.
     pub fn logging(mut self, log: &'g Injector<usize>) -> Self {
         self.log = Some(log);
         self
     }
 
-    /// 一起回收几个堆：追踪到的 Far 报到 `group`。
+    /// Collecting several heaps together: traced Fars are reported to `group`.
     pub fn grouping(mut self, group: &'g Injector<(usize, usize)>) -> Self {
         self.group = Some(group);
         self
     }
 
-    /// 计数模式（年轻回收的晋升、停顿式完整回收的重新计数）。
+    /// Counting mode (promotion in young collections, recount in stop-the-world full collections).
     pub fn counting(mut self, parity: Option<bool>) -> Self {
         self.count = parity;
         self
     }
 
-    /// 疏散回收：每个工人带一个复制缓冲，候选块里被追踪到的对象搬进 `targets` 里的块（不够就开新块登记进 `blocks`）；
-    /// 根由 0 号工人重定位。`last` 是上次完成的纪元（空行判定）。
+    /// Evacuating collections: each worker carries a copy buffer; traced objects in candidate blocks move into the blocks in `targets` (opening new blocks registered in `blocks` when short);
+    /// worker 0 relocates the roots. `last` is the last completed epoch (to judge free lines).
     pub fn evacuating(mut self, roots: &'g RootTable, targets: &Injector<Block>, blocks: &SegVec<Block>, pages: &Pages, moved: &AtomicUsize, last: u32) -> Self {
         self.copiers = (0..self.crew.len()).map(|_| CachePadded::new(UnsafeCell::new(Some(Copier::new(targets, blocks, pages, moved, last, self.epoch))))).collect();
         self.roots = Some(roots);
         self
     }
 
-    /// 标记根（顺带写行标记），需要追踪的放进灰队列。
+    /// Mark the roots (writing line marks too) and put the ones needing tracing on the grey queue.
     pub fn seed(grey: &Injector<usize>, roots: &[*const Header], epoch: u32) {
         let seed = Worker::new_lifo();
         let mut t = Tracer::new(&seed, epoch, None);
@@ -753,12 +753,12 @@ impl<'g> Marking<'g> {
         }
     }
 
-    /// 年轻回收：记忆集里的槽（地址）当前指向的对象当作根（年轻的标上、进灰队列；老的碰到就停）。
+    /// Young collections: the objects currently referenced by the remembered slots (addresses) act as roots (young ones are marked and greyed; old ones stop the trace).
     pub fn seed_slots(grey: &Injector<usize>, slots: &[usize], epoch: u32) {
         let seed = Worker::new_lifo();
         let mut t = Tracer::new(&seed, epoch, None);
         for &slot in slots {
-            // SAFETY: 槽在写入它的对象里；那个对象被写时可达，到这次回收前不会被释放（见 Mutator::written）
+            // SAFETY: the slot lives in the object written to; that object was reachable when written and is not freed before this collection (see Mutator::written)
             let slot = unsafe { &*core::ptr::with_exposed_provenance::<RawSlot>(slot) };
             if let Some(h) = slot.current() {
                 t.visit(h, false);
@@ -769,18 +769,18 @@ impl<'g> Marking<'g> {
         }
     }
 
-    /// 从灰队列出发标记，直到全部工人空闲。
+    /// Mark from the grey queue until every worker is idle.
     pub fn run(&self, pool: &Pool) {
         pool.run(self.crew.len(), |me| self.work(me));
     }
 
     fn work(&self, me: usize) {
         let local = self.crew.take(me);
-        // SAFETY: 复制缓冲也按工号取一次，只在这个工号的线程上
+        // SAFETY: copy buffers are also taken once per worker id, only on that worker's thread
         let mut copier = self.copiers.get(me).and_then(|c| unsafe { (*c.get()).take() });
         #[cfg(crossheap)]
         let promoter = self.promote.map(Promoter::new);
-        // 只有一个工人时没有别人改计数（mutator 不碰计数，减量队列此时为空）
+        // With a single worker nobody else changes counts (mutators do not touch counts, and the decrement queue is empty now)
         let mut t = Tracer::new(&local, self.epoch, copier.as_mut()).counting(self.count, self.crew.len() == 1).logging(self.log).grouping(self.group);
         #[cfg(crossheap)]
         {
@@ -792,7 +792,7 @@ impl<'g> Marking<'g> {
         {
             roots.relocate(|h| t.forward(h, false));
             for &slot in self.slots {
-                // SAFETY: 槽在写入它的老对象里，到这次回收前不会被释放（见 Mutator::written）；停顿里没有 mutator 写它
+                // SAFETY: the slot lives in the old object written to and is not freed before this collection (see Mutator::written); no mutator writes it during the pause
                 let slot = unsafe { &*core::ptr::with_exposed_provenance::<RawSlot>(slot) };
                 if let Some(old) = slot.current() {
                     let new = t.forward(old, false);
@@ -807,33 +807,33 @@ impl<'g> Marking<'g> {
 }
 
 pub struct Copier {
-    /// 可搬入的块（只在本轮回收期间有效）
+    /// Blocks that can be moved into (valid only during this collection)
     targets: *const Injector<Block>,
-    /// 全部块表：新开的块登记进去，本轮清扫会扫到
+    /// The table of all blocks: new blocks are registered there so this round's sweep sees them
     blocks: *const SegVec<Block>,
-    /// 新开的块从这里领
+    /// New blocks come from here
     pages: *const Pages,
-    /// 上次完成的纪元：行标记早于它的是空行
+    /// The last completed epoch: lines with older marks are free
     last: u32,
-    /// 本轮纪元
+    /// This round's epoch
     epoch: u32,
     block: Option<Block>,
     line: usize,
     cursor: *mut u8,
     limit: *mut u8,
-    /// 本线程搬了多少字节；析构时并进堆的计数
+    /// Bytes moved by this thread; added to the heap's count when dropped
     moved: usize,
     total: *const AtomicUsize,
 }
 
 impl Drop for Copier {
     fn drop(&mut self) {
-        // SAFETY: 计数器在本轮回收期间有效（Copier 在回收结束前析构）
+        // SAFETY: the counter is valid during this collection (the Copier is dropped before the collection ends)
         unsafe { &*self.total }.fetch_add(self.moved, Ordering::Relaxed);
     }
 }
 
-// SAFETY: 指针指向回收期间一直有效的堆结构；每个回收线程独占自己的 Copier
+// SAFETY: the pointers refer to heap structures valid throughout the collection; each collector thread owns its own Copier
 unsafe impl Send for Copier {}
 
 impl Copier {
@@ -841,19 +841,19 @@ impl Copier {
         Self { targets, blocks, pages, last, epoch, block: None, line: 0, cursor: null_mut(), limit: null_mut(), moved: 0, total }
     }
 
-    /// 把 `from` 整个抄到新地方，返回新头。SAFETY（调用方）：本线程认领了 `from`，它是块里的小对象。
+    /// Copy `from` whole to a new place and return the new header. SAFETY (caller): this thread claimed `from`, a small object in a block.
     pub unsafe fn copy(&mut self, from: *const Header) -> *const Header {
-        // SAFETY: from 有效
+        // SAFETY: from is valid
         let bytes = unsafe { &*from }.bytes();
         let to = self.alloc(bytes);
         self.moved += bytes;
-        // SAFETY: to 是 bytes 字节的新内存；from 归本线程（认领后别人只读头里的标记字）
+        // SAFETY: to is new memory of bytes bytes; from belongs to this thread (after the claim others only read the mark word in its header)
         unsafe { core::ptr::copy_nonoverlapping(from.cast::<u8>(), to, bytes) };
         let block = Block::containing(to);
         block.set_start(to);
         block.mark_lines(to, bytes, self.epoch);
         let to = to.cast::<Header>().cast_const();
-        // SAFETY: 新头已抄好
+        // SAFETY: the new header is copied
         unsafe { &*to }.set_mark(self.epoch);
         to
     }
@@ -869,7 +869,7 @@ impl Copier {
         }
     }
 
-    /// 当前空洞放不下：找当前块的下一个空洞，没有了就换块。
+    /// The current hole is too small: find the next hole in the current block, or switch blocks when there is none.
     fn refill(&mut self) {
         if let Some(b) = self.block
             && let Some((start, end)) = b.hole(self.line, self.last)
@@ -879,12 +879,12 @@ impl Copier {
             self.limit = b.line(end);
             return;
         }
-        // SAFETY: 三个指针在本轮回收期间有效
+        // SAFETY: the three pointers are valid during this collection
         let (targets, blocks, pages) = unsafe { (&*self.targets, &*self.blocks, &*self.pages) };
         let b = loop {
             match targets.steal() {
                 Steal::Success(b) => {
-                    // 年轻疏散直接从可用队列里拿：拿出来，标成用过（落进本次年轻清扫重新分类）
+                    // Young evacuation takes straight from the available queue: take it out and mark it used (so this young sweep reclassifies it)
                     b.unlist();
                     b.reused();
                     break b;
@@ -904,14 +904,14 @@ impl Copier {
     }
 }
 
-/// 队列项里「组里第几个堆」放在高位（地址只用到低 48 位）
+/// The queue item's "index in the group" sits in the high bits (addresses use only the low 48 bits)
 #[cfg(crossheap)]
 const MEMBER_SHIFT: u32 = 56;
-/// 队列项里地址那部分
+/// The address part of a queue item
 #[cfg(crossheap)]
 const ADDR_MASK: usize = (1 << MEMBER_SHIFT) - 1;
 
-/// 组里的一个堆：它和它这一轮的纪元。
+/// One heap of the group: the heap and its epoch this round.
 #[cfg(crossheap)]
 pub struct Member<'h> {
     pub heap: &'h Inner,
@@ -921,16 +921,16 @@ pub struct Member<'h> {
 #[cfg(crossheap)]
 pub struct Marker<'h> {
     members: &'h [Member<'h>],
-    /// 堆号 → 组里第几个（不在组里是 None）
+    /// Heap number → index in the group (None when not in the group)
     by_heap: [Option<usize>; WINDOWS],
-    /// 一起回收时：发现的组内跨堆边（来源是组里第几个, 目标的公开偏移）
+    /// In a group collection: cross-heap edges found inside the group (index of the source, public offset of the target)
     found: Option<&'h Injector<(usize, u64)>>,
     crew: Crew<'h>,
 }
 
 #[cfg(crossheap)]
 impl<'h> Marker<'h> {
-    /// `grey`：根放这里（空的，标记期间只有这一组工人用）。
+    /// `grey`: the roots go here (empty; only this crew uses it during marking).
     pub fn new(members: &'h [Member<'h>], found: Option<&'h Injector<(usize, u64)>>, grey: &'h Injector<usize>, workers: usize) -> Self {
         let mut by_heap = [None; WINDOWS];
         for (m, member) in members.iter().enumerate() {
@@ -944,7 +944,7 @@ impl<'h> Marker<'h> {
         }
     }
 
-    /// 从 `roots`（组里第几个, 对象头地址）出发标记，直到全部工人空闲。
+    /// Mark from `roots` (index in the group, object header address) until every worker is idle.
     pub fn run(&self, pool: &Pool, roots: &[(usize, usize)]) {
         for &(m, header) in roots {
             self.visit(m, header, |item| self.crew.grey.push(item));
@@ -955,11 +955,11 @@ impl<'h> Marker<'h> {
         });
     }
 
-    /// 标记组里第 `m` 个堆的对象（和它跨的行）；本轮第一次见到且它有边时把队列项交给 `push`。
+    /// Mark an object of heap `m` in the group (and the lines it spans); when it is first seen this round and has edges, hand its queue item to `push`.
     fn visit(&self, m: usize, header: usize, push: impl FnOnce(usize)) {
         let member = &self.members[m];
         let h = core::ptr::with_exposed_provenance::<PHeader>(header);
-        // SAFETY: 来自入口或活对象的指针槽，对象活着
+        // SAFETY: from an entry or a pointer slot of a live object, so the object is alive
         let (core, ty) = unsafe { (&(*h).core, (*h).ty) };
         if !core.mark(member.epoch) {
             return;
@@ -972,19 +972,19 @@ impl<'h> Marker<'h> {
         }
     }
 
-    /// 追踪一个对象：指针图里每个槽，指向组里某个堆的就标上（指向别的堆时报到 `found`）；组外的由它们自己的入口管。
+    /// Trace an object: every slot in the pointer map that points into a heap of the group is marked (edges into another heap are reported to `found`); heaps outside the group are kept by their own entries.
     fn scan(&self, item: usize, local: &Worker<usize>) {
         let (m, header) = (item >> MEMBER_SHIFT, item & ADDR_MASK);
         let source = self.members[m].heap;
         let h = core::ptr::with_exposed_provenance::<PHeader>(header);
-        // SAFETY: 队列里只有本轮标记过的活对象
+        // SAFETY: the queue holds only live objects marked this round
         let ty = unsafe { (*h).ty };
         let data = PHeader::data(h);
         for &edge in source.edges(ty) {
             let (far, off) = (edge & FAR_EDGE != 0, (edge & !EDGE_KINDS) as usize);
-            // SAFETY: 指针图里的偏移都是这个类型里指针槽（一个 AtomicU64）的位置
+            // SAFETY: every offset in the pointer map is the position of a pointer slot (one AtomicU64) in this type
             let raw = unsafe { &*data.add(off).cast::<AtomicU64>() }.load(Ordering::Acquire);
-            // 存绝对地址的边换成公开偏移（地址区外的——私有堆的对象——不归这里管）
+            // Edges storing absolute addresses become public offsets (addresses outside the region, private heap objects, are not handled here)
             let absolute = match edge & (WORD_EDGE | PTR_EDGE) {
                 WORD_EDGE => Some(word_pointer(raw).map_or(0, <*mut u8>::addr)),
                 PTR_EDGE => usize::try_from(raw).ok(),
@@ -998,8 +998,8 @@ impl<'h> Marker<'h> {
                 continue;
             }
             let Some(t) = Inner::heap_of(v).and_then(|k| self.by_heap[k]) else { continue };
-            // 指向的那个堆已经死了、号被组里这个新堆用上：不是它的对象，不跟
-            // SAFETY: 跨堆的槽是 CrossHeapRef（repr(C)：偏移后面紧跟目标堆身份，也是一个 AtomicU64）
+            // The heap pointed to has died and its number was reused by this new heap of the group: not its object, do not follow
+            // SAFETY: a cross-heap slot is a CrossHeapRef (repr(C): the offset is followed by the target heap's identity, also one AtomicU64)
             if far && unsafe { &*data.add(off + size_of::<AtomicU64>()).cast::<AtomicU64>() }.load(Ordering::Acquire) != self.members[t].heap.incarnation() {
                 continue;
             }

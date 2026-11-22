@@ -1,6 +1,6 @@
 [workspace]
 members = [".", "macros"]
-# 对比基准依赖 V8 等大库，自成 workspace
+# The comparison benchmarks depend on large libraries such as V8, so they are a workspace of their own
 exclude = ["benches"]
 
 [workspace.package]
@@ -20,7 +20,7 @@ doc_markdown = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
-# 块与对象头的对齐由布局保证（块按 32 KiB 对齐、对象按 8 字节粒度）
+# Block and header alignment is guaranteed by the layout (blocks aligned to 32 KiB, objects to the 8-byte granule)
 cast_ptr_alignment = "allow"
 
 [package]
@@ -35,7 +35,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# 跨堆（共享内存上的公开堆、跨进程共享）：只在 Linux 上生效，别的平台打开也不编进来
+# Cross-heap (public heaps on shared memory, sharing across processes): Linux only; on other platforms the feature compiles to nothing
 crossheap = []
 
 [package.metadata.docs.rs]

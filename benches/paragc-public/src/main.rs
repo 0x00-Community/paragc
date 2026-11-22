@@ -1,5 +1,5 @@
-//! paragc 的公开堆（共享内存文件上）：pause / gcbench 与私有堆同样的树，看共享内存、偏移指针、按指针图追踪的代价。
-//! 公开堆没有年轻回收与引用计数，gcbench 照私有堆的触发阈值手动回收。线程数是回收线程数。
+//! paragc public heaps (on a shared-memory file): the same pause / gcbench trees as the private heap, measuring the cost of shared memory, offset pointers and tracing by pointer map.
+//! Public heaps have no young collections or reference counting, so gcbench collects by hand at the private heap's trigger. The thread count is the number of collector threads.
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
@@ -16,7 +16,7 @@ struct Node<'p> {
 
 cross_heap_brand!(NodeB = for<'p> Node<'p>);
 
-/// 回收触发的下限与倍数（同私有堆）：新领用的超过「上次存活 × GROWTH」且不少于 MIN_TRIGGER 就回收
+/// Collection trigger floor and factor (as for the private heap): collect once newly taken bytes exceed "last live × GROWTH" and at least MIN_TRIGGER
 const MIN_TRIGGER: usize = 4 * 1024 * 1024;
 const GROWTH: usize = 2;
 
@@ -28,7 +28,7 @@ struct ParagcPublic {
 impl ParagcPublic {
     fn heap(&self) -> CrossHeap {
         let path = PathBuf::from(format!("/dev/shm/paragc-bench-{}", std::process::id()));
-        self.space.create(path, self.threads).expect("建公开堆")
+        self.space.create(path, self.threads).expect("create a public heap")
     }
 
     fn tree<'p>(m: &CrossHeapMutator<'p>, depth: u32) -> CrossHeapGc<'p, Node<'p>> {
@@ -101,5 +101,5 @@ impl Bench for ParagcPublic {
 
 fn main() {
     let args = Args::parse();
-    args.report(&ParagcPublic { threads: args.threads, space: CrossHeapSpace::reserve().expect("保留公开地址区") });
+    args.report(&ParagcPublic { threads: args.threads, space: CrossHeapSpace::reserve().expect("reserve the public region") });
 }

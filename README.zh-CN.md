@@ -178,8 +178,7 @@ heap.collect();
 | `weak_reference_across_heaps_does_not_keep_target` | 另一个堆里的 `CrossHeapWeak` 不保活目标：目标没根后回收、存活 0，读出来 `None`，同一位置分配新对象后仍是 `None` |
 | `signature_round_trip_and_forgeries` | 签名转字节再转回不变、按类型取得到、类型不对取不到；改戳、改堆身份、改类型键都不过；把偏移挪到前后 32 KiB 里每个粒度上，只有对象起点能过、不崩；对象死后失效 |
 | `mailbox_delivers_in_order` | 投 3 封、回收后信还在，按投递顺序取出，还掉后堆里存活 0 |
-| `young_survivors_promote_into_attached_cross_heap` | 5000 个可共享节点一次年轻回收全部进跨堆、值不变；不可共享的对象留在私有堆、它的槽改成新地址；弱引用跟着搬；签名找得到晋升过去的对象；跨堆单独回收什么都不做；主人完整回收后存活字节数精确，链头死后私有弱引用清空、签名失效，最后全部回收 |
-| `private_values_cannot_be_written_into_cross_heap_objects` | 往跨堆对象的槽里写私有年轻对象 panic |
+| `promotion_into_attached_cross_heap` | 5000 个可共享节点一次年轻回收全部进跨堆、值不变；不可共享的对象留在私有堆、它的槽改成新地址；弱引用跟着搬；签名找得到晋升过去的对象；跨堆单独回收什么都不做；主人完整回收后存活字节数精确，链头死后私有弱引用清空、签名失效，最后全部回收；接着往跨堆对象的槽里写私有年轻对象会 panic。一个进程同一时刻只能保留一个固定地址区，所以两个场景放在一条测试里先后跑 |
 | `shrink_returns_empty_blocks_and_open_by_fd` | 40 万个节点的垃圾回收后 `shrink`，堆文件实际占用降到四分之一以下；凭描述符打开的另一个映射认得签名；还掉的块再分配照样对 |
 | `private_heap_holds_public_handles` · `eight_threads_churn_public_heap` | 私有堆对象里的 `CrossHeapRoot` 保活目标，直到私有堆析构它；8 个线程压入弹出各自的链、另一个线程同时回收，每轮存活字节数精确 |
 | `reference_counting_leaves_cycles_to_tracing` | 整体扔掉的老对象链在年轻回收时按计数释放（500 层连锁）；两节点的环留到完整回收 |

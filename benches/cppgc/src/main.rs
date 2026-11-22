@@ -1,14 +1,14 @@
-//! cppgc（V8 的 Oilpan，C++），经 rusty_v8 的绑定使用。两种用法（环境变量 `CPPGC_HEAP`）：
+//! cppgc (V8's Oilpan, C++), used through rusty_v8's bindings. Two modes (environment variable `CPPGC_HEAP`):
 //!
-//! - `attached`（缺省，报告名 `cppgc`）：堆挂在 isolate 上（Blink 的用法），回收走 V8 的完整 GC
-//!   （`request_garbage_collection_for_testing(Full)`，精确、不扫栈），并行标记用平台的工作线程；
-//!   gcbench 里回收时机交给 V8 自己调度
-//! - `detached`（报告名 `cppgc-detached`）：堆不挂 isolate，回收用 `collect_garbage_for_testing`。
-//!   实测这条路径是单线程的原子回收，线程数和 `--cppheap-concurrent-marking` 都不影响；gcbench 按 paragc 的触发策略手动回收
+//! - `attached` (default, reported as `cppgc`): the heap is attached to an isolate (as Blink uses it), and collection goes through V8's full GC
+//!   (`request_garbage_collection_for_testing(Full)`, precise, no stack scanning), with parallel marking on the platform's worker threads;
+//!   in gcbench the timing of collections is left to V8's own scheduling
+//! - `detached` (reported as `cppgc-detached`): the heap is not attached to an isolate and collection uses `collect_garbage_for_testing`.
+//!   Measured, this path is a single-threaded atomic collection unaffected by the thread count or `--cppheap-concurrent-marking`; gcbench collects by hand with paragc's trigger policy
 //!
-//! 共同：线程数 1 用单线程平台（没有工作线程），大于 1 用带这么多工作线程的默认平台；`V8_FLAGS` 传额外的 V8 选项。
-//! 每次分配、每个 `Member` 的构造、标记时每条边都要过一次 Rust ⇄ C++ 的 FFI，这部分开销算在 cppgc 头上。
-//! 只能一个线程用一个堆，没有 alloc-mt。
+//! Common: 1 thread uses the single-threaded platform (no worker threads), more than 1 the default platform with that many worker threads; `V8_FLAGS` passes extra V8 options.
+//! Every allocation, every `Member` construction and every edge during marking crosses the Rust ⇄ C++ FFI once, and that cost is charged to cppgc.
+//! A heap can be used by one thread only, so there is no alloc-mt.
 use std::cell::UnsafeCell;
 use std::ffi::CStr;
 use std::num::NonZeroUsize;
@@ -18,25 +18,25 @@ use bench_common::{Args, Bench, Clock, FRAG_PER_ROUND, FRAG_ROUNDS, Footprint, F
 use v8::cppgc::{EmbedderStackState, GarbageCollected, Heap, HeapCreateParams, Member, Persistent, UnsafePtr, Visitor, make_garbage_collected};
 use v8::{GarbageCollectionType, SharedRef, UniqueRef};
 
-/// 触发回收的下限（与 paragc 相同；只用于 detached）
+/// Collection trigger floor (the same as paragc; detached only)
 const MIN_TRIGGER: usize = 4 * 1024 * 1024;
-/// 新分配超过「存活 × 它」就回收（与 paragc 相同；只用于 detached）
+/// Collect once new allocation exceeds "live × this" (the same as paragc; detached only)
 const GROWTH: usize = 2;
-/// 每个节点在 cppgc 堆上大约占的字节数：对象头 8 + RustObj 头与 dyn 指针 24 + 两个 Member 与 u64 24
+/// Approximate bytes per node on the cppgc heap: object header 8 + RustObj header and dyn pointer 24 + two Members and a u64 24
 const NODE_BYTES: usize = 56;
-/// V8 的完整 GC 要这个选项才能从嵌入方触发
+/// V8's full GC needs this option to be triggered by the embedder
 const EXPOSE_GC: &str = "--expose-gc";
-/// 单线程平台必须配这个选项（V8 不再起并行 / 并发任务），否则挂 isolate 时崩溃
+/// The single-threaded platform needs this option (so V8 starts no parallel / concurrent tasks), otherwise attaching to an isolate crashes
 const SINGLE_THREADED: &str = "--single-threaded";
 
 struct Node {
     left: Member<Node>,
     right: Member<Node>,
-    #[expect(dead_code, reason = "负载：和其他库的节点一样大")]
+    #[expect(dead_code, reason = "payload: as large as the other libraries' nodes")]
     value: u64,
 }
 
-// SAFETY: 两个 Member 都追踪了
+// SAFETY: both Members are traced
 unsafe impl GarbageCollected for Node {
     fn trace(&self, visitor: &mut Visitor) {
         visitor.trace(&self.left);
@@ -48,12 +48,12 @@ unsafe impl GarbageCollected for Node {
     }
 }
 
-/// 碎片负载的对象：`N` 个 u64 的数据
+/// An object of the fragmentation load: `N` u64s of data
 struct Blob<const N: usize> {
     _data: [u64; N],
 }
 
-// SAFETY: 没有 Member
+// SAFETY: no Members
 unsafe impl<const N: usize> GarbageCollected for Blob<N> {
     fn trace(&self, _: &mut Visitor) {}
 
@@ -62,19 +62,19 @@ unsafe impl<const N: usize> GarbageCollected for Blob<N> {
     }
 }
 
-/// 一块槽：[`CHUNK`] 个 Member，放在 cppgc 堆上（Member 只能在堆对象里：写屏障按槽地址找所在页）。
-/// 只在 mutator 线程上改。
+/// A chunk of slots: [`CHUNK`] Members on the cppgc heap (Members may only live in heap objects: the write barrier finds the page from the slot's address).
+/// Changed only on the mutator thread.
 struct Chunk<const N: usize> {
     slots: UnsafeCell<[Member<Blob<N>>; CHUNK]>,
 }
 
-/// 每块几个槽
+/// Slots per chunk
 const CHUNK: usize = 64;
 
-// SAFETY: 槽都追踪了
+// SAFETY: every slot is traced
 unsafe impl<const N: usize> GarbageCollected for Chunk<N> {
     fn trace(&self, visitor: &mut Visitor) {
-        // SAFETY: 标记时 mutator 不在改这一块（增量标记在 mutator 的安全点上跑；改槽走 Member 的写屏障）
+        // SAFETY: no mutator changes this chunk while marking (incremental marking runs at the mutator's safepoints; slot changes go through Member's write barrier)
         unsafe { (*self.slots.get()).iter().for_each(|m| visitor.trace(m)) };
     }
 
@@ -83,32 +83,32 @@ unsafe impl<const N: usize> GarbageCollected for Chunk<N> {
     }
 }
 
-/// 一种大小的全部槽（按块挂在 Persistent 上）。
+/// All slots of one size (chunks held by Persistents).
 struct Slots<const N: usize>(Vec<Persistent<Chunk<N>>>);
 
 impl<const N: usize> Slots<N> {
     fn new(heap: &Heap, size: Size) -> Self {
         let chunk = || {
-            // SAFETY: 马上放进 Persistent
+            // SAFETY: put into a Persistent right away
             Persistent::new(&unsafe { make_garbage_collected(heap, Chunk { slots: UnsafeCell::new(std::array::from_fn(|_| Member::empty())) }) })
         };
         Self((0..size.slots().div_ceil(CHUNK)).map(|_| chunk()).collect())
     }
 
-    /// 分配一个对象，需要的话放进第 `slot` 个槽；返回它在 cppgc 堆上大约占的字节。
+    /// Allocate an object and put it in slot `slot` if needed; returns roughly how many bytes it takes on the cppgc heap.
     fn put(&self, heap: &Heap, slot: Option<usize>) -> usize {
-        // SAFETY: 新对象马上放进槽或丢掉，期间不分配
+        // SAFETY: the new object goes into a slot or is dropped right away, with no allocation in between
         let blob = unsafe { make_garbage_collected(heap, Blob { _data: [0; N] }) };
         if let Some(i) = slot {
-            let chunk = self.0[i / CHUNK].get().expect("块挂在 Persistent 上");
-            // SAFETY: 只有这个线程改槽
+            let chunk = self.0[i / CHUNK].get().expect("the chunk is held by a Persistent");
+            // SAFETY: only this thread changes slots
             unsafe { (&mut *chunk.slots.get())[i % CHUNK].set(&blob) };
         }
         BLOB_OVERHEAD + N * size_of::<u64>()
     }
 }
 
-/// 碎片负载的持有者：每种大小一组槽
+/// The holder of the fragmentation load: one group of slots per size
 struct Holder {
     small: Slots<3>,
     medium: Slots<30>,
@@ -121,7 +121,7 @@ impl Holder {
         Self { small: Slots::new(heap, Size::Small), medium: Slots::new(heap, Size::Medium), large: Slots::new(heap, Size::Large), huge: Slots::new(heap, Size::Huge) }
     }
 
-    /// 分配一个对象，需要的话放进槽里；返回它在 cppgc 堆上大约占的字节（头 8 + RustObj 包装 24 + 数据）。
+    /// Allocate an object and put it in a slot if needed; returns roughly how many bytes it takes on the cppgc heap (header 8 + RustObj wrapper 24 + data).
     fn place(&self, heap: &Heap, frag: &mut Frag) -> usize {
         let pick = frag.next();
         match pick.size {
@@ -132,13 +132,13 @@ impl Holder {
         }
     }
 
-    /// 槽全满时的存活字节（估算，detached 的触发用）
+    /// Live bytes when every slot is full (an estimate, for detached's trigger)
     fn live() -> usize {
         [(Size::Small, 3), (Size::Medium, 30), (Size::Large, 200), (Size::Huge, 1500)].iter().map(|&(s, n)| s.slots() * (BLOB_OVERHEAD + n * size_of::<u64>())).sum()
     }
 }
 
-/// 碎片负载里每个对象在 cppgc 堆上除数据外的字节：对象头 8 + RustObj 头与 dyn 指针 24
+/// Bytes besides data per object of the fragmentation load on the cppgc heap: object header 8 + RustObj header and dyn pointer 24
 const BLOB_OVERHEAD: usize = 32;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -154,12 +154,12 @@ impl FromStr for HeapMode {
         match s {
             "attached" => Ok(Self::Attached),
             "detached" => Ok(Self::Detached),
-            _ => Err(format!("CPPGC_HEAP 只认 attached / detached，不认 {s}")),
+            _ => Err(format!("CPPGC_HEAP accepts only attached / detached, not {s}")),
         }
     }
 }
 
-/// 进程级的 V8 平台（只能初始化一次）。
+/// The process-wide V8 platform (initialized only once).
 struct V8 {
     platform: SharedRef<v8::Platform>,
 }
@@ -169,7 +169,7 @@ impl From<NonZeroUsize> for V8 {
         let platform = if threads.get() == 1 {
             v8::new_single_threaded_default_platform(false)
         } else {
-            v8::new_default_platform(u32::try_from(threads.get()).expect("线程数太大"), false)
+            v8::new_default_platform(u32::try_from(threads.get()).expect("too many threads"), false)
         }
         .make_shared();
         v8::V8::set_flags_from_string(EXPOSE_GC);
@@ -190,14 +190,14 @@ impl V8 {
         Heap::create(self.platform.clone(), HeapCreateParams::default())
     }
 
-    /// 造树；返回的指针只在栈上，马上放进 Persistent / Member 或者丢掉。
+    /// Build a tree; the returned pointer lives only on the stack and goes into a Persistent / Member or is dropped right away.
     fn tree(heap: &Heap, depth: u32) -> UnsafePtr<Node> {
         let (left, right) = if depth > 1 {
             (Member::new(&Self::tree(heap, depth - 1)), Member::new(&Self::tree(heap, depth - 1)))
         } else {
             (Member::empty(), Member::empty())
         };
-        // SAFETY: 见上
+        // SAFETY: see above
         unsafe { make_garbage_collected(heap, Node { left, right, value: depth.into() }) }
     }
 
@@ -206,7 +206,7 @@ impl V8 {
         let mut n = 0;
         while let Some(x) = stack.pop() {
             n += 1;
-            // SAFETY: 树挂在 Persistent 上，遍历期间不回收
+            // SAFETY: the tree is held by a Persistent and is not collected while traversed
             stack.extend(unsafe { x.left.get() });
             stack.extend(unsafe { x.right.get() });
         }
@@ -214,14 +214,14 @@ impl V8 {
     }
 }
 
-/// 挂在 isolate 上的堆。
+/// A heap attached to an isolate.
 struct Attached(V8);
 
 impl Attached {
-    /// isolate 与它的 cppgc 堆。堆归 isolate 所有，指针在 isolate 活着时有效。
+    /// The isolate and its cppgc heap. The heap belongs to the isolate, and the pointer is valid while the isolate lives.
     fn isolate(&self) -> (v8::OwnedIsolate, *const Heap) {
         let mut isolate = v8::Isolate::new(v8::CreateParams::default().cpp_heap(self.0.heap()));
-        let heap: *const Heap = isolate.get_cpp_heap().expect("刚挂上的 cppgc 堆");
+        let heap: *const Heap = isolate.get_cpp_heap().expect("the cppgc heap just attached");
         (isolate, heap)
     }
 }
@@ -231,12 +231,12 @@ impl Bench for Attached {
 
     fn pause(&self) -> Option<Took> {
         let (mut isolate, heap) = self.isolate();
-        // SAFETY: 堆归 isolate 所有，isolate 活到函数末尾
+        // SAFETY: the heap belongs to the isolate, which lives until the end of the function
         let heap = unsafe { &*heap };
-        // 基线：cppgc 堆是空的时候一次完整 GC 的耗时（V8 自己那一份），打到 stderr 供对照
+        // Baseline: the time of a full GC with the cppgc heap empty (V8's own share), printed to stderr for comparison
         let start = Clock::start();
         isolate.request_garbage_collection_for_testing(GarbageCollectionType::Full);
-        eprintln!("cppgc 空堆完整 GC 基线 {:.2} ms", start.stop().wall.as_secs_f64() * 1e3);
+        eprintln!("cppgc empty-heap full GC baseline {:.2} ms", start.stop().wall.as_secs_f64() * 1e3);
         let live = Persistent::new(&V8::tree(heap, PAUSE_DEPTH));
         V8::tree(heap, PAUSE_DEPTH);
         let start = Clock::start();
@@ -249,7 +249,7 @@ impl Bench for Attached {
 
     fn gcbench(&self) -> Option<Took> {
         let (isolate, heap) = self.isolate();
-        // SAFETY: 同上
+        // SAFETY: as above
         let heap = unsafe { &*heap };
         let start = Clock::start();
         V8::tree(heap, STRETCH_DEPTH);
@@ -266,12 +266,12 @@ impl Bench for Attached {
         Some(took)
     }
 
-    /// 回收时机交给 V8 自己调度；最后一次完整 GC 后量 RSS。
+    /// Collection timing is left to V8's own scheduling; RSS is measured after the last full GC.
     fn frag(&self) -> Option<(Took, Footprint)> {
         let base = Footprint::rss();
         let start = Clock::start();
         let (mut isolate, heap) = self.isolate();
-        // SAFETY: 同上
+        // SAFETY: as above
         let heap = unsafe { &*heap };
         let h = Holder::new(heap);
         let mut frag = Frag::default();
@@ -291,7 +291,7 @@ impl Bench for Attached {
     }
 }
 
-/// 不挂 isolate 的堆。
+/// A heap not attached to an isolate.
 struct Detached(V8);
 
 impl Detached {
@@ -302,12 +302,12 @@ impl Detached {
     }
 
     fn collect(heap: &Heap) {
-        // SAFETY: 调用时栈上没有指向堆的指针（树都挂在 Persistent 上或已丢弃）
+        // SAFETY: when called no pointer into the heap is on the stack (the trees are held by Persistents or already dropped)
         unsafe { heap.collect_garbage_for_testing(EmbedderStackState::NoHeapPointers) };
     }
 }
 
-/// 照 paragc 的策略决定什么时候回收（按节点数估算字节）。
+/// Decide when to collect with paragc's policy (estimating bytes from node counts).
 #[derive(Default)]
 struct Trigger {
     allocated: usize,
@@ -359,7 +359,7 @@ impl Bench for Detached {
         Some(took)
     }
 
-    /// 照 paragc 的触发策略手动回收（按估算字节）。
+    /// Collect by hand with paragc's trigger policy (by estimated bytes).
     fn frag(&self) -> Option<(Took, Footprint)> {
         let base = Footprint::rss();
         let start = Clock::start();

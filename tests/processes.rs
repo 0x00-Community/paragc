@@ -1,5 +1,5 @@
-//! 多个进程挂同一个公开堆。子进程是本测试程序自己：带上 [`ROLE`] 等环境变量、只跑 `child` 那一条。
-//! 逐条跑：`cargo test --features crossheap --test processes -- --exact <名字>`
+//! Several processes attached to the same public heap. The child processes are this test program itself: started with [`ROLE`] and other environment variables, running only the `child` test.
+//! Run one at a time: `cargo test --features crossheap --test processes -- --exact <name>`
 #![cfg(all(target_os = "linux", feature = "crossheap", not(miri)))]
 
 use std::io::{BufRead, BufReader, Write};
@@ -12,30 +12,30 @@ use std::time::{Duration, Instant};
 use paragc::{Heap, HeapDead, CrossHeapRoot, CrossHeap, CrossHeapRef, CrossHeapSlot, CrossHeapSpace, Root, Shared, Trace, brand, cross_heap_brand};
 
 const THREADS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
-/// 公开堆的对象头
+/// Public heap object header
 const HEADER: usize = 16;
 
-/// 子进程的环境变量：做什么、堆文件、锚对象的入口号、用哪条链、跑几轮
+/// Environment variables of a child: what to do, the heap file, the anchor object's entry number, which chain to use, how many rounds
 const ROLE: &str = "PARAGC_CHILD";
 const PATH: &str = "PARAGC_PATH";
 const ANCHOR: &str = "PARAGC_ANCHOR";
 const CHAIN: &str = "PARAGC_CHAIN";
 const ROUNDS: &str = "PARAGC_ROUNDS";
-/// 子进程准备好时打印这一行
+/// A child prints this line when it is ready
 const READY: &str = "PARAGC-READY";
-/// 子进程跑完时打印这个前缀 + 链长
+/// A child prints this prefix + the chain length when done
 const DONE: &str = "PARAGC-LEN ";
-/// 建堆的子进程打印这个前缀 + 链头的入口号 + 堆号
+/// The heap-creating child prints this prefix + the chain head's entry number + the heap number
 const CREATED: &str = "PARAGC-CREATED ";
-/// 建堆的子进程：调 persist（堆与链头都留着，主人不在了也不死）
+/// The heap-creating child calls persist (the heap and the chain head stay, so it does not die with its owner)
 const PERSIST: &str = "PARAGC_PERSIST";
-/// 建堆的子进程 [`ROUNDS`] 取这个值：建好后一直等着被杀（否则正常退出）
+/// The heap-creating child with [`ROUNDS`] set to this waits to be killed after creating (otherwise it exits normally)
 const STAY: u64 = 1;
-/// 建堆的子进程挂的链长
+/// Length of the chain hung by the heap-creating child
 const CREATED_LEN: u64 = 5_000;
-/// 每轮在链头压入的节点数
+/// Nodes pushed at the chain head per round
 const PUSH: u64 = 200;
-/// 杀掉的进程最迟这么久内要被收拾、回收要能做完
+/// A killed process must be cleaned up, and a collection be able to finish, within this long
 const DEADLINE: Duration = Duration::from_secs(10);
 
 #[repr(C)]
@@ -47,7 +47,7 @@ struct Node<'p> {
 
 cross_heap_brand!(NodeB = for<'p> Node<'p>);
 
-/// 每条链一个头；0 号归父进程，其余给子进程
+/// One head per chain; number 0 belongs to the parent, the rest to children
 #[repr(C)]
 #[derive(Shared)]
 struct Anchor<'p> {
@@ -59,20 +59,20 @@ cross_heap_brand!(AnchorB = for<'p> Anchor<'p>);
 const NODE: usize = (HEADER + size_of::<Node<'static>>()).next_multiple_of(8);
 const ANCHOR_BYTES: usize = (HEADER + size_of::<Anchor<'static>>()).next_multiple_of(8);
 
-/// 子进程做什么。
+/// What a child does.
 #[derive(Clone, Copy)]
 enum Role {
-    /// 在自己的链上压入弹出 [`ROUNDS`] 轮（每 5 轮回收一次），打印链长退出
+    /// Push and pop on its own chain for [`ROUNDS`] rounds (collecting every 5), print the chain length and exit
     Churn,
-    /// 不停地压入弹出、回收，直到被杀
+    /// Keep pushing, popping and collecting until killed
     ChurnForever,
-    /// 建一条只有自己持有的链，然后停在 mutate 里不出来，直到被杀
+    /// Make a chain held only by itself, then stay inside mutate until killed
     Hold,
-    /// 不停地回收，直到被杀
+    /// Keep collecting until killed
     CollectForever,
-    /// 在 [`PATH`] 建一个堆、挂一条 [`CREATED_LEN`] 节点的链，打印入口号与堆号；然后 persist 后退出，或一直等着被杀
+    /// Create a heap at [`PATH`], hang a chain of [`CREATED_LEN`] nodes and print the entry number and heap number; then persist and exit, or wait to be killed
     Create,
-    /// 八进程场景里的一员：一个公开堆 + 一个私有堆，引用别人的公开堆；按标准输入的命令做事（见 [`Pair`]）
+    /// A member of the eight-process scenario: one public heap + one private heap, referencing the others' public heaps; acts on commands from standard input (see [`Pair`])
     Pair,
 }
 
@@ -93,16 +93,16 @@ impl FromStr for Role {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, String> {
-        [Self::Churn, Self::ChurnForever, Self::Hold, Self::CollectForever, Self::Create, Self::Pair].into_iter().find(|r| r.name() == s).ok_or_else(|| format!("未知的子进程角色 {s}"))
+        [Self::Churn, Self::ChurnForever, Self::Hold, Self::CollectForever, Self::Create, Self::Pair].into_iter().find(|r| r.name() == s).ok_or_else(|| format!("unknown child role {s}"))
     }
 }
 
-/// 链现在的长度：链上的值从头起是 len-1, len-2, …, 0（任何一步被杀都保持这个形状），头的值 + 1 就是长度。
+/// The chain's current length: its values from the head are len-1, len-2, …, 0 (this shape holds whichever step is killed), so the head's value + 1 is the length.
 fn length(heap: &CrossHeap, anchor: &CrossHeapRoot<AnchorB>, chain: usize) -> u64 {
     heap.mutate(|m| anchor.get(m).heads[chain].get(m).map_or(0, |n| n.value + 1))
 }
 
-/// 在链头压入 `push` 个、再弹掉 `pop` 个；返回新长度。
+/// Push `push` nodes at the chain head, then pop `pop`; returns the new length.
 fn churn(heap: &CrossHeap, anchor: &CrossHeapRoot<AnchorB>, chain: usize, push: u64, pop: u64) -> u64 {
     heap.mutate(|m| {
         let top = &anchor.get(m).heads[chain];
@@ -112,14 +112,14 @@ fn churn(heap: &CrossHeap, anchor: &CrossHeapRoot<AnchorB>, chain: usize, push: 
             top.set(m, Some(n));
         }
         for _ in 0..pop.min(len + push) {
-            let first = top.get(m).expect("链不比弹掉的短");
+            let first = top.get(m).expect("the chain is not shorter than what is popped");
             top.set(m, first.next.get(m));
         }
         top.get(m).map_or(0, |n| n.value + 1)
     })
 }
 
-/// 链的形状对：从头起 len-1, …, 0。返回长度。
+/// The chain has the right shape: len-1, …, 0 from the head. Returns the length.
 fn check(heap: &CrossHeap, anchor: &CrossHeapRoot<AnchorB>, chain: usize) -> u64 {
     heap.mutate(|m| {
         let mut cur = anchor.get(m).heads[chain].get(m);
@@ -127,22 +127,22 @@ fn check(heap: &CrossHeap, anchor: &CrossHeapRoot<AnchorB>, chain: usize) -> u64
         let mut expect = len;
         while let Some(n) = cur {
             expect -= 1;
-            assert_eq!(n.value, expect, "第 {chain} 条链上的值错位：对象被提前回收或指针坏了");
+            assert_eq!(n.value, expect, "values out of place on chain {chain}: an object was collected early or a pointer is corrupted");
             cur = n.next.get(m);
         }
-        assert_eq!(expect, 0, "第 {chain} 条链断了");
+        assert_eq!(expect, 0, "chain {chain} is broken");
         len
     })
 }
 
-/// 简单的线性同余随机数（种子取时间，失败时打印出来好复现）
+/// A simple linear congruential generator (seeded with the time; printed on failure so it can be reproduced)
 struct Rng(u64);
 
 impl Rng {
     fn new() -> Self {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
         let seed = u64::from(now.subsec_nanos()) ^ now.as_secs() ^ u64::from(std::process::id()) << 32;
-        eprintln!("随机种子 {seed}");
+        eprintln!("random seed {seed}");
         Self(seed | 1)
     }
 
@@ -152,7 +152,7 @@ impl Rng {
     }
 }
 
-/// 父进程这一侧：堆文件、地址区、堆、锚。
+/// The parent's side: the heap file, region, heap and anchor.
 struct Parent {
     path: PathBuf,
     heap: CrossHeap,
@@ -169,22 +169,22 @@ impl Parent {
         Self { path, heap, anchor }
     }
 
-    /// 起一个子进程。
+    /// Start a child.
     fn spawn(&self, role: Role, chain: usize, rounds: u64) -> Kid {
         Kid::spawn(role, &self.path, self.anchor.index(), chain, rounds, false)
     }
 
-    /// 等 `f` 成立，最多 [`DEADLINE`]。
+    /// Wait until `f` holds, at most [`DEADLINE`].
     fn eventually(&self, what: &str, f: impl Fn(&Self) -> bool) {
         let start = Instant::now();
         while !f(self) {
-            assert!(start.elapsed() < DEADLINE, "{what} 超时");
+            assert!(start.elapsed() < DEADLINE, "{what} timed out");
             std::thread::sleep(Duration::from_millis(5));
         }
     }
 }
 
-/// 子进程与它的输出。
+/// A child and its output.
 struct Kid {
     child: Child,
     out: BufReader<ChildStdout>,
@@ -213,18 +213,18 @@ impl Kid {
         Self { child, out, input }
     }
 
-    /// 给子进程发一行命令。
+    /// Send the child a line of command.
     fn send(&mut self, line: &str) {
         writeln!(self.input, "{line}").unwrap();
         self.input.flush().unwrap();
     }
 
-    /// 读输出直到某一行以 `prefix` 开头，返回这一行剩下的部分。
+    /// Read output until a line starts with `prefix`, returning the rest of that line.
     fn line(&mut self, prefix: &str) -> String {
         let mut line = String::new();
         loop {
             line.clear();
-            assert_ne!(self.out.read_line(&mut line).unwrap(), 0, "子进程没等到 {prefix} 就退出了");
+            assert_ne!(self.out.read_line(&mut line).unwrap(), 0, "the child exited before {prefix}");
             if let Some(rest) = line.trim_end().strip_prefix(prefix) {
                 return rest.to_owned();
             }
@@ -236,15 +236,15 @@ impl Kid {
         self.child.wait().unwrap();
     }
 
-    /// 等它正常跑完，返回它打印的链长。
+    /// Wait for it to finish normally and return the chain length it printed.
     fn finish(mut self) -> u64 {
         let len = self.line(DONE).parse().unwrap();
-        assert!(self.child.wait().unwrap().success(), "子进程失败");
+        assert!(self.child.wait().unwrap().success(), "the child failed");
         len
     }
 }
 
-/// 子进程入口：没有 [`ROLE`] 时什么都不做（父进程跑整个文件时也会跑到这里）。
+/// Child entry point: does nothing without [`ROLE`] (the parent also reaches it when running the whole file).
 #[test]
 fn child() {
     let Ok(role) = std::env::var(ROLE) else { return };
@@ -267,11 +267,11 @@ fn child() {
             m.root::<NodeB>(top.unwrap())
         });
         let index = if std::env::var(PERSIST).is_ok() {
-            // 链头变成不归任何进程的根，堆也留着：主人不在了别人照样接着用
+            // The chain head becomes a root owned by no process and the heap stays: others can continue after the owner is gone
             heap.persist();
             chain.persist()
         } else {
-            // 没有 persist：堆跟着本进程死（正常退出时句柄析构删文件；被杀时别人发现后删）
+            // No persist: the heap dies with this process (on a normal exit dropping the handle deletes the file; when killed, whoever notices deletes it)
             chain.index()
         };
         println!("{CREATED}{index} {}", heap.id());
@@ -284,7 +284,7 @@ fn child() {
         }
     }
     let heap = space.open(Path::new(&path), THREADS).unwrap();
-    let anchor: CrossHeapRoot<AnchorB> = heap.mutate(|m| m.find(env(ANCHOR).parse().unwrap())).expect("凭入口号找到锚");
+    let anchor: CrossHeapRoot<AnchorB> = heap.mutate(|m| m.find(env(ANCHOR).parse().unwrap())).expect("the anchor is found by its entry number");
     match role {
         Role::Churn => {
             for r in 0..rounds {
@@ -309,7 +309,7 @@ fn child() {
             }
         }
         Role::Hold => {
-            // 一条只有本进程句柄挂着的链：进程死后入口还掉，这条链就该被回收
+            // A chain held only by this process's handle: once the process dies its entry is returned and the chain should be collected
             let _mine = heap.mutate(|m| {
                 let mut top = None;
                 for value in 0..10_000 {
@@ -330,11 +330,11 @@ fn child() {
                 heap.collect();
             }
         }
-        Role::Create | Role::Pair => unreachable!("上面已经处理"),
+        Role::Create | Role::Pair => unreachable!("handled above"),
     }
 }
 
-/// 一个单独的目录（里面的堆号标记只归这条测试）。
+/// A directory of its own (the heap-number markers in it belong to this test only).
 struct Dir(PathBuf);
 
 impl Dir {
@@ -356,18 +356,18 @@ impl Drop for Dir {
     }
 }
 
-/// 读建堆子进程打印的（链头入口号, 堆号）。
+/// Read (chain head entry number, heap number) printed by the heap-creating child.
 fn created(kid: &mut Kid) -> (u32, usize) {
     let line = kid.line(CREATED);
     let mut parts = line.split_whitespace().map(|p| p.parse::<u64>().unwrap());
     (u32::try_from(parts.next().unwrap()).unwrap(), usize::try_from(parts.next().unwrap()).unwrap())
 }
 
-/// 打开 `path` 的堆，凭入口号找到链、核对 0..CREATED_LEN，回收后核对存活字节数与挂接数。
+/// Open the heap at `path`, find the chain by entry number and check 0..CREATED_LEN, then after collecting check live bytes and the attachment count.
 fn reopen_and_check(path: &Path, index: u32) -> CrossHeap {
     let space = CrossHeapSpace::reserve().unwrap();
     let heap = space.open(path, THREADS).unwrap();
-    let chain: CrossHeapRoot<NodeB> = heap.mutate(|m| m.find(index)).expect("建堆的进程挂的链还在");
+    let chain: CrossHeapRoot<NodeB> = heap.mutate(|m| m.find(index)).expect("the chain hung by the creating process is still there");
     let sum = heap.mutate(|m| {
         let (mut s, mut cur) = (0, Some(chain.get(m)));
         while let Some(n) = cur {
@@ -378,8 +378,8 @@ fn reopen_and_check(path: &Path, index: u32) -> CrossHeap {
     });
     assert_eq!(sum, CREATED_LEN * (CREATED_LEN - 1) / 2);
     heap.collect();
-    assert_eq!(heap.attached(), 1, "建堆的进程已经不在，它的挂接被收拾");
-    assert_eq!(heap.stats().live, NODE * usize::try_from(CREATED_LEN).unwrap(), "链还活着（我们的句柄）");
+    assert_eq!(heap.attached(), 1, "the creating process is gone and its attachment was cleaned up");
+    assert_eq!(heap.stats().live, NODE * usize::try_from(CREATED_LEN).unwrap(), "the chain is still alive (our handle)");
     drop(chain);
     heap
 }
@@ -387,41 +387,41 @@ fn reopen_and_check(path: &Path, index: u32) -> CrossHeap {
 #[test]
 fn restart_after_the_creator_is_gone() {
     let dir = Dir::new("restart");
-    // 没有 persist、被 kill -9：堆跟着死。别人打开时发现主人不在了，打开失败，文件与标记删掉
+    // No persist and killed with kill -9: the heap dies with it. Whoever opens it finds the owner gone, opening fails, and the file and marker are deleted
     let crashed = dir.file("crashed");
     let mut kid = Kid::spawn(Role::Create, &crashed, 0, 0, STAY, false);
     let (_, number) = created(&mut kid);
     kid.line(READY);
     kid.kill();
     let space = CrossHeapSpace::reserve().unwrap();
-    let err = space.open(&crashed, THREADS).err().expect("主人死了，堆跟着死");
+    let err = space.open(&crashed, THREADS).err().expect("the owner died, so the heap died with it");
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-    assert!(!crashed.exists() && !dir.file(&format!(".paragc-{number}")).exists(), "死堆的文件与标记删掉了");
-    // 没有 persist、正常退出：句柄析构时删掉
+    assert!(!crashed.exists() && !dir.file(&format!(".paragc-{number}")).exists(), "the dead heap's file and marker were deleted");
+    // No persist and a normal exit: deleted when the handle is dropped
     let exited = dir.file("exited");
     let mut kid = Kid::spawn(Role::Create, &exited, 0, 0, 0, false);
     let (_, number) = created(&mut kid);
     assert!(kid.child.wait().unwrap().success());
     assert!(!exited.exists() && !dir.file(&format!(".paragc-{number}")).exists());
-    // persist 之后被 kill -9：堆留着，别的进程打开接着用；它持有的入口在回收时还掉
+    // Killed with kill -9 after persist: the heap stays and other processes open it and continue; the entries it held are returned at collection
     let killed = dir.file("killed");
     let mut kid = Kid::spawn(Role::Create, &killed, 0, 0, STAY, true);
     let (index, _) = created(&mut kid);
     kid.line(READY);
     kid.kill();
     let heap = reopen_and_check(&killed, index);
-    assert!(heap.is_alive(), "persist 过的堆主人不在了也活着");
+    assert!(heap.is_alive(), "a persisted heap stays alive after its owner is gone");
     drop(heap);
-    // persist 之后正常退出：文件与堆号标记都留着
+    // A normal exit after persist: the file and heap-number marker both stay
     let kept = dir.file("kept");
     let mut kid = Kid::spawn(Role::Create, &kept, 0, 0, 0, true);
     let (index, number) = created(&mut kid);
     assert!(kid.child.wait().unwrap().success());
     assert!(kept.exists() && dir.file(&format!(".paragc-{number}")).exists());
     let heap = reopen_and_check(&kept, index);
-    // 不归任何进程的根要手动还；还掉以后链就收掉
+    // A root owned by no process must be returned by hand; once returned the chain is collected
     assert!(heap.mutate(|m| m.release(index)));
-    assert!(!heap.mutate(|m| m.release(index)), "还过一次就空了");
+    assert!(!heap.mutate(|m| m.release(index)), "empty after returning it once");
     heap.collect();
     assert_eq!(heap.stats().live, 0);
 }
@@ -433,20 +433,20 @@ fn heap_numbers_do_not_collide_across_processes() {
     let mut kid = Kid::spawn(Role::Create, &first, 0, 0, 0, true);
     let (_, taken) = created(&mut kid);
     assert!(kid.child.wait().unwrap().success());
-    // 本进程在同一个目录建堆：堆号不能和别的进程建的撞，两个堆在本进程能同时打开
+    // This process creates heaps in the same directory: heap numbers must not collide with other processes', and the two heaps can be open at once in this process
     let space = CrossHeapSpace::reserve().unwrap();
     let second = space.create(dir.file("second"), THREADS).unwrap();
     assert_ne!(second.id(), taken);
     let reopened = space.open(&first, THREADS).unwrap();
     assert_eq!(reopened.id(), taken);
-    // 堆文件没了，它的标记就是过期的：号收回重用
+    // The heap file is gone, so its marker is stale: the number is reclaimed and reused
     drop(reopened);
     std::fs::remove_file(&first).unwrap();
     let third = space.create(dir.file("third"), THREADS).unwrap();
-    assert_eq!(third.id(), taken, "过期标记的堆号收回重用");
+    assert_eq!(third.id(), taken, "the heap number of a stale marker is reclaimed and reused");
     drop((second, third));
     let left: Vec<_> = std::fs::read_dir(&dir.0).unwrap().map(|e| e.unwrap().file_name()).collect();
-    assert!(left.is_empty(), "建堆的句柄析构后文件与标记都删了：{left:?}");
+    assert!(left.is_empty(), "after the creating handles were dropped, files and markers were deleted: {left:?}");
 }
 
 #[test]
@@ -455,7 +455,7 @@ fn processes_share_one_heap() {
     const ROUNDS_EACH: u64 = 40;
     let p = Parent::new("share");
     let kids: Vec<Kid> = (1..=KIDS).map(|c| p.spawn(Role::Churn, c, ROUNDS_EACH)).collect();
-    // 父进程同时改 0 号链、回收
+    // The parent changes chain 0 and collects at the same time
     for r in 0..ROUNDS_EACH {
         churn(&p.heap, &p.anchor, 0, PUSH, r % 50);
         check(&p.heap, &p.anchor, 0);
@@ -465,11 +465,11 @@ fn processes_share_one_heap() {
     p.heap.collect();
     let mut live = check(&p.heap, &p.anchor, 0);
     for (c, len) in (1..=KIDS).zip(lens) {
-        assert_eq!(check(&p.heap, &p.anchor, c), len, "子进程改的链在父进程里看到的长度一样");
+        assert_eq!(check(&p.heap, &p.anchor, c), len, "the parent sees the same length for the chain the child changed");
         live += len;
     }
-    assert_eq!(p.heap.stats().live, ANCHOR_BYTES + NODE * usize::try_from(live).unwrap(), "存活字节数恰好是各条链");
-    assert_eq!(p.heap.attached(), 1, "正常退出的子进程空出了挂接槽");
+    assert_eq!(p.heap.stats().live, ANCHOR_BYTES + NODE * usize::try_from(live).unwrap(), "live bytes are exactly the chains");
+    assert_eq!(p.heap.attached(), 1, "children that exited normally freed their attachment slots");
 }
 
 #[test]
@@ -481,22 +481,22 @@ fn killed_mutator_does_not_block_collection() {
     let before = p.heap.stats().collections;
     std::thread::scope(|s| {
         let collecting = s.spawn(|| p.heap.collect());
-        // 子进程活着、停在 mutate 里：回收只能等
+        // The child is alive and stays inside mutate: collection can only wait
         std::thread::sleep(Duration::from_millis(300));
-        assert!(!collecting.is_finished(), "子进程还在 mutate 里，回收不该开始");
+        assert!(!collecting.is_finished(), "the child is still inside mutate, collection must not start");
         kid.kill();
         collecting.join().unwrap();
     });
     assert_eq!(p.heap.stats().collections, before + 1);
-    assert_eq!(p.heap.attached(), 1, "死掉的子进程被收拾了");
-    assert_eq!(p.heap.stats().live, ANCHOR_BYTES, "它那条只有自己挂着的链随入口还掉一起被回收");
+    assert_eq!(p.heap.attached(), 1, "the dead child was cleaned up");
+    assert_eq!(p.heap.stats().live, ANCHOR_BYTES, "the chain held only by it was collected once its entry was returned");
 }
 
 #[test]
 fn killed_collector_is_taken_over() {
     const TRIES: usize = 12;
     let p = Parent::new("collector");
-    // 一条大一点的链，让每次回收要花几毫秒，杀的时候多半正在回收
+    // A somewhat bigger chain so every collection takes a few milliseconds, and the kill most likely lands mid-collection
     churn(&p.heap, &p.anchor, 0, 300_000, 0);
     let mut rng = Rng::new();
     for _ in 0..TRIES {
@@ -504,12 +504,12 @@ fn killed_collector_is_taken_over() {
         kid.line(READY);
         std::thread::sleep(Duration::from_millis(5 + rng.below(30)));
         kid.kill();
-        // 父进程照常用堆：回收方死了的话，mutate 或回收会接手
+        // The parent uses the heap as usual: if the collector died, a mutate or a collection takes over
         assert_eq!(check(&p.heap, &p.anchor, 0), 300_000);
         p.heap.collect();
-        p.eventually("死掉的回收方被收拾", |p| p.heap.attached() == 1);
+        p.eventually("the dead collector was cleaned up", |p| p.heap.attached() == 1);
     }
-    assert!(p.heap.stats().takeovers > 0, "{TRIES} 次里至少有一次杀在回收中途、被接手");
+    assert!(p.heap.stats().takeovers > 0, "at least one of {TRIES} kills hit mid-collection and was taken over");
     assert_eq!(p.heap.stats().live, ANCHOR_BYTES + NODE * 300_000);
 }
 
@@ -529,9 +529,9 @@ fn random_kills_while_processes_churn() {
         churn(&p.heap, &p.anchor, 0, PUSH, PUSH - 1 + i as u64 % 3);
         check(&p.heap, &p.anchor, 0);
         std::thread::sleep(Duration::from_millis(rng.below(20)));
-        // 随便杀一个，再起一个新的接着改同一条链（先杀后起：同一条链只能有一个进程在改）
+        // Kill one at random, then start a new one to continue on the same chain (kill first, then start: only one process may change a chain)
         let c = usize::try_from(rng.below(KIDS as u64)).unwrap();
-        kids[c].take().expect("每个位置都有一个子进程").kill();
+        kids[c].take().expect("every position has a child").kill();
         kids[c] = start(c + 1);
         if i.is_multiple_of(3) {
             p.heap.collect();
@@ -541,18 +541,18 @@ fn random_kills_while_processes_churn() {
         k.kill();
     }
     p.heap.collect();
-    p.eventually("死掉的子进程都被收拾", |p| {
+    p.eventually("every dead child was cleaned up", |p| {
         p.heap.collect();
         p.heap.attached() == 1
     });
     let live: u64 = (0..=KIDS).map(|c| check(&p.heap, &p.anchor, c)).sum();
-    assert_eq!(p.heap.stats().live, ANCHOR_BYTES + NODE * usize::try_from(live).unwrap(), "被杀进程的东西都收干净了，挂着的一个不少");
+    assert_eq!(p.heap.stats().live, ANCHOR_BYTES + NODE * usize::try_from(live).unwrap(), "everything of the killed processes was reclaimed and nothing still held is missing");
 }
 
-/// 八进程场景：进程数、每个公开堆 / 私有堆里链的长度
+/// The eight-process scenario: process count and chain length in each public / private heap
 const PAIRS: usize = 8;
 const PAIR_NODES: u64 = 500_000;
-/// 八进程场景的命令与回报（标准输入 / 输出的行首）
+/// Commands and replies of the eight-process scenario (line prefixes on standard input / output)
 const PAIR_INFO: &str = "PAIR ";
 const PEERS: &str = "PEERS ";
 const LINKED: &str = "PAIR-LINKED";
@@ -561,7 +561,7 @@ const CHECK: &str = "CHECK ";
 const CHECKED: &str = "PAIR-OK ";
 const EXIT: &str = "EXIT";
 
-/// 公开堆里的「集线器」：指向每个别的进程的公开堆里给本进程的礼物
+/// The "hub" in a public heap: points at the gift for this process in every other process's public heap
 #[repr(C)]
 #[derive(Shared)]
 struct Hub<'p> {
@@ -572,7 +572,7 @@ cross_heap_brand!(HubB = for<'p> Hub<'p>);
 
 const HUB: usize = (HEADER + size_of::<Hub<'static>>()).next_multiple_of(8);
 
-/// 私有堆里的卡片：拿着别的进程公开堆里那条链的句柄
+/// A card in a private heap: holds a handle to the chain in another process's public heap
 #[derive(Trace)]
 struct Card {
     peer: usize,
@@ -581,7 +581,7 @@ struct Card {
 
 brand!(CardB = for<'gc> Card);
 
-/// 私有堆里的链
+/// A chain in the private heap
 #[derive(Trace)]
 struct Bead<'gc> {
     value: u64,
@@ -590,12 +590,12 @@ struct Bead<'gc> {
 
 brand!(BeadB = for<'gc> Bead<'gc>);
 
-/// 礼物的值：给谁的、谁给的
+/// A gift's value: whom it is for and who gave it
 fn gift_value(from: usize, to: usize) -> u64 {
     1_000_000 + (from * PAIRS + to) as u64
 }
 
-/// 八进程场景里的一个进程。
+/// One process of the eight-process scenario.
 struct Pair {
     me: usize,
     mine: CrossHeap,
@@ -603,13 +603,13 @@ struct Pair {
     hub: CrossHeapRoot<HubB>,
     private: Heap,
     beads: Root<BeadB>,
-    /// 别的进程的公开堆（死了的放掉）
+    /// The other processes' public heaps (dead ones dropped)
     peers: Vec<Option<CrossHeap>>,
     cards: Vec<Option<Root<CardB>>>,
 }
 
 impl Pair {
-    /// 子进程这一侧：建堆、报信息、等 PEERS、连上别人、等 RELEASE、报 READY，之后边干活边听命令。
+    /// The child's side: create the heaps, report, wait for PEERS, connect to the others, wait for RELEASE, report READY, then work while listening for commands.
     fn run(space: &CrossHeapSpace, path: &Path, me: usize) {
         let mine = space.create(path, THREADS).unwrap();
         let chain = mine.mutate(|m| {
@@ -620,14 +620,14 @@ impl Pair {
             m.root::<NodeB>(top.unwrap())
         });
         let hub = mine.mutate(|m| m.root::<HubB>(m.alloc(Hub { refs: Default::default() })));
-        // 给每个别的进程一份礼物：等它的集线器指上来、本进程放掉句柄后，只靠它的引用活着
+        // A gift for every other process: once its hub points here and this process drops its handle, it lives only through that reference
         let gifts: Vec<Option<CrossHeapRoot<NodeB>>> = (0..PAIRS).map(|j| (j != me).then(|| mine.mutate(|m| m.root(m.alloc(Node { value: gift_value(me, j), next: CrossHeapSlot::default() }))))).collect();
         let gift_list: Vec<String> = gifts.iter().map(|g| g.as_ref().map_or(u32::MAX, CrossHeapRoot::index).to_string()).collect();
         println!("{PAIR_INFO}{me} {} {}", chain.index(), gift_list.join(","));
         let mut stdin = std::io::stdin().lines();
         let peers_line = stdin.next().unwrap().unwrap();
         let peers_line = peers_line.strip_prefix(PEERS).expect("PEERS");
-        // 每个进程：路径 链头入口号 给各进程的礼物入口号（逗号分隔）；用 ; 分开
+        // Per process: path, chain head entry number, gift entry numbers for each process (comma separated); processes separated by ;
         let infos: Vec<(PathBuf, u32, Vec<u32>)> = peers_line
             .split(';')
             .map(|p| {
@@ -650,13 +650,13 @@ impl Pair {
         let mut cards = Vec::new();
         for (j, peer) in peers.iter().enumerate() {
             cards.push(peer.as_ref().map(|h| {
-                let chain: CrossHeapRoot<NodeB> = h.mutate(|m| m.find(infos[j].1)).expect("别人的链");
+                let chain: CrossHeapRoot<NodeB> = h.mutate(|m| m.find(infos[j].1)).expect("the other's chain");
                 private.mutate(|m| m.root(m.alloc(Card { peer: j, chain })))
             }));
-            // 集线器第 j 格指向 j 给本进程的礼物
+            // Hub slot j points at the gift j gave this process
             if let Some(h) = peer {
                 mine.mutate_with(h, |mi, mj| {
-                    let gift: CrossHeapRoot<NodeB> = mj.find(infos[j].2[me]).expect("礼物");
+                    let gift: CrossHeapRoot<NodeB> = mj.find(infos[j].2[me]).expect("gift");
                     hub.get(mi).refs[j].set(mi, mj, Some(gift.get(mj)));
                 });
             }
@@ -670,7 +670,7 @@ impl Pair {
         pair.serve(&mut stdin);
     }
 
-    /// 后台线程不停地分配、回收、读别人；主线程等命令。
+    /// A background thread keeps allocating, collecting and reading the others; the main thread waits for commands.
     fn serve(&mut self, stdin: &mut std::io::Lines<std::io::StdinLock<'static>>) {
         loop {
             let stop = std::sync::atomic::AtomicBool::new(false);
@@ -690,7 +690,7 @@ impl Pair {
         }
     }
 
-    /// 后台：在自己的公开堆上分配垃圾、回收，读活着的别人（读不到就跳过）。
+    /// Background: allocate garbage in its own public heap, collect, and read the live others (skipping those it cannot read).
     fn churn(&self, stop: &std::sync::atomic::AtomicBool) {
         let mut round = 0u64;
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
@@ -700,7 +700,7 @@ impl Pair {
                 }
             });
             for (j, peer) in self.peers.iter().enumerate() {
-                // 同时进两个公开堆用 mutate_with（按堆号顺序进门）；死了的不进
+                // Enter two public heaps at once with mutate_with (entering in heap-number order); dead ones are not entered
                 let Some(h) = peer.as_ref().filter(|h| h.is_alive()) else { continue };
                 self.mine.mutate_with(h, |mi, mj| self.hub.get(mi).refs[j].get(mj).map(|g| g.value));
             }
@@ -711,31 +711,31 @@ impl Pair {
         }
     }
 
-    /// 核对（后台已停）：死了的别人读不了、放掉；活着的读得到、值对；自己的堆存活量恰好是「链 + 集线器 + 活着的人手里的礼物」。返回自己公开堆的存活字节数。
+    /// Check (background stopped): dead others cannot be read and are dropped; live ones read with the right values; its own heap's live bytes are exactly "chain + hub + gifts held by the living". Returns the live bytes of its own public heap.
     fn check(&mut self, dead: &[usize]) -> usize {
         let me = self.me;
         for j in (0..PAIRS).filter(|&j| j != me) {
             let h = self.peers[j].as_ref();
             if dead.contains(&j) {
                 if let Some(h) = h {
-                    assert!(!h.is_alive(), "进程 {j} 死了，它的公开堆也该死");
+                    assert!(!h.is_alive(), "process {j} died, so its public heap should be dead too");
                     assert_eq!(h.try_mutate(|_| ()), Err(HeapDead));
                 }
-                // 放掉指向它的句柄：私有堆里的卡片、本进程对它的映射
+                // Drop the handles pointing at it: the card in the private heap, and this process's mapping of it
                 self.cards[j] = None;
                 self.peers[j] = None;
                 continue;
             }
-            let h = h.expect("活着的都还开着");
-            assert!(h.is_alive(), "进程 {j} 还活着");
+            let h = h.expect("every live one is still open");
+            assert!(h.is_alive(), "process {j} is still alive");
             let gift = self.mine.mutate_with(h, |mi, mj| self.hub.get(mi).refs[j].get(mj).map(|g| g.value));
-            assert_eq!(gift, Some(gift_value(j, me)), "集线器指着 {j} 给的礼物");
-            let card = self.cards[j].as_ref().expect("活着的卡片还在");
-            let head = self.private.mutate(|m| h.try_mutate(|mj| m.get(card).chain.get(mj).value)).expect("活着的读得到");
+            assert_eq!(gift, Some(gift_value(j, me)), "the hub points at the gift from {j}");
+            let card = self.cards[j].as_ref().expect("the live card is still there");
+            let head = self.private.mutate(|m| h.try_mutate(|mj| m.get(card).chain.get(mj).value)).expect("a live one can be read");
             assert_eq!(head, PAIR_NODES - 1);
             assert_eq!(self.private.mutate(|m| m.get(card).peer), j);
         }
-        // 私有堆：卡片析构（句柄还掉入口），珠链完好
+        // Private heap: cards are finalized (their handles return entries), and the bead chain is intact
         self.private.collect();
         let sum = self.private.mutate(|m| {
             let (mut s, mut cur) = (0, Some(m.get(&self.beads)));
@@ -746,13 +746,13 @@ impl Pair {
             s
         });
         assert_eq!(sum, PAIR_NODES * (PAIR_NODES - 1) / 2);
-        // 自己的公开堆：死了的人持有的礼物登记还掉，礼物收掉
+        // Its own public heap: gift registrations held by the dead are returned, and those gifts are collected
         self.mine.collect();
         let alive_peers = (0..PAIRS).filter(|&j| j != me && !dead.contains(&j)).count();
         let expected = NODE * usize::try_from(PAIR_NODES).unwrap() + HUB + NODE * alive_peers;
         let live = self.mine.stats().live;
-        assert_eq!(live, expected, "进程 {me}：存活 = 链 + 集线器 + {alive_peers} 份礼物");
-        // 和活着的别人一起回收也照常
+        assert_eq!(live, expected, "process {me}: live = chain + hub + {alive_peers} gifts");
+        // Collecting together with the live others still works
         let mut group = vec![&self.mine];
         group.extend(self.peers.iter().flatten());
         CrossHeap::collect_group(&group);
@@ -761,13 +761,13 @@ impl Pair {
     }
 }
 
-/// 进程的内存峰值与 /dev/shm 用量（在 cgroup 里跑时有意义）。
+/// The process's peak memory and /dev/shm usage (meaningful when running in a cgroup).
 fn report_memory(what: &str) {
     let cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
     let dir = cgroup.trim().rsplit(':').next().unwrap_or_default();
     let read = |f: &str| std::fs::read_to_string(format!("/sys/fs/cgroup{dir}/{f}")).map_or_else(|_| "?".into(), |v| v.trim().to_owned());
     let shm = std::fs::read_to_string("/proc/meminfo").unwrap_or_default().lines().find(|l| l.starts_with("Shmem:")).unwrap_or_default().to_owned();
-    eprintln!("[内存] {what}：cgroup memory.max={} memory.peak={} memory.current={}；{shm}", read("memory.max"), read("memory.peak"), read("memory.current"));
+    eprintln!("[memory] {what}: cgroup memory.max={} memory.peak={} memory.current={}; {shm}", read("memory.max"), read("memory.peak"), read("memory.current"));
 }
 
 #[test]
@@ -797,8 +797,8 @@ fn eight_processes_half_die() {
     for k in kids.iter_mut().flatten() {
         k.line(READY);
     }
-    report_memory("八个进程都起来了");
-    // 先让后台跑一会儿，再全体核对一次（没人死）
+    report_memory("all eight processes are up");
+    // Let the background run a while, then everyone checks once (nobody dead)
     std::thread::sleep(Duration::from_millis(200));
     for k in kids.iter_mut().flatten() {
         k.send(CHECK);
@@ -806,7 +806,7 @@ fn eight_processes_half_die() {
     for k in kids.iter_mut().flatten() {
         k.line(CHECKED);
     }
-    // 后台还在跑的时候杀掉一半
+    // Kill half while the background is still running
     std::thread::sleep(Duration::from_millis(200));
     let victims = [1, 3, 4, 6];
     for &v in &victims {
@@ -821,28 +821,28 @@ fn eight_processes_half_die() {
     for k in kids.iter_mut().flatten() {
         k.line(CHECKED);
     }
-    report_memory("死掉四个之后");
-    // 死了的堆：文件与标记都删了；活着的还在
+    report_memory("after four died");
+    // Dead heaps: file and marker deleted; live ones remain
     for i in 0..PAIRS {
         let alive = !victims.contains(&i);
-        assert_eq!(dir.file(&format!("heap-{i}")).exists(), alive, "堆 {i} 的文件");
+        assert_eq!(dir.file(&format!("heap-{i}")).exists(), alive, "heap {i}'s file");
     }
     let markers = std::fs::read_dir(&dir.0).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with(".paragc-")).count();
-    assert_eq!(markers, PAIRS - victims.len(), "死堆的标记都删了");
+    assert_eq!(markers, PAIRS - victims.len(), "the markers of dead heaps were deleted");
     for k in kids.iter_mut().flatten() {
         k.send(EXIT);
     }
     for k in kids.into_iter().flatten() {
         assert!(k.child.wait_with_output().unwrap().status.success());
     }
-    // 活着的也都退出了：它们的堆跟着死，目录空了
+    // The living have exited too: their heaps died with them and the directory is empty
     let left: Vec<_> = std::fs::read_dir(&dir.0).unwrap().map(|e| e.unwrap().file_name()).collect();
-    assert!(left.is_empty(), "进程都走了，堆都跟着死：{left:?}");
+    assert!(left.is_empty(), "every process left and every heap died with it: {left:?}");
 }
 
 #[test]
 fn simultaneous_creates_get_distinct_numbers() {
-    // 同一个目录里同时建堆：领号的标记、堆文件、超级块是几步写的，别人读到中间状态时不能当成过期标记抢走
+    // Create heaps in the same directory at once: the number marker, heap file and superblock are written in several steps, and someone reading an intermediate state must not take it for a stale marker
     const ROUNDS_EACH: usize = 5;
     for round in 0..ROUNDS_EACH {
         let dir = Dir::new(&format!("race-{round}"));
@@ -856,6 +856,6 @@ fn simultaneous_creates_get_distinct_numbers() {
         for k in kids {
             k.kill();
         }
-        assert!(unique, "第 {round} 轮同时建的堆号撞了：{numbers:?}");
+        assert!(unique, "round {round}: heap numbers created at the same time collided: {numbers:?}");
     }
 }

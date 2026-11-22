@@ -1,24 +1,24 @@
-//! 释放死对象：清扫器 [`Sweeper`]（标记后与 mutator 并发、惰性）与引用计数减到 0 的后台释放 [`Releaser`]。
+//! Freeing dead objects: the [`Sweeper`] (after marking, concurrent with mutators, lazy) and the background [`Releaser`] for objects whose reference count drops to 0.
 //!
-//! 清扫：标记收尾时（独占堆）把全部块与大对象交给 [`Sweeper`]，之后 mutator 照常跑，清扫在两头并发进行：
+//! Sweeping: at the end of marking (with the heap held exclusively) all blocks and large objects go to the [`Sweeper`]; mutators then run as usual and sweeping proceeds from both ends:
 //!
-//! - mutator 要新块时先拿清扫好的；没有就自己领一个没扫的块当场扫（析构死对象），能用就用（惰性清扫）
-//! - 回收线程（[`crate::Heap::sweep_concurrently`]）把剩下的块和大对象领走扫完
+//! - a mutator that needs a block takes a swept one first; if there is none it takes an unswept block and sweeps it on the spot (finalizing dead objects), using it if it can (lazy sweeping)
+//! - collector threads ([`crate::Heap::sweep_concurrently`]) take and sweep the remaining blocks and large objects
 //!
-//! 领用是原子游标 `fetch_add`，每个块恰好被一个线程扫一次；扫完才交出去，所以扫的时候没有 mutator 在用它。
-//! 判死用「标记纪元 ≠ 本轮」：下一轮标记开始前必须扫完（否则活对象被标成更新的纪元会被当成死的）。
+//! Taking is an atomic cursor `fetch_add`, so each block is swept exactly once by one thread; it is handed out only after sweeping, so no mutator uses it meanwhile.
+//! Death is "mark epoch ≠ this round": sweeping must finish before the next marking starts (otherwise live objects marked with a newer epoch would look dead).
 //!
-//! 引用计数的减量在线程池上并发处理（mutator 照常跑）：年轻回收的停顿只把减量放进队列。
+//! Reference count decrements are processed concurrently on the thread pool (mutators keep running): a young collection's pause only queues them.
 //!
-//! 安全性：停顿那一刻计数为 0 的对象没有计入的引用，根都 +1 过、年轻对象都已晋升或死掉 ⇒ mutator 碰不到它们，
-//! 连锁下去的也一样。释放只析构、清起点位、记下脏块；脏块的行要等下一次停顿开头重算（此刻可能有分配缓冲在往里分配）。
-//! 被释放对象的行在重算前一直标着占用，所以不会被提前分配出去。
+//! Safety: an object whose count is 0 at the pause has no counted references, every root was incremented and every young object was promoted or died ⇒ mutators cannot reach it,
+//! and the same holds down the chain. Releasing only finalizes, clears start bits and records dirty blocks; their lines are recomputed at the start of the next pause (an allocation buffer may be allocating into them right now).
+//! Lines of released objects stay marked as used until recomputed, so they are never handed out early.
 //!
-//! 结束判定与标记相同：工人自己的队列空、也偷不到 ⇒ 空闲计数 +1；全部空闲 ⇒ 结束（只有工人会往队列里放）。
+//! Termination is decided as in marking: a worker whose own queue is empty and that cannot steal adds 1 to the idle count; all idle ⇒ done (only workers push to the queues).
 //!
-//! 只在调用方线程上析构（[`crate::Heap::set_parallel_drop`] 关掉时）：别的工人照旧并行判死、清起点位、算行，
-//! 但死对象不析构，连同扫好的块一起放进待办；调用方（线程池的 0 号工人）析构完才把块交出去 / 还给系统。
-//! 析构里释放的内存多是 mutator 线程分配的，跨线程释放会让分配器（glibc 的 arena 锁）争用。
+//! Finalizing only on the caller's thread ([`crate::Heap::set_parallel_drop`] off): other workers still judge death, clear start bits and compute lines in parallel,
+//! but put dead objects, together with the swept blocks, into a pending list; the caller (worker 0 of the pool) finalizes them before handing the blocks out / back to the system.
+//! Memory freed in destructors was mostly allocated on mutator threads, and freeing it across threads makes the allocator contend (glibc's arena locks).
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
@@ -32,25 +32,25 @@ use crate::layout::{Block, Core, Finalize, GRANULE, Header, State};
 use crate::mark::{Tracer, TracerInternal};
 use crate::sync::Pool;
 
-/// 单独分配的大对象（头指针）。
+/// A separately allocated large object (header pointer).
 #[derive(Clone, Copy)]
 pub struct Large(pub NonNull<Header>);
 
-// SAFETY: 独立的堆内存；对象内容跨线程由 Trace: Send + Sync 担保
+// SAFETY: separate heap memory; the object's contents across threads are covered by Trace: Send + Sync
 unsafe impl Send for Large {}
-// SAFETY: 同上
+// SAFETY: as above
 unsafe impl Sync for Large {}
 
 impl Large {
     pub fn layout(bytes: usize) -> Layout {
-        Layout::from_size_align(bytes, GRANULE).expect("对象太大")
+        Layout::from_size_align(bytes, GRANULE).expect("object too large")
     }
 
-    /// 分配 `bytes` 字节（至少有头）：不小于 [`LARGE_MMAP`] 的在 Linux 上单独映射（释放即还给系统），其余走全局分配器。
+    /// Allocate `bytes` bytes (at least a header): on Linux, sizes of at least [`LARGE_MMAP`] get their own mapping (returned to the system when freed); the rest use the global allocator.
     pub fn alloc(bytes: usize) -> *mut u8 {
         #[cfg(all(target_os = "linux", not(miri)))]
         if bytes >= LARGE_MMAP {
-            // SAFETY: 匿名私有映射，参数合法
+            // SAFETY: an anonymous private mapping with valid arguments
             let p = unsafe { libc::mmap(core::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
             if p == libc::MAP_FAILED {
                 handle_alloc_error(Self::layout(bytes));
@@ -58,7 +58,7 @@ impl Large {
             return p.cast();
         }
         let layout = Self::layout(bytes);
-        // SAFETY: 大小非零（至少有头）
+        // SAFETY: the size is non-zero (at least a header)
         let p = unsafe { alloc(layout) };
         if p.is_null() {
             handle_alloc_error(layout);
@@ -67,48 +67,48 @@ impl Large {
     }
 
     fn header(&self) -> &Header {
-        // SAFETY: 大对象活着时头一直有效
+        // SAFETY: the header stays valid while the large object lives
         unsafe { self.0.as_ref() }
     }
 
-    /// 析构并释放。SAFETY（调用方）：死了，没人会再碰它。
+    /// Finalize and free. SAFETY (caller): it is dead and nobody touches it again.
     unsafe fn free(self) {
         let bytes = self.header().bytes();
-        // 晋升进跨堆的（搬走了）没有析构，析构函数那个字存着新地址
+        // Objects promoted into a cross-heap (moved away) have no destructor; the destructor word holds the new address
         if !self.header().is_forwarded() {
-            // SAFETY: 没标记 ⇒ 不可达
+            // SAFETY: not marked ⇒ unreachable
             unsafe { Header::finalize(self.0.as_ptr()) };
         }
         #[cfg(all(target_os = "linux", not(miri)))]
         if bytes >= LARGE_MMAP {
-            // SAFETY: Large::alloc 按同样的字节数映射的
+            // SAFETY: mapped by Large::alloc with the same byte count
             unsafe { libc::munmap(self.0.as_ptr().cast(), bytes) };
             return;
         }
-        // SAFETY: 内存来自 Large::alloc 按同一 layout 的分配
+        // SAFETY: the memory comes from Large::alloc with the same layout
         unsafe { dealloc(self.0.as_ptr().cast(), Self::layout(bytes)) };
     }
 }
 
-/// 别的工人扫好、等调用方析构的项。
+/// Items swept by other workers and waiting for the caller to finalize.
 enum Pending {
-    /// 扫好的块、它的状态、里面待析构的死对象（头地址）
+    /// A swept block, its state and the dead objects in it waiting to be finalized (header addresses)
     Block(Block, State, Vec<usize>),
-    /// 死了的大对象
+    /// A dead large object
     Large(Large),
 }
 
-/// 扫完一个块的去向。
+/// Where a block goes after sweeping.
 pub enum Outcome {
-    /// 有空行（含全空），可以分配
+    /// Has free lines (including fully empty): can be allocated from
     Usable(Block),
-    /// 满了
+    /// Full
     Full(Block),
-    /// 全空且留够了备用：还给系统（死对象已析构，块里没有活对象）
+    /// Empty and enough spares are kept: return it to the system (dead objects are finalized, no live objects remain)
     Release(Block),
 }
 
-/// 清扫完一项后交给谁。
+/// Who receives an item once it is swept.
 pub trait Sink {
     fn block(&self, outcome: Outcome);
     fn large(&self, survivor: Large);
@@ -116,27 +116,27 @@ pub trait Sink {
 
 #[derive(Default)]
 pub struct Sweeper {
-    /// 本轮判活的纪元
+    /// The epoch that counts as alive this round
     epoch: u32,
     blocks: Vec<Block>,
     next_block: AtomicUsize,
     large: Vec<Large>,
     next_large: AtomicUsize,
-    /// 还没扫完的项（领走没扫完的也算）
+    /// Items not yet swept (taken but unfinished ones included)
     unfinished: AtomicUsize,
-    /// 还能留作备用的全空块数
+    /// How many more empty blocks may be kept as spares
     spare: AtomicUsize,
-    /// 本轮存活字节数（含头）
+    /// Live bytes this round (including headers)
     live: AtomicUsize,
-    /// 只在调用方线程析构时：别的工人扫好、等调用方析构的项（处理完才算扫完）
+    /// Only when finalizing on the caller's thread: items swept by other workers waiting for the caller to finalize (they count as swept only once handled)
     pending: Injector<Pending>,
-    /// 本轮有空行的块把凑满整页的空行还给系统
+    /// This round, blocks with free lines give whole pages of free lines back to the system
     discard: bool,
 }
 
 impl Sweeper {
-    /// 开始一轮（独占堆时）。上一轮必须已经扫完。
-    /// `discard`：有空行的块把凑满整页的空行还给系统（[`crate::Heap::shrink`]）。
+    /// Start a round (with the heap held exclusively). The previous round must be finished.
+    /// `discard`: blocks with free lines give whole pages of free lines back to the system ([`crate::Heap::shrink`]).
     pub fn start(&mut self, epoch: u32, blocks: Vec<Block>, large: Vec<Large>, spare: usize, discard: bool) {
         debug_assert!(self.is_done());
         self.discard = discard;
@@ -154,39 +154,39 @@ impl Sweeper {
         self.unfinished.load(Ordering::Acquire) == 0
     }
 
-    /// 本轮到目前为止扫出的存活字节数（扫完才是全部）。
+    /// Live bytes found so far this round (complete only once sweeping is done).
     pub fn live(&self) -> usize {
         self.live.load(Ordering::Relaxed)
     }
 
-    /// 还没扫完的项数（估计回收线程数用）。
+    /// Items not yet swept (to estimate the number of collector threads).
     pub fn unfinished(&self) -> usize {
         self.unfinished.load(Ordering::Relaxed)
     }
 
-    /// 领一个没扫的块并扫掉。没有可领的了返回 None。领到的扫完、交出结果后要调 [`Sweeper::finished`]。
+    /// Take an unswept block and sweep it. Returns None when there is nothing left to take. Call [`Sweeper::finished`] after handing out the result.
     pub fn sweep_next_block(&self) -> Option<Outcome> {
         let (b, state) = self.sweep_claimed(None)?;
         Some(self.settle(b, state))
     }
 
-    /// 领一个没扫的块并扫掉（`deferred` 见 [`Block::sweep`]），返回块与状态。
+    /// Take an unswept block and sweep it (`deferred`: see [`Block::sweep`]); returns the block and its state.
     fn sweep_claimed(&self, deferred: Option<&mut Vec<usize>>) -> Option<(Block, State)> {
         let i = self.next_block.fetch_add(1, Ordering::AcqRel);
         let b = *self.blocks.get(i)?;
-        // SAFETY: 本轮标记已完成；这个块只分给了这一次领用，扫完前没人分配进去
+        // SAFETY: this round's marking is complete; the block was given to this taker only and nobody allocates into it before it is swept
         let (state, live) = unsafe { b.sweep::<Header>(self.epoch, deferred) };
         self.live.fetch_add(live, Ordering::Relaxed);
         Some((b, state))
     }
 
-    /// 扫好（死对象都已析构）的块的去向。
+    /// Where a swept block goes (its dead objects are all finalized).
     fn settle(&self, b: Block, state: State) -> Outcome {
         match state {
             State::Full => Outcome::Full(b),
             State::Recyclable => {
                 if self.discard {
-                    // SAFETY: 死对象都已析构，空行里没有要用的东西；块还没交出去
+                    // SAFETY: dead objects are finalized and nothing in the free lines is needed; the block has not been handed out
                     unsafe { b.discard_free_lines(self.epoch) };
                 }
                 Outcome::Usable(b)
@@ -196,7 +196,7 @@ impl Sweeper {
         }
     }
 
-    /// 还能留一个全空块作备用就占掉一个名额。
+    /// Take one spare slot if another empty block may still be kept.
     fn take_spare(&self) -> bool {
         let mut left = self.spare.load(Ordering::Acquire);
         while left > 0 {
@@ -208,12 +208,12 @@ impl Sweeper {
         false
     }
 
-    /// 一项扫完（交出结果之后调用）。
+    /// An item is done (call after handing out the result).
     pub fn finished(&self) {
         self.unfinished.fetch_sub(1, Ordering::AcqRel);
     }
 
-    /// 领一个没扫的大对象并扫掉；活着的交给 `sink`。没有可领的了返回 false。`defer`：死了不析构，放进待办。
+    /// Take an unswept large object and sweep it; a live one goes to `sink`. Returns false when there is nothing left. `defer`: a dead one is not finalized but put on the pending list.
     fn sweep_next_large(&self, sink: &impl Sink, defer: bool) -> bool {
         let i = self.next_large.fetch_add(1, Ordering::AcqRel);
         let Some(&l) = self.large.get(i) else { return false };
@@ -224,15 +224,15 @@ impl Sweeper {
             self.pending.push(Pending::Large(l));
             return true;
         } else {
-            // SAFETY: 本轮标记已完成、没标上 ⇒ 不可达；这个大对象只分给了这一次领用
+            // SAFETY: this round's marking is complete and it is not marked ⇒ unreachable; this large object was given to this taker only
             unsafe { l.free() };
         }
         self.finished();
         true
     }
 
-    /// 回收线程：扫到没有可领的为止。`defer`：死对象不析构，连同块放进待办（只在调用方线程析构时的其他工人）；
-    /// 调用方自己当场析构，每扫完一块顺手处理一批待办。
+    /// Collector thread: sweep until nothing is left to take. `defer`: dead objects are not finalized but put on the pending list with their blocks (the other workers when finalizing only on the caller's thread);
+    /// the caller finalizes on the spot and handles a batch of pending items after each block.
     fn work(&self, sink: &impl Sink, defer: bool, caller: bool) {
         let mut dead = Vec::new();
         while let Some((b, state)) = self.sweep_claimed(defer.then_some(&mut dead)) {
@@ -249,18 +249,18 @@ impl Sweeper {
         while self.sweep_next_large(sink, defer) {}
     }
 
-    /// 调用方：析构待办里的死对象，再把块交出去。
+    /// Caller: finalize the dead objects in the pending list, then hand the blocks out.
     fn drain(&self, sink: &impl Sink) {
         loop {
             match self.pending.steal() {
                 Steal::Success(Pending::Block(b, state, dead)) => {
                     for addr in dead {
-                        // SAFETY: 扫块时判死的对象，还没析构；块交出去之前没人碰它
+                        // SAFETY: objects judged dead while sweeping, not yet finalized; nobody touches the block before it is handed out
                         unsafe { <Header as Finalize>::finalize(core::ptr::with_exposed_provenance::<Core>(addr)) };
                     }
                     sink.block(self.settle(b, state));
                 }
-                // SAFETY: 判死的大对象，只在待办里
+                // SAFETY: a large object judged dead, only on the pending list
                 Steal::Success(Pending::Large(l)) => unsafe { l.free() },
                 Steal::Retry => continue,
                 Steal::Empty => return,
@@ -269,8 +269,8 @@ impl Sweeper {
         }
     }
 
-    /// 用回收线程把本轮扫完，并等别人（惰性清扫的 mutator）手里领走的也扫完。
-    /// `parallel_drop` 为假时死对象只在调用方线程上析构（见模块说明）。
+    /// Finish this round on the collector threads, and wait for blocks taken by others (mutators sweeping lazily) to be finished too.
+    /// With `parallel_drop` false dead objects are finalized only on the caller's thread (see the module docs).
     pub fn finish(&self, pool: &Pool, sink: &(impl Sink + Sync), parallel_drop: bool) {
         if self.is_done() {
             return;
@@ -288,22 +288,22 @@ impl Sweeper {
 }
 
 pub struct Releaser<'h> {
-    /// 待减的对象（头地址）
+    /// Objects to decrement (header addresses)
     decs: &'h Injector<usize>,
-    /// 释放过对象的块（下一次停顿时重算行）
+    /// Blocks in which objects were released (lines recomputed at the next pause)
     dirty: &'h Injector<Block>,
     workers: usize,
     idle: CachePadded<AtomicUsize>,
-    /// 判老：标记纪元等于它
+    /// Old means: mark epoch equals this
     epoch: u32,
-    /// 当前计数的奇偶
+    /// Parity of the current count
     parity: bool,
-    /// 只在调用方线程析构：别的工人归零、还没析构的对象（头地址）
+    /// Only when finalizing on the caller's thread: objects other workers brought to zero but did not finalize (header addresses)
     pending: Option<Injector<usize>>,
 }
 
 impl<'h> Releaser<'h> {
-    /// `parallel_drop` 为假：归零的对象只在调用方线程上析构。
+    /// With `parallel_drop` false, objects brought to zero are finalized only on the caller's thread.
     pub fn new(decs: &'h Injector<usize>, dirty: &'h Injector<Block>, workers: usize, epoch: u32, parity: bool, parallel_drop: bool) -> Self {
         let pending = (!parallel_drop).then(Injector::new);
         Self { decs, dirty, workers: workers.max(1), idle: CachePadded::new(AtomicUsize::new(0)), epoch, parity, pending }
@@ -357,11 +357,11 @@ impl<'h> Releaser<'h> {
         }
     }
 
-    /// 对一个对象 −1；减到 0 的块内老对象释放：它每条边的目标再 −1（放进本地队列），析构，清起点位。
-    /// 大对象、粘住的、年轻的不在这里释放（留给追踪 / 年轻清扫）。`defer`：边处理完后不析构，放进待办给调用方。
+    /// Decrement an object; an old in-block object that reaches 0 is released: the target of each of its edges is decremented in turn (pushed on the local queue), then it is finalized and its start bit cleared.
+    /// Large, stuck and young objects are not released here (left to tracing / young sweeping). `defer`: after the edges, put it on the pending list for the caller instead of finalizing.
     fn one(&self, addr: usize, local: &Worker<usize>, defer: Option<&Injector<usize>>) {
         let header = core::ptr::with_exposed_provenance::<Header>(addr);
-        // SAFETY: 减量来自计入过的边，目标在计数归零前一直活着
+        // SAFETY: the decrement comes from a counted edge; the target stays alive until its count reaches zero
         let h = unsafe { &*header };
         if !h.rc_dec(self.parity) || h.is_large() || !h.is_marked(self.epoch) {
             return;
@@ -369,7 +369,7 @@ impl<'h> Releaser<'h> {
         let mut children = Vec::new();
         let seed = Worker::new_lifo();
         let mut t = Tracer::releasing(&seed, &mut children);
-        // SAFETY: 对象还没析构；释放模式只读它的边；计数归零后只有拿到 true 的这一个线程碰它
+        // SAFETY: not yet finalized; release mode only reads its edges; once the count is zero only the thread that got true touches it
         unsafe { Header::visit(header, &mut t) };
         for child in children {
             local.push(child);
@@ -380,9 +380,9 @@ impl<'h> Releaser<'h> {
         }
     }
 
-    /// 析构归零的对象、清起点位、记下脏块。
+    /// Finalize an object brought to zero, clear its start bit and record the dirty block.
     fn free(&self, header: *const Header) {
-        // SAFETY: 计数归零 ⇒ 没有计入的引用、mutator 碰不到（见模块说明）；只有归零的那个线程（或它交给的调用方）碰它
+        // SAFETY: count zero ⇒ no counted references and unreachable for mutators (see the module docs); only the thread that brought it to zero (or the caller it handed it to) touches it
         unsafe { Header::finalize(header) };
         let block = Block::containing(header.cast());
         block.clear_start(header.cast());
