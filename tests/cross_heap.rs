@@ -826,7 +826,10 @@ fn young_survivors_promote_into_attached_cross_heap() {
         assert!(!in_fixed(keeper.as_ptr().addr()), "a non-shareable object stays in the private heap");
         assert_eq!(keeper.node.get().map(|n| n.value), Some(LEN - 2), "the slot in the private object was rewritten to the new address");
         assert!(m.upgrade(&weak).is_some_and(|n| in_fixed(n.as_ptr().addr())), "the weak reference followed the move");
-        cross.mutate(|cm| cm.sign(cm.adopt::<SNodeX, _>(m.get(&root)).expect("in the cross-heap")))
+        let sig = cross.mutate(|cm| cm.sign(cm.adopt::<SNodeX, _>(m.get(&root)).expect("in the cross-heap")));
+        assert_eq!(cross.mutate(|cm| cm.sign_promoted(m.get(&root))), Some(sig), "signing without a brand gives the same signature");
+        assert_eq!(cross.mutate(|cm| cm.sign_promoted(keeper)), None, "a private object has no signature");
+        sig
     });
     assert_eq!(cross.mutate(|cm| cm.resolve::<SNodeX>(&sig).map(|n| n.value)), Some(LEN - 1), "the signature finds the promoted object");
     // Only the owner collects the cross-heap: collecting it on its own does nothing

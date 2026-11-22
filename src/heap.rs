@@ -2532,6 +2532,16 @@ impl<'p> CrossHeapMutator<'p> {
         self.heap.is_type::<B::Of<'p>>(data).then(|| unsafe { CrossHeapGc::from_data(data) })
     }
 
+    /// The signature of the object a private heap [`Gc`] points at, when it is an object of this heap (promoted here, see [`Heap::attach_cross_heap`]); None otherwise.
+    /// Needs no brand: the type key is read from the object's header.
+    pub fn sign_promoted<T>(&self, gc: Gc<'_, T>) -> Option<Signature> {
+        let off = self.heap.offset_of(gc.as_ptr().addr()).filter(|&off| self.heap.owns(off))?;
+        let data = self.heap.ptr(off);
+        // SAFETY: a live Gc pointing into this heap is the data of a promoted object, with its header in front
+        let stamp = unsafe { (*PHeader::of(data)).stamp };
+        Some((WeakWord::from((off, stamp)), self.heap.incarnation(), self.heap.key_of(data)).into())
+    }
+
     /// The object's signature: send it to another process, which opens this heap and finds the object with it ([`CrossHeapMutator::resolve`]). A signature keeps nothing alive.
     pub fn sign<T: Shared>(&self, gc: CrossHeapGc<'p, T>) -> Signature {
         (WeakWord::from(gc), self.heap.incarnation(), self.heap.key_of(gc.as_ptr().cast())).into()
