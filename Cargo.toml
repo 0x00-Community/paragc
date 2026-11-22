@@ -34,6 +34,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# 跨堆（共享内存上的公开堆、跨进程共享）：只在 Linux 上生效，别的平台打开也不编进来
+crossheap = []
+
+[package.metadata.docs.rs]
+features = ["crossheap"]
+
 [dependencies]
 paragc-macros.workspace = true
 crossbeam-deque = "0.8.8"

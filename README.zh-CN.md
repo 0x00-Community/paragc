@@ -125,7 +125,7 @@ heap.collect();
 - `Far` 用 `Far::new(holder, target, gc)` 建（同时在两个堆的 `mutate` 里），只能放进持有方堆的对象里（品牌限制），
   读要带目标堆的 `Mutator`（`far.get(mb)`）。建好后不变；要改指向，把它放在 `Slot` 后面的对象里、换掉那个对象。同一个堆里的边用 `Slot`。
 - 跨堆的环只有 `Heap::collect_group` 能收。
-- 公开堆只支持 Linux。类型用 `#[derive(Shared)]`：`#[repr(C)]`，只有纯数据、`CrossHeapSlot`、嵌套的 `Shared` 类型与定长数组，没有析构。
+- 公开堆（跨堆、跨进程共享）在 `crossheap` feature 后面，只在 Linux 上有；别的平台打开这个 feature 也不编进来，只有私有堆。类型用 `#[derive(Shared)]`：`#[repr(C)]`，只有纯数据、`CrossHeapSlot`、嵌套的 `Shared` 类型与定长数组，没有析构。
   公开堆还没有并发标记、年轻回收、引用计数、疏散：`collect` 是暂停式的，要等每个活着的进程的 mutator 走空。
 - 能写这个堆的进程都能把它写坏：共用一个堆的进程互相信任。死掉的进程可能留下少量用不了的块或入口（死在「领了、还没登记」之间），
   但它留下的任何东西都不会被当成对象去读。
@@ -199,7 +199,7 @@ crossbeam-epoch 的全局回收器退出时还拿着延迟释放的垃圾；每�
 在 Stacked Borrows 下仍会碰到 crossbeam-epoch 内部那处违例（crossbeam-deque 压栈时），Tree Borrows 下干净：
 
 ```sh
-cargo test --test gc -- --exact <名字>          # 另有 --test far · --test weak · --test word · --test cross_heap · --test processes
+cargo test --test gc -- --exact <名字>          # 另有 --test far · --test weak · --test word；加 --features crossheap 另有 --test cross_heap · --test processes
 MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-ignore-leaks" cargo +nightly miri test --test gc -- --exact <名字>
 MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-ignore-leaks -Zmiri-tree-borrows" cargo +nightly miri test --test gc -- --exact <名字>
 ```

@@ -1,5 +1,5 @@
-//! 公开堆（共享内存上的堆）。逐条跑：`cargo test --test cross_heap -- --exact <名字>`
-#![cfg(target_os = "linux")]
+//! 公开堆（共享内存上的堆）。逐条跑：`cargo test --features crossheap --test cross_heap -- --exact <名字>`
+#![cfg(all(target_os = "linux", feature = "crossheap"))]
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;

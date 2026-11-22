@@ -142,7 +142,7 @@ Work-stealing deques and backoff come from [crossbeam](https://github.com/crossb
   holder heap's objects (its brand), and is read with the target heap's `Mutator` (`far.get(mb)`). It never changes;
   to point elsewhere, keep it in an object behind a `Slot` and replace that object. Edges within one heap use `Slot`.
 - Cycles that span heaps are reclaimed only by `Heap::collect_group`.
-- Public heaps are Linux only. Their types use `#[derive(Shared)]`: `#[repr(C)]`, only plain data, `CrossHeapSlot`,
+- Public heaps (cross-heap and cross-process sharing) sit behind the `crossheap` feature and exist only on Linux; on other platforms the feature compiles to nothing and only the private heap is there. Their types use `#[derive(Shared)]`: `#[repr(C)]`, only plain data, `CrossHeapSlot`,
   nested `Shared` types and fixed-size arrays, no destructor. Public heaps do not yet have concurrent marking, young
   collections, reference counting or evacuation: `collect` is stop-the-world, and waits for every live process's
   mutators to leave.
@@ -224,7 +224,7 @@ under Miri; the two concurrent `gc` tests and `far_targets_are_pinned_during_eva
 crossbeam-deque push), and are clean under Tree Borrows:
 
 ```sh
-cargo test --test gc -- --exact <name>          # also --test far · --test weak · --test word · --test cross_heap · --test processes
+cargo test --test gc -- --exact <name>          # also --test far · --test weak · --test word; with --features crossheap also --test cross_heap · --test processes
 MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-ignore-leaks" cargo +nightly miri test --test gc -- --exact <name>
 MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-ignore-leaks -Zmiri-tree-borrows" cargo +nightly miri test --test gc -- --exact <name>
 ```

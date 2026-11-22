@@ -7,4 +7,4 @@ publish.workspace = true
 
 [dependencies]
 bench-common.workspace = true
-paragc = { path = "../.." }
+paragc = { path = "../..", features = ["crossheap"] }

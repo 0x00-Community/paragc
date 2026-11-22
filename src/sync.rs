@@ -12,9 +12,9 @@ use core::mem::MaybeUninit;
 use core::num::NonZeroUsize;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use core::sync::atomic::AtomicU32;
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use core::time::Duration;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -431,19 +431,19 @@ impl<T> Drop for PushList<T> {
 }
 
 /// 栈头低 32 位：栈顶序号 + 1（0 = 空）；高 32 位是改动次数（防 ABA）
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 const STACK_TOP: u64 = u32::MAX as u64;
 /// 栈头里改动次数的位移
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 const STACK_TAG_SHIFT: u32 = u32::BITS;
 
 /// 窗口里的无锁栈（可用块、还回来的入口）：头在超级块里，每个元素的「下一个」在它自己的表项里。
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct Stack<'a> {
     head: &'a AtomicU64,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<'a> Stack<'a> {
     /// 头在 `head` 的栈。
     pub fn on(head: &'a AtomicU64) -> Self {
@@ -501,7 +501,7 @@ impl<'a> Stack<'a> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 /// 共享内存上的 32 位字当 futex 用（不带 FUTEX_PRIVATE_FLAG，跨进程有效）。Miri 下退化成让出时间片。
 pub trait FutexWord {
     /// 字还等于 `expected` 就睡，最多 `timeout`（醒来不保证字变了，调用方自己再查）。
@@ -510,7 +510,7 @@ pub trait FutexWord {
     fn wake_all(&self);
 }
 
-#[cfg(all(target_os = "linux", not(miri)))]
+#[cfg(all(crossheap, not(miri)))]
 impl FutexWord for AtomicU32 {
     fn wait(&self, expected: u32, timeout: Duration) {
         let ts = libc::timespec {
@@ -527,7 +527,7 @@ impl FutexWord for AtomicU32 {
     }
 }
 
-#[cfg(all(target_os = "linux", miri))]
+#[cfg(all(crossheap, miri))]
 impl FutexWord for AtomicU32 {
     fn wait(&self, _: u32, _: Duration) {
         std::thread::yield_now();
@@ -538,14 +538,14 @@ impl FutexWord for AtomicU32 {
 
 /// 回收方放开回收权后，再抢之前的退让：时长随机（错开同时在抢的几个回收方，免得每次都一起撞上）、
 /// 上限随次数翻倍，封顶 [`Retry::MAX`]。
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct Retry {
     round: u32,
     /// 每个回收方自己的随机源（std 的随机种子），不用全局状态
     seed: std::collections::hash_map::RandomState,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl Retry {
     /// 第一次退让的上限
     const BASE: Duration = Duration::from_millis(2);

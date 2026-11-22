@@ -14,20 +14,20 @@
 //!
 //! 第一期（单进程）：多个线程同时 mutate、碰撞分配；回收是暂停式的并行标记 + 并行清扫，不搬对象。握手字在超级块里，
 //! 所以同一个堆被映射两次（同一进程里两个地址区，或以后跨进程）也互相排斥。
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use core::any::type_name;
 use core::cell::Cell;
 use core::marker::PhantomData;
 use core::num::{NonZeroU32, NonZeroUsize};
 use core::ptr::{NonNull, null_mut};
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use core::time::Duration;
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use std::io;
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use std::fs::File;
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -36,21 +36,21 @@ use crossbeam_utils::{Backoff, CachePadded};
 
 use crate::{Gc, Trace};
 use crate::handle::{GcInternal, Invariant, RawSlot, RootTable};
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use crate::handle::{EdgeMap, CrossHeapRoot, CrossHeapBrand, CrossHeapGc, CrossHeapGcInternal, CrossHeapRootInternal, STAMP_MASK, Shared, Signature, WeakWord};
 use crate::layout::{BLOCK, Block, Pages, WARM_CYCLES, YOUNG_COPY_DEN, YOUNG_COPY_NUM, LINE, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, HEADER, Header, LARGE, MAX_EPOCH, MIN_SPARE_BLOCKS, MIN_TRIGGER, OVERFLOW_TRIES, FRAG_NUM, FRAG_DEN, YOUNG_PER_FULL, YOUNG_PER_FULL_RC};
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use crate::layout::{Core, State};
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use crate::layout::{ATTACH_CAP, ATTACH_OFF, Attachment, BlockState, Entry, Kind, MAP_CAP, PAGE, PHEADER, PHeader, Segment, Super, TYPE_CAP, TypeEntry, WindowLayout};
 use crate::mark::Marking;
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use crate::mark::{Marker, Member};
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use crate::shm::{Liveness, Process, Region, Registry, Space, WINDOW, WINDOWS};
 use crate::sweep::{Large, Outcome, Releaser, Sink, Sweeper};
 use crate::sync::{Pool, SegVec};
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use crate::sync::{FutexWord, Retry, Stack};
 
 pub struct Heap {
@@ -1128,44 +1128,44 @@ impl<'gc> MutatorInternal<'gc> for Mutator<'gc> {
 }
 
 /// 等别人（回收方、mutate 里的线程）时每隔多久醒来查一次对方进程还在不在
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 const POLL: Duration = Duration::from_millis(10);
 /// [`Attachment::pid`]：有人正在收拾这个死掉的挂接（防两个回收方重复还它的入口）
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 const REAPING: u32 = u32::MAX;
 /// 回收方抢回收权前，等挡在门口的 mutator 进门最多等这么多轮（每轮 [`POLL`]）
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 const YIELD_ROUNDS: usize = 10;
 /// 回收方等 mutate 走空最多等这么久，等不到就先放开请求、过一会儿重来：一个线程在 A 的 mutate 里又去进 B 时，
 /// 两个回收方（或一起回收）分别挡着 A、B 会互相等死，放开请求就解开了
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 const PATIENCE: Duration = Duration::from_millis(50);
 /// [`Entry::holder`] 的最高位：持有方是另一个公开堆（低位是它的堆号，[`Entry::holder_incarnation`] 是它的身份），不是某个挂接（槽号 + 1）
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub const HEAP_HOLDER: u32 = 1 << 31;
 /// [`Entry::holder`]：持有方堆和这个堆在同一个目录（同一份堆号登记），可以按目录判它死活、死了就还掉它的登记
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub const SAME_DIR: u32 = 1 << 30;
 /// [`Entry::holder`] 里堆号那几位
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 const HOLDER_INDEX: u32 = SAME_DIR - 1;
 /// `try_mutate` 隔多久才重新查一次主人还在不在（读 /proc）
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 const ALIVE_RECHECK: Duration = Duration::from_millis(10);
 /// 清扫时每次领多少块
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 const SWEEP_BATCH: usize = 16;
 /// 出生戳的打散用 SplitMix64：纪元乘的黄金比例常数
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 const SPLITMIX_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
 /// SplitMix64 末尾三轮的右移位数
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 const SPLITMIX_SHIFTS: [u32; 3] = [30, 27, 31];
 /// SplitMix64 末尾两轮的乘数
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 const SPLITMIX_MULS: [u64; 2] = [0xbf58_476d_1ce4_e5b9, 0x94d0_49bb_1331_11eb];
 /// 窗口背后是什么。
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub enum Backing {
     /// 共享内存文件系统上的文件；`owner` = 本句柄建的（本进程是主人），析构时堆跟着死、删文件与标记（除非 persist）。
     /// 凭别人交来的文件描述符打开的没有路径（[`crate::CrossHeapSpace::open_fd`]）
@@ -1174,7 +1174,7 @@ pub enum Backing {
     Anonymous,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl Backing {
     /// 让窗口的 `[offset, offset + len)` 有内存可用（文件：延长；匿名：本来就有）。
     fn commit(&self, offset: usize, len: usize) {
@@ -1194,10 +1194,10 @@ impl Backing {
 }
 
 /// 类型键用的 64 位 FNV-1a。
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 struct Fnv(u64);
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl Fnv {
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     /// 两个不同的起点，合成 128 位
@@ -1232,7 +1232,7 @@ impl Fnv {
 }
 
 /// 进程这一侧的公开堆：窗口在哪、怎么延长文件、回收线程池、类型号缓存。
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct Inner {
     /// 地址区：窗口在它里面，Arc 让它比堆活得久
     space: Arc<Space>,
@@ -1255,13 +1255,13 @@ pub struct Inner {
 }
 
 // SAFETY: 窗口里的状态都是原子量或由握手保护；其余是线程安全的
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 unsafe impl Send for Inner {}
 // SAFETY: 同上
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 unsafe impl Sync for Inner {}
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl Inner {
     /// 窗口 `index` 已经映射上 `backing`；`fresh` 时写新的超级块，否则核对。出错时析构负责还窗口。
     pub fn new(space: Arc<Space>, index: usize, backing: Backing, threads: NonZeroUsize, fresh: bool) -> io::Result<Self> {
@@ -1985,7 +1985,7 @@ impl Inner {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl Drop for Inner {
     fn drop(&mut self) {
         // 句柄都已析构（入口都还了），没有 mutator：空出挂接槽
@@ -2014,10 +2014,10 @@ impl Drop for Inner {
 }
 
 /// 公开堆。多个线程可以同时 [`CrossHeap::mutate`]；同一个堆在别处（另一个地址区、以后另一个进程）也映射着时，握手照样互相排斥。
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct CrossHeap(Arc<Inner>);
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl From<Inner> for CrossHeap {
     fn from(inner: Inner) -> Self {
         Self(Arc::new(inner))
@@ -2026,22 +2026,22 @@ impl From<Inner> for CrossHeap {
 
 /// 堆已经死了（主人不在了）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct HeapDead;
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl core::fmt::Display for HeapDead {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("公开堆已经死了（建它的进程不在了）")
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl std::error::Error for HeapDead {}
 
 /// 公开堆的统计。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct CrossHeapStats {
     /// 上次回收后存活的字节数（含头）
     pub live: usize,
@@ -2054,7 +2054,7 @@ pub struct CrossHeapStats {
     pub takeovers: u64,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl CrossHeap {
     /// 堆号（= 窗口号）。
     pub fn id(&self) -> usize {
@@ -2180,12 +2180,12 @@ impl CrossHeap {
 }
 
 /// 只给本 crate 用的操作：trait 在私有模块里、不导出，crate 外拿不到。
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub trait CrossHeapInternal {
     fn is(&self, inner: &Arc<Inner>) -> bool;
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl CrossHeapInternal for CrossHeap {
     fn is(&self, inner: &Arc<Inner>) -> bool {
         Arc::ptr_eq(&self.0, inner)
@@ -2197,13 +2197,13 @@ impl CrossHeapInternal for CrossHeap {
 ///
 /// 进门先加计数、再看回收请求，回收方先挂请求、再看计数（都是 SeqCst）：两边至少有一方看到对方，所以不会有
 /// mutator 在回收进行时溜进来。看到请求就退回去等；回收方死了（请求一直挂着）就自己接手把回收做完。
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 struct Gate<'h> {
     inside: &'h AtomicU32,
     request: &'h AtomicU32,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<'h> Gate<'h> {
     fn enter(heap: &'h Inner) -> Self {
         let request = &heap.sup().request;
@@ -2243,7 +2243,7 @@ impl<'h> Gate<'h> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl Drop for Gate<'_> {
     fn drop(&mut self) {
         self.inside.fetch_sub(1, Ordering::SeqCst);
@@ -2254,7 +2254,7 @@ impl Drop for Gate<'_> {
 }
 
 /// 一次公开堆 mutate 里的分配器与品牌；只在调用线程上用。
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct CrossHeapMutator<'p> {
     heap: &'p Arc<Inner>,
     tlab: &'p Tlab,
@@ -2265,7 +2265,7 @@ pub struct CrossHeapMutator<'p> {
     _brand: Invariant<'p>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<'p> CrossHeapMutator<'p> {
 
     /// 分配一个对象。类型不能有析构（编译期检查）。
@@ -2389,7 +2389,7 @@ impl<'p> CrossHeapMutator<'p> {
 }
 
 /// 只给本 crate 用的操作：trait 在私有模块里、不导出，crate 外拿不到。
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub trait CrossHeapMutatorInternal {
     fn is(&self, inner: &Arc<Inner>) -> bool;
 
@@ -2412,7 +2412,7 @@ pub trait CrossHeapMutatorInternal {
     fn is_type<T: Shared>(&self, data: *const u8) -> bool;
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl CrossHeapMutatorInternal for CrossHeapMutator<'_> {
     fn is(&self, inner: &Arc<Inner>) -> bool {
         Arc::ptr_eq(self.heap, inner)

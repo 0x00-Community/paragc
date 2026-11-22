@@ -16,7 +16,7 @@
 //! 「看一眼再删」这种两步不会和别人的领号交错。进程被杀时内核替它放锁。
 //!
 //! [`CrossHeapSpace`]：本进程的公开地址区；在它上面建、打开公开堆。
-#![cfg(target_os = "linux")]
+#![cfg(crossheap)]
 use core::mem::offset_of;
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;

@@ -38,7 +38,7 @@ use crossbeam_utils::Backoff;
 
 use crate::Trace;
 use crate::mark::{Tracer, TracerInternal};
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use crate::shm::WINDOW;
 
 /// 块大小：块按自身大小对齐，对象地址抹掉低位就是所在块的起点
@@ -401,7 +401,7 @@ impl Block {
         b
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(crossheap)]
     /// 公开堆窗口里的块。SAFETY（调用方）：`p` 按块大小对齐、有 [`BLOCK`] 字节可读写；
     /// 第一次用时内存是零（新延长的文件页）或已经 [`Block::reset`] 过。
     pub unsafe fn at(p: *mut u8) -> Self {
@@ -409,7 +409,7 @@ impl Block {
         Self(unsafe { NonNull::new_unchecked(p.cast()) })
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(crossheap)]
     /// 元数据清零（大对象占过的块还回来时）。SAFETY（调用方）：块里没有对象，没人在用它。
     pub unsafe fn reset(self) {
         // SAFETY: 见上；元数据全是原子量，全零是合法值
@@ -817,30 +817,30 @@ impl Drop for Pages {
 }
 
 /// 超级块里的魔数：认出这是 paragc 的公开堆、布局版本对得上
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub const MAGIC: u64 = u64::from_le_bytes(*b"paragcP5");
-/// 页大小：各段按页对齐、按页延长文件
+/// 页大小：公开堆各段按页对齐、按页延长文件；私有堆按整页还空行
 #[cfg(target_os = "linux")]
 pub const PAGE: usize = 4096;
 /// 类型表容量
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub const TYPE_CAP: usize = 1024;
 /// 指针图容量（全部类型的指针槽偏移加起来）
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub const MAP_CAP: usize = 64 * 1024;
 /// 窗口里每这么多字节给一个入口
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub const BYTES_PER_ENTRY: usize = 16 * 1024;
 /// 挂接表容量：同时映射这个堆的地方（进程，或同一进程里的多个地址区）最多这么多
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub const ATTACH_CAP: usize = 32;
 /// 挂接表在超级块那一页里的偏移
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub const ATTACH_OFF: usize = 1024;
 
 /// 超级块（窗口偏移 0）。跨进程共享：除了建堆时写一次的字段，全是原子量。
 #[repr(C)]
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct Super {
     pub magic: AtomicU64,
     /// 窗口大小（布局由它算出）
@@ -890,7 +890,7 @@ pub struct Super {
     _pad_dead: u32,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl Super {
     /// 新堆的超级块：纪元从 1 开始（新对象的标记 0、新块的行标记 0 都早于它）。
     pub fn new(heap: u64, incarnation: u64, owner: crate::shm::Process) -> Self {
@@ -926,7 +926,7 @@ impl Super {
 
 /// 挂接表的一项（一条缓存行，免得各进程的计数互相挤）。
 #[repr(C, align(64))]
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct Attachment {
     /// 进程号；0 = 空槽
     pub pid: AtomicU32,
@@ -938,12 +938,12 @@ pub struct Attachment {
     pub waiting: AtomicU32,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 const _: () = assert!(size_of::<Super>() <= ATTACH_OFF && ATTACH_OFF + ATTACH_CAP * size_of::<Attachment>() <= PAGE, "挂接表放在超级块那一页里");
 
 /// 按需延长文件的几段。
 #[derive(Clone, Copy)]
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub enum Segment {
     Types,
     Map,
@@ -951,7 +951,7 @@ pub enum Segment {
     States,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl Segment {
     pub const COUNT: usize = 4;
 
@@ -962,7 +962,7 @@ impl Segment {
 
 /// 类型表的一项。
 #[repr(C)]
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct TypeEntry {
     /// 写完其余字段后置 1（之后才可以按它查、按它追踪）
     pub ready: AtomicU32,
@@ -976,7 +976,7 @@ pub struct TypeEntry {
     pub key: [AtomicU64; 2],
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl TypeEntry {
     /// 登记完了、类型键是 `key`。
     pub fn has_key(&self, key: [u64; 2]) -> bool {
@@ -986,7 +986,7 @@ impl TypeEntry {
 
 /// 入口表的一项。
 #[repr(C)]
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct Entry {
     /// 目标对象数据的公开偏移；0 = 空
     pub ptr: AtomicU64,
@@ -1000,7 +1000,7 @@ pub struct Entry {
 
 /// 块状态表的一项。
 #[repr(C)]
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct BlockState {
     /// [`Kind`]
     pub kind: AtomicU32,
@@ -1011,7 +1011,7 @@ pub struct BlockState {
 /// 块的种类。
 #[repr(u32)]
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub enum Kind {
     /// 还没开过
     Unused = 0,
@@ -1023,7 +1023,7 @@ pub enum Kind {
     LargeTail = 3,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl From<u32> for Kind {
     fn from(v: u32) -> Self {
         match v {
@@ -1037,7 +1037,7 @@ impl From<u32> for Kind {
 
 /// 各段在窗口里的偏移（由窗口大小算出，所以挂上来的进程算出的一样）。
 #[derive(Clone, Copy)]
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct WindowLayout {
     pub types: usize,
     pub map: usize,
@@ -1048,7 +1048,7 @@ pub struct WindowLayout {
     pub max_blocks: usize,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl WindowLayout {
     pub fn new() -> Self {
         let types = size_of::<Super>().next_multiple_of(PAGE);
@@ -1075,7 +1075,7 @@ impl WindowLayout {
 
 /// 公开堆的对象头（16 B）：两种堆共用的标记字 / 信息字，加类型号。
 #[repr(C)]
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct PHeader {
     pub core: Core,
     /// 类型表里的序号
@@ -1086,13 +1086,13 @@ pub struct PHeader {
 }
 
 /// 公开堆对象头的字节数；数据紧跟在后面
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub const PHEADER: usize = size_of::<PHeader>();
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 const _: () = assert!(PHEADER == 16, "公开堆的对象头是 16 字节");
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl PHeader {
     pub fn new(bytes: usize, large: bool, ty: u32, stamp: u32) -> Self {
         // 新对象的标记 0 不等于任何纪元（纪元从 1 开始）
@@ -1109,7 +1109,7 @@ impl PHeader {
 }
 
 // 公开堆的对象没有析构
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl Finalize for PHeader {
     unsafe fn finalize(_: *const Core) {}
 }

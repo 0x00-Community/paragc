@@ -32,16 +32,16 @@ use crossbeam_utils::{Backoff, CachePadded};
 
 use crate::{Gc, Slot, WordSlot};
 use crate::handle::{GcInternal, RawSlot, RootTable, SlotInternal, WordSlotInternal};
-#[cfg(target_os = "linux")]
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
+#[cfg(crossheap)]
 use crate::handle::FAR_EDGE;
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use crate::heap::Inner;
 use crate::layout::{Block, Claim, Header, Pages};
-#[cfg(target_os = "linux")]
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
+#[cfg(crossheap)]
 use crate::layout::PHeader;
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use crate::shm::WINDOWS;
 use crate::sync::{Pool, SegVec};
 
@@ -733,20 +733,20 @@ impl Copier {
 }
 
 /// 队列项里「组里第几个堆」放在高位（地址只用到低 48 位）
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 const MEMBER_SHIFT: u32 = 56;
 /// 队列项里地址那部分
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 const ADDR_MASK: usize = (1 << MEMBER_SHIFT) - 1;
 
 /// 组里的一个堆：它和它这一轮的纪元。
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct Member<'h> {
     pub heap: &'h Inner,
     pub epoch: u32,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct Marker<'h> {
     members: &'h [Member<'h>],
     /// 堆号 → 组里第几个（不在组里是 None）
@@ -756,7 +756,7 @@ pub struct Marker<'h> {
     crew: Crew<'h>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<'h> Marker<'h> {
     /// `grey`：根放这里（空的，标记期间只有这一组工人用）。
     pub fn new(members: &'h [Member<'h>], found: Option<&'h Injector<(usize, u64)>>, grey: &'h Injector<usize>, workers: usize) -> Self {

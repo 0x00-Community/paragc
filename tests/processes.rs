@@ -1,6 +1,6 @@
 //! 多个进程挂同一个公开堆。子进程是本测试程序自己：带上 [`ROLE`] 等环境变量、只跑 `child` 那一条。
-//! 逐条跑：`cargo test --test processes -- --exact <名字>`
-#![cfg(all(target_os = "linux", not(miri)))]
+//! 逐条跑：`cargo test --features crossheap --test processes -- --exact <名字>`
+#![cfg(all(target_os = "linux", feature = "crossheap", not(miri)))]
 
 use std::io::{BufRead, BufReader, Write};
 use std::num::NonZeroUsize;

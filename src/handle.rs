@@ -23,24 +23,24 @@
 use core::fmt;
 use core::cell::{Cell, UnsafeCell};
 use core::marker::PhantomData;
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use core::num::{NonZeroI16, NonZeroI32, NonZeroI64, NonZeroI8, NonZeroU16, NonZeroU32, NonZeroU64, NonZeroU8};
 use core::ops::Deref;
 use core::ptr::{NonNull, null_mut};
 use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use core::sync::atomic::{AtomicBool, AtomicI16, AtomicI32, AtomicI64, AtomicI8, AtomicU16, AtomicU32, AtomicU8};
 use std::sync::Arc;
 
 use crate::{Heap, Mutator, Trace, Tracer};
 use crate::heap::{HeapInternal, MutatorInternal};
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use crate::heap::{Inner, CrossHeap, CrossHeapInternal, CrossHeapMutator, CrossHeapMutatorInternal};
 use crate::layout::Header;
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use crate::layout::{GRANULE, PHeader};
 use crate::mark::TracerInternal;
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use crate::shm::{REGION, Region};
 use crate::sync::{PushList, SegVec};
 
@@ -729,7 +729,7 @@ unsafe impl<B: Brand> Trace for Far<'_, B> {
 ///
 /// # Safety
 /// `edges` 必须把每个 [`CrossHeapSlot`] 的字节偏移（相对 `at`）报给 `map`，漏了就是悬垂指针；`NO_EDGES` 只能在确实没有时为 true。
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub unsafe trait Shared: Send + Sync {
     /// 类型里没有任何 [`CrossHeapSlot`]
     const NO_EDGES: bool = false;
@@ -739,15 +739,15 @@ pub unsafe trait Shared: Send + Sync {
 }
 
 /// 指针图里的偏移带这一位：那里是一个 [`CrossHeapRef`]（偏移 + 目标堆身份），指向别的堆；不带的是同堆的 [`CrossHeapSlot`]
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub const FAR_EDGE: u32 = 1 << 31;
 
 /// 一个类型的指针图：对象数据里每个指针槽的字节偏移。
 #[derive(Default)]
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct EdgeMap(Vec<u32>);
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl EdgeMap {
     pub fn edge(&mut self, at: u32) {
         self.0.push(at);
@@ -770,7 +770,7 @@ impl EdgeMap {
 }
 
 /// 不含指针槽的公开堆类型。
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 macro_rules! shared_leaf {
     ($($ty:ty),* $(,)?) => {$(
         // SAFETY: 没有指针槽
@@ -781,7 +781,7 @@ macro_rules! shared_leaf {
     )*};
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 shared_leaf!(
     (), bool, char, u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64,
     NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64, NonZeroI8, NonZeroI16, NonZeroI32, NonZeroI64,
@@ -789,14 +789,14 @@ shared_leaf!(
 );
 
 // SAFETY: 没有值
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 unsafe impl<T: ?Sized + Send + Sync> Shared for PhantomData<T> {
     const NO_EDGES: bool = true;
     fn edges(_: &mut EdgeMap, _: u32) {}
 }
 
 // SAFETY: 逐个元素报
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 unsafe impl<T: Shared, const N: usize> Shared for [T; N] {
     const NO_EDGES: bool = T::NO_EDGES;
     fn edges(map: &mut EdgeMap, at: u32) {
@@ -809,30 +809,30 @@ unsafe impl<T: Shared, const N: usize> Shared for [T; N] {
 }
 
 /// 公开堆里的对象，只在一次 [`CrossHeap::mutate`] 里有效（`'p` 是那次调用的品牌）。是本进程里的绝对地址。
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct CrossHeapGc<'p, T> {
     ptr: NonNull<T>,
     _brand: PhantomData<(&'p T, Invariant<'p>)>,
 }
 
 // SAFETY: 只给出 &T，T: Shared 要求 Send + Sync
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 unsafe impl<T: Send + Sync> Send for CrossHeapGc<'_, T> {}
 // SAFETY: 同上
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 unsafe impl<T: Send + Sync> Sync for CrossHeapGc<'_, T> {}
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<T> Clone for CrossHeapGc<'_, T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<T> Copy for CrossHeapGc<'_, T> {}
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<'p, T> CrossHeapGc<'p, T> {
 
     pub fn as_ptr(self) -> *const T {
@@ -852,7 +852,7 @@ impl<'p, T> CrossHeapGc<'p, T> {
 }
 
 /// 只给本 crate 用的操作：trait 在私有模块里、不导出，crate 外拿不到。
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub trait CrossHeapGcInternal {
     /// SAFETY（调用方）：`ptr` 是这个公开堆里一个活对象的数据指针，品牌 `'p` 正确。
     unsafe fn from_data(ptr: *mut u8) -> Self;
@@ -861,7 +861,7 @@ pub trait CrossHeapGcInternal {
     fn offset(self) -> u64;
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<T> CrossHeapGcInternal for CrossHeapGc<'_, T> {
     unsafe fn from_data(ptr: *mut u8) -> Self {
         // SAFETY: 见上
@@ -875,7 +875,7 @@ impl<T> CrossHeapGcInternal for CrossHeapGc<'_, T> {
 }
 
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<T> Deref for CrossHeapGc<'_, T> {
     type Target = T;
 
@@ -885,7 +885,7 @@ impl<T> Deref for CrossHeapGc<'_, T> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<T: fmt::Debug> fmt::Debug for CrossHeapGc<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
@@ -895,34 +895,34 @@ impl<T: fmt::Debug> fmt::Debug for CrossHeapGc<'_, T> {
 /// 公开堆对象里的原子指针槽：存目标的公开偏移（0 = 空），所以同一个值在每个映射这个堆的进程里都对。
 /// 读写都要带 [`CrossHeapMutator`]（换算成本进程地址要用它的区起点）。
 #[repr(transparent)]
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct CrossHeapSlot<'p, T> {
     off: AtomicU64,
     _brand: PhantomData<CrossHeapGc<'p, T>>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<T> Default for CrossHeapSlot<'_, T> {
     fn default() -> Self {
         Self { off: AtomicU64::new(0), _brand: PhantomData }
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<'p, T> From<Option<CrossHeapGc<'p, T>>> for CrossHeapSlot<'p, T> {
     fn from(v: Option<CrossHeapGc<'p, T>>) -> Self {
         Self { off: AtomicU64::new(Self::raw(v)), _brand: PhantomData }
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<'p, T> From<CrossHeapGc<'p, T>> for CrossHeapSlot<'p, T> {
     fn from(v: CrossHeapGc<'p, T>) -> Self {
         Some(v).into()
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<'p, T> CrossHeapSlot<'p, T> {
     fn raw(v: Option<CrossHeapGc<'p, T>>) -> u64 {
         v.map_or(0, CrossHeapGc::offset)
@@ -955,7 +955,7 @@ impl<'p, T> CrossHeapSlot<'p, T> {
 }
 
 // SAFETY: 槽本身就是一个指针
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 unsafe impl<T: Send + Sync> Shared for CrossHeapSlot<'_, T> {
     fn edges(map: &mut EdgeMap, at: u32) {
         map.edge(at);
@@ -970,7 +970,7 @@ unsafe impl<T: Send + Sync> Shared for CrossHeapSlot<'_, T> {
 ///
 /// B 死了以后它的堆号可能被新堆用上：身份对不上的引用读出来是 None，回收时也不跟，不会被当成新堆里的地址。
 #[repr(C)]
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct CrossHeapRef<'a, B: CrossHeapBrand> {
     off: AtomicU64,
     /// 目标堆的身份（[`crate::layout::Super::incarnation`]）
@@ -979,17 +979,17 @@ pub struct CrossHeapRef<'a, B: CrossHeapBrand> {
 }
 
 /// 持有方堆的品牌：对 `'a` 不变；用 fn 指针形式是为了能跨线程（[`Invariant`] 用的 Cell 不行）
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 type HolderBrand<'a> = fn(&'a ()) -> &'a ();
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<B: CrossHeapBrand> Default for CrossHeapRef<'_, B> {
     fn default() -> Self {
         Self { off: AtomicU64::new(0), incarnation: AtomicU64::new(0), _brand: PhantomData }
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<'a, B: CrossHeapBrand> CrossHeapRef<'a, B> {
     /// 指向 `gc`（在 `target` 堆里）的新引用，放进 `holder` 堆的对象里。
     pub fn to<'b>(holder: &CrossHeapMutator<'a>, target: &CrossHeapMutator<'b>, gc: CrossHeapGc<'b, B::Of<'b>>) -> Self {
@@ -1027,7 +1027,7 @@ impl<'a, B: CrossHeapBrand> CrossHeapRef<'a, B> {
 }
 
 // SAFETY: 它本身就是一个跨堆的指针槽（回收时按身份认目标堆）
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 unsafe impl<B: CrossHeapBrand> Shared for CrossHeapRef<'_, B> {
     fn edges(map: &mut EdgeMap, at: u32) {
         map.far(at);
@@ -1037,23 +1037,23 @@ unsafe impl<B: CrossHeapBrand> Shared for CrossHeapRef<'_, B> {
 /// 跨堆弱引用与签名里的那一个字：高位是对象数据的公开偏移（去掉按粒度对齐的低位），低位是对象的出生戳；0 = 空。
 /// 一个字，所以读写都是一次原子操作，不用加锁。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct WeakWord(u64);
 
 /// 偏移按粒度对齐，低这么多位总是 0
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 const OFF_SHIFT: u32 = GRANULE.trailing_zeros();
 /// 偏移去掉低位后要的位数（整个公开地址区）
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 const OFF_BITS: u32 = REGION.trailing_zeros() - OFF_SHIFT;
 /// 留给出生戳的位数（对象头里的戳是 32 位）
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 const STAMP_BITS: u32 = if u64::BITS - OFF_BITS < u32::BITS { u64::BITS - OFF_BITS } else { u32::BITS };
 /// 出生戳在字里留下的那几位
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub const STAMP_MASK: u32 = u32::MAX >> (u32::BITS - STAMP_BITS);
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl From<(u64, u32)> for WeakWord {
     /// （对象数据的公开偏移, 出生戳）
     fn from((off, stamp): (u64, u32)) -> Self {
@@ -1061,21 +1061,21 @@ impl From<(u64, u32)> for WeakWord {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl From<u64> for WeakWord {
     fn from(raw: u64) -> Self {
         Self(raw)
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl From<WeakWord> for u64 {
     fn from(w: WeakWord) -> Self {
         w.0
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<T> From<CrossHeapGc<'_, T>> for WeakWord {
     fn from(gc: CrossHeapGc<'_, T>) -> Self {
         // SAFETY: gc 是公开堆里一个活对象，头在数据前面
@@ -1084,7 +1084,7 @@ impl<T> From<CrossHeapGc<'_, T>> for WeakWord {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl WeakWord {
     /// 对象数据的公开偏移（空的是 0）。
     pub fn offset(self) -> u64 {
@@ -1107,34 +1107,34 @@ impl WeakWord {
 ///
 /// 读写都是一次原子操作，不加锁：多个进程同时改，读到的是某一次写进去的值。
 #[repr(transparent)]
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct CrossHeapWeak<B: CrossHeapBrand> {
     word: AtomicU64,
     _brand: PhantomData<fn() -> B>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<B: CrossHeapBrand> Default for CrossHeapWeak<B> {
     fn default() -> Self {
         Self { word: AtomicU64::new(0), _brand: PhantomData }
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<B: CrossHeapBrand> From<Option<CrossHeapGc<'_, B::Of<'_>>>> for CrossHeapWeak<B> {
     fn from(v: Option<CrossHeapGc<'_, B::Of<'_>>>) -> Self {
         Self { word: AtomicU64::new(v.map_or(0, |gc| WeakWord::from(gc).into())), _brand: PhantomData }
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<B: CrossHeapBrand> From<CrossHeapGc<'_, B::Of<'_>>> for CrossHeapWeak<B> {
     fn from(gc: CrossHeapGc<'_, B::Of<'_>>) -> Self {
         Some(gc).into()
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<B: CrossHeapBrand> CrossHeapWeak<B> {
     /// 改指向（`None` 清空）。不用目标堆的 mutator：偏移和出生戳都从对象本身读。
     pub fn set(&self, v: Option<CrossHeapGc<'_, B::Of<'_>>>) {
@@ -1165,14 +1165,14 @@ impl<B: CrossHeapBrand> CrossHeapWeak<B> {
 }
 
 // SAFETY: 弱引用不是边：回收不跟它
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 unsafe impl<B: CrossHeapBrand> Shared for CrossHeapWeak<B> {
     const NO_EDGES: bool = true;
     fn edges(_: &mut EdgeMap, _: u32) {}
 }
 
 // SAFETY: 对私有堆没有边
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 unsafe impl<B: CrossHeapBrand> Trace for CrossHeapWeak<B> {
     const NO_EDGES: bool = true;
     fn trace(&self, _: &mut Tracer<'_>) {}
@@ -1184,7 +1184,7 @@ unsafe impl<B: CrossHeapBrand> Trace for CrossHeapWeak<B> {
 /// 签名不保活对象（同 [`CrossHeapWeak`]）：发出的一方不再引用它，它在下一次回收死，对方再凭签名找就是 None。
 /// 对方不需要知道 Rust 类型也能核对（[`CrossHeapMutator::verify`]）；按类型取用 [`CrossHeapMutator::resolve`]。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct Signature {
     word: WeakWord,
     incarnation: u64,
@@ -1192,10 +1192,10 @@ pub struct Signature {
 }
 
 /// 签名序列化后的字节数
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub const SIGNATURE_BYTES: usize = 32;
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl Signature {
     /// 对象所在的公开堆号（要读得先打开它）。
     pub fn heap(&self) -> Option<usize> {
@@ -1213,21 +1213,21 @@ impl Signature {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl From<(WeakWord, u64, [u64; 2])> for Signature {
     fn from((word, incarnation, key): (WeakWord, u64, [u64; 2])) -> Self {
         Self { word, incarnation, key }
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl From<&Signature> for WeakWord {
     fn from(s: &Signature) -> Self {
         s.word
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl From<Signature> for [u8; SIGNATURE_BYTES] {
     fn from(s: Signature) -> Self {
         let mut out = [0; SIGNATURE_BYTES];
@@ -1238,7 +1238,7 @@ impl From<Signature> for [u8; SIGNATURE_BYTES] {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl From<&[u8; SIGNATURE_BYTES]> for Signature {
     fn from(bytes: &[u8; SIGNATURE_BYTES]) -> Self {
         let mut words = bytes.as_chunks::<{ size_of::<u64>() }>().0.iter().map(|c| u64::from_le_bytes(*c));
@@ -1248,13 +1248,13 @@ impl From<&[u8; SIGNATURE_BYTES]> for Signature {
 }
 
 /// 把带 `'p` 的公开堆类型换个品牌：[`CrossHeapRoot<B>`] 不带生命周期，取出来时再套上当次 mutate 的 `'p`。用 [`cross_heap_brand!`](crate::cross_heap_brand) 声明。
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub trait CrossHeapBrand {
     type Of<'p>: Shared + 'p;
 }
 
 /// 声明一个公开堆的品牌类型：`cross_heap_brand!(pub NodeB = for<'p> Node<'p>);`
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 #[macro_export]
 macro_rules! cross_heap_brand {
     ($(#[$meta:meta])* $vis:vis $name:ident = for<$l:lifetime> $ty:ty) => {
@@ -1268,7 +1268,7 @@ macro_rules! cross_heap_brand {
 
 /// 指向公开堆对象的句柄：在入口表里占一项，只要它活着对象就不会被回收。不带生命周期，可以放进私有堆的对象里、跨线程传。
 /// 用 [`CrossHeapMutator::root`] 建、[`CrossHeapRoot::get`] 取。
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct CrossHeapRoot<B: CrossHeapBrand> {
     /// 进程这一侧的堆：Arc 让窗口在句柄还在时一直映射着
     heap: Arc<Inner>,
@@ -1279,13 +1279,13 @@ pub struct CrossHeapRoot<B: CrossHeapBrand> {
 }
 
 // SAFETY: 只给出 B::Of 的共享引用（Shared: Send + Sync）；入口表是原子的
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 unsafe impl<B: CrossHeapBrand> Send for CrossHeapRoot<B> {}
 // SAFETY: 同上
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 unsafe impl<B: CrossHeapBrand> Sync for CrossHeapRoot<B> {}
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<B: CrossHeapBrand> CrossHeapRoot<B> {
 
     /// 取目标对象；`m` 必须是目标堆的 mutator。
@@ -1318,12 +1318,12 @@ impl<B: CrossHeapBrand> CrossHeapRoot<B> {
 }
 
 /// 只给本 crate 用的操作：trait 在私有模块里、不导出，crate 外拿不到。
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub trait CrossHeapRootInternal {
     fn new(heap: Arc<Inner>, entry: u32, data: NonNull<u8>) -> Self;
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<B: CrossHeapBrand> CrossHeapRootInternal for CrossHeapRoot<B> {
     fn new(heap: Arc<Inner>, entry: u32, data: NonNull<u8>) -> Self {
         Self { heap, entry, data, _brand: PhantomData }
@@ -1331,7 +1331,7 @@ impl<B: CrossHeapBrand> CrossHeapRootInternal for CrossHeapRoot<B> {
 }
 
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<B: CrossHeapBrand> Drop for CrossHeapRoot<B> {
     fn drop(&mut self) {
         self.heap.release_entry(self.entry);
@@ -1339,7 +1339,7 @@ impl<B: CrossHeapBrand> Drop for CrossHeapRoot<B> {
 }
 
 // SAFETY: 句柄对私有堆没有边（它本身是公开堆的一个根）
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 unsafe impl<B: CrossHeapBrand> Trace for CrossHeapRoot<B> {
     const NO_EDGES: bool = true;
     fn trace(&self, _: &mut Tracer<'_>) {}
