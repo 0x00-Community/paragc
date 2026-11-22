@@ -192,8 +192,25 @@ pub struct RawSlot {
 }
 
 impl RawSlot {
+    /// 字里指着的私有堆对象的头。指着跨堆（[`crate::CrossHeap`]）对象的不算：私有堆不标记、不计数、不搬它们。
     fn header(word: u64) -> Option<*const Header> {
-        word_pointer(word).map(|p| Header::of(p))
+        Self::private(word_pointer(word)).map(|p| Header::of(p))
+    }
+
+    #[cfg(crossheap)]
+    fn private(p: Option<*mut u8>) -> Option<*mut u8> {
+        p.filter(|p| !Region::holds_fixed(p.addr()))
+    }
+
+    #[cfg(not(crossheap))]
+    fn private(p: Option<*mut u8>) -> Option<*mut u8> {
+        p
+    }
+
+    /// 字指着跨堆对象时，它的数据地址。
+    #[cfg(crossheap)]
+    pub fn cross(&self) -> Option<*mut u8> {
+        word_pointer(self.word.load(Ordering::Acquire)).filter(|p| Region::holds_fixed(p.addr()))
     }
 
     /// 改成指向搬过去的对象（`to` 是新头）；只在停顿里（没有 mutator）。
@@ -234,7 +251,7 @@ impl RawSlot {
 
     /// 改成计入当前值；返回（当前值, 上次计入的值）。
     pub fn recount(&self) -> (Option<*const Header>, Option<*const Header>) {
-        let p = word_pointer(self.word.load(Ordering::Acquire));
+        let p = Self::private(word_pointer(self.word.load(Ordering::Acquire)));
         let prev = self.counted.swap(p.map_or(0, <*mut u8>::expose_provenance), Ordering::AcqRel);
         (p.map(|p| Header::of(p.cast_const())), Self::from_counted(prev))
     }
@@ -448,6 +465,39 @@ unsafe impl Sync for RootTable {}
 unsafe impl Send for RootTable {}
 
 impl RootTable {
+    /// 槽里的对象在跨堆里（晋升过去了）：私有堆的回收不碰它，由跨堆的回收管。
+    #[cfg(crossheap)]
+    fn crossed(p: *const Header) -> bool {
+        Region::holds_fixed(p.addr())
+    }
+
+    #[cfg(not(crossheap))]
+    fn crossed(_: *const Header) -> bool {
+        false
+    }
+
+    /// 指着跨堆对象的槽：数据地址逐个交给 `f`（主人一起回收跨堆时当根）。SAFETY（调用方）：没有 mutator。
+    #[cfg(crossheap)]
+    pub unsafe fn crossing(&self, mut f: impl FnMut(*mut u8)) {
+        for slot in self.slots.iter() {
+            let p = slot.load();
+            if !p.is_null() && Self::crossed(p) {
+                f(Header::data(p));
+            }
+        }
+    }
+
+    /// 跨堆回收之后：指着跨堆对象、`alive` 说它死了的槽清空（弱表用）。SAFETY（调用方）：没有 mutator。
+    #[cfg(crossheap)]
+    pub unsafe fn clear_crossed(&self, alive: impl Fn(*mut u8) -> bool) {
+        for slot in self.slots.iter() {
+            let p = slot.load();
+            if !p.is_null() && Self::crossed(p) && !alive(Header::data(p)) {
+                let _ = slot.ptr.compare_exchange(p, null_mut(), Ordering::AcqRel, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// 领一个槽放 `header`（只在这个堆的 mutate 里调用）。`holder`：持有方堆，普通根是 [`NO_HOLDER`]。
     pub fn claim(&self, header: *const Header, holder: usize) -> usize {
         // SAFETY: mutate 期间 ready 不变
@@ -480,7 +530,7 @@ impl RootTable {
     pub fn relocate(&self, mut f: impl FnMut(*const Header) -> *const Header) {
         for slot in self.slots.iter() {
             let old = slot.load();
-            if old.is_null() {
+            if old.is_null() || Self::crossed(old) {
                 continue;
             }
             let new = f(old.cast_const());
@@ -494,7 +544,7 @@ impl RootTable {
     pub unsafe fn pinned(&self, mut f: impl FnMut(*const Header)) {
         for slot in self.slots.iter() {
             let p = slot.load();
-            if !p.is_null() && slot.holder.load(Ordering::Relaxed) != NO_HOLDER {
+            if !p.is_null() && !Self::crossed(p) && slot.holder.load(Ordering::Relaxed) != NO_HOLDER {
                 f(p.cast_const());
             }
         }
@@ -514,7 +564,7 @@ impl RootTable {
             .iter()
             .filter_map(|s| {
                 let p = s.load();
-                (!p.is_null() && !inside(s.holder.load(Ordering::Relaxed))).then_some(p.cast_const())
+                (!p.is_null() && !Self::crossed(p) && !inside(s.holder.load(Ordering::Relaxed))).then_some(p.cast_const())
             })
             .collect()
     }
@@ -536,7 +586,7 @@ impl RootTable {
         unsafe { self.recycle() };
         for slot in self.slots.iter() {
             let old = slot.load();
-            if old.is_null() {
+            if old.is_null() || Self::crossed(old) {
                 continue;
             }
             let new = Header::survivor(old, epoch);
@@ -557,7 +607,7 @@ impl RootTable {
         for slot in self.slots.iter() {
             let p = slot.load();
             // SAFETY: 槽里非空的都是本堆的对象，回收还没清扫，内存都在
-            if !p.is_null() && inside(slot.holder.load(Ordering::Relaxed)) && !unsafe { &*p }.is_marked(epoch) {
+            if !p.is_null() && !Self::crossed(p) && inside(slot.holder.load(Ordering::Relaxed)) && !unsafe { &*p }.is_marked(epoch) {
                 let _ = slot.ptr.compare_exchange(p, null_mut(), Ordering::AcqRel, Ordering::Relaxed);
             }
         }
@@ -741,6 +791,16 @@ pub unsafe trait Shared: Send + Sync {
 /// 指针图里的偏移带这一位：那里是一个 [`CrossHeapRef`]（偏移 + 目标堆身份），指向别的堆；不带的是同堆的 [`CrossHeapSlot`]
 #[cfg(crossheap)]
 pub const FAR_EDGE: u32 = 1 << 31;
+/// 指针图里的偏移带这一位：那里是一个字（[`Slot`]、[`WordSlot`]：[`word_pointer`] 认得出的才是指针），存的是对象数据的绝对地址
+/// （固定地址的地址区里，每个进程都一样，见 [`crate::CrossHeapSpace::reserve_fixed`]）
+#[cfg(crossheap)]
+pub const WORD_EDGE: u32 = 1 << 30;
+/// 指针图里的偏移带这一位：那里是一个可空的裸指针（[`Gc`]、`Option<Gc>`），存对象数据的绝对地址
+#[cfg(crossheap)]
+pub const PTR_EDGE: u32 = 1 << 29;
+/// 指针图里表示边种类的那几位
+#[cfg(crossheap)]
+pub const EDGE_KINDS: u32 = FAR_EDGE | WORD_EDGE | PTR_EDGE;
 
 /// 一个类型的指针图：对象数据里每个指针槽的字节偏移。
 #[derive(Default)]
@@ -758,6 +818,16 @@ impl EdgeMap {
         self.0.push(at | FAR_EDGE);
     }
 
+    /// 一个存绝对地址的字（[`Slot`]、[`WordSlot`]）。
+    pub fn word(&mut self, at: u32) {
+        self.0.push(at | WORD_EDGE);
+    }
+
+    /// 一个存绝对地址的可空裸指针（[`Gc`]）。
+    pub fn ptr(&mut self, at: u32) {
+        self.0.push(at | PTR_EDGE);
+    }
+
     /// 报上来的全部偏移（[`FAR_EDGE`] 那一位标着跨堆的）。
     pub fn as_slice(&self) -> &[u32] {
         &self.0
@@ -765,7 +835,39 @@ impl EdgeMap {
 
     /// 字段偏移转成指针图里的偏移（derive 用）。
     pub fn offset(bytes: usize) -> u32 {
-        u32::try_from(bytes).expect("公开堆的对象不超过 4 GiB")
+        u32::try_from(bytes).ok().filter(|&b| b & EDGE_KINDS == 0).expect("公开堆的对象不超过 512 MiB")
+    }
+}
+
+// SAFETY: Gc 本身就是一个裸指针
+#[cfg(crossheap)]
+unsafe impl<T: Send + Sync> Shared for Gc<'_, T> {
+    fn edges(map: &mut EdgeMap, at: u32) {
+        map.ptr(at);
+    }
+}
+
+// SAFETY: None 是空指针（Gc 是 NonNull），同 Gc
+#[cfg(crossheap)]
+unsafe impl<T: Send + Sync> Shared for Option<Gc<'_, T>> {
+    fn edges(map: &mut EdgeMap, at: u32) {
+        map.ptr(at);
+    }
+}
+
+// SAFETY: repr(C)，字在开头
+#[cfg(crossheap)]
+unsafe impl<T: Send + Sync> Shared for Slot<'_, T> {
+    fn edges(map: &mut EdgeMap, at: u32) {
+        map.word(at);
+    }
+}
+
+// SAFETY: 字在开头
+#[cfg(crossheap)]
+unsafe impl Shared for WordSlot<'_> {
+    fn edges(map: &mut EdgeMap, at: u32) {
+        map.word(at);
     }
 }
 

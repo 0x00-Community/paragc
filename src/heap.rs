@@ -47,7 +47,7 @@ use crate::mark::Marking;
 #[cfg(crossheap)]
 use crate::mark::{Marker, Member};
 #[cfg(crossheap)]
-use crate::shm::{Liveness, Process, Region, Registry, Space, WINDOW, WINDOWS};
+use crate::shm::{Liveness, Process, REGION, Region, Registry, Space, WINDOW, WINDOWS};
 use crate::sweep::{Large, Outcome, Releaser, Sink, Sweeper};
 use crate::sync::{Pool, SegVec};
 #[cfg(crossheap)]
@@ -118,6 +118,9 @@ pub struct Heap {
     evacuated: (usize, usize),
     /// 给 [`Heap::mutate`] 复用的分配缓冲
     spare: AtomicPtr<Tlab>,
+    /// 当老年代用的跨堆（[`Heap::attach_cross_heap`]）
+    #[cfg(crossheap)]
+    cross: Option<CrossHeap>,
 }
 
 /// 年轻回收要不要把存活的年轻对象搬进紧凑的块（[`Heap::set_young_evacuation`]）。
@@ -207,7 +210,47 @@ impl Heap {
             automatic: false,
             evacuated: (0, 0),
             spare: AtomicPtr::new(null_mut()),
+            #[cfg(crossheap)]
+            cross: None,
         }
+    }
+
+    /// 把本进程建的跨堆挂上来当老年代：之后每次年轻回收，可共享的（[`Mutator::alloc_shared`] 分配的）存活年轻对象
+    /// 搬进 `cross`，私有堆里指着它们的地方都改成新地址；完整回收（[`Heap::collect`]）连同 `cross` 一起回收——
+    /// 私有堆指着它的边是它的根。`cross` 从此只由这个私有堆回收（别的进程调它的 `collect` 什么都不做）。
+    ///
+    /// `cross` 要建在固定地址的地址区上（[`crate::CrossHeapSpace::reserve_fixed`]），对象里存的绝对地址在每个进程里才都对。
+    /// 可共享的对象只能指着可共享的对象：晋升时碰到指着不可共享对象的边会 panic。挂上之后不支持并发标记与 `collect_group`。
+    #[cfg(crossheap)]
+    pub fn attach_cross_heap(&mut self, cross: &CrossHeap) -> io::Result<()> {
+        let inner = &cross.0;
+        if !inner.space.is_fixed() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "当老年代的跨堆要建在固定地址的地址区上（CrossHeapSpace::reserve_fixed）"));
+        }
+        if inner.sup().owner_pid.load(Ordering::Acquire) != Process::current().pid {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "只能挂本进程建的跨堆"));
+        }
+        if self.cross.is_some() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "已经挂了一个跨堆"));
+        }
+        inner.sup().owner_only.store(1, Ordering::Release);
+        self.cross = Some(CrossHeap(Arc::clone(inner)));
+        Ok(())
+    }
+
+    /// 主人一起回收跨堆（私有堆的标记做完、还没清扫）：根是跨堆自己的入口、私有堆追踪到的跨堆边 `crossing`、
+    /// 私有根表里指着跨堆的；之后私有弱表里指着死掉的跨堆对象的清空。
+    #[cfg(crossheap)]
+    fn collect_cross(&mut self, crossing: &Injector<usize>) {
+        let Some(cross) = &self.cross else { return };
+        let mut extra = Self::drain(crossing);
+        // SAFETY: &mut self ⇒ 没有 mutator
+        unsafe { self.roots.crossing(|p| extra.push(p.addr())) };
+        extra.sort_unstable();
+        extra.dedup();
+        let epoch = cross.0.collect_owned(&extra, *self.shrinking.get_mut());
+        // SAFETY: 没有 mutator
+        unsafe { self.weaks.clear_crossed(|p| Inner::survived(p, epoch)) };
     }
 
     /// 在堆上做事；可以在多个线程上同时调用。闭包里分配的对象只有挂到 [`crate::Root`] 上（直接或间接）才能活过下一次回收。
@@ -249,6 +292,8 @@ impl Heap {
     ///
     /// 不要在这个堆的 mutate 里调用（会一直等自己走空）。
     pub fn mark_concurrently(&self) -> bool {
+        #[cfg(crossheap)]
+        assert!(self.cross.is_none(), "挂着跨堆时不支持并发标记");
         // 上一轮按「纪元 ≠ 本轮」判死，必须在新一轮标记把活对象标成更新的纪元之前扫完
         self.sweep_concurrently();
         let epoch = self.next_epoch();
@@ -515,6 +560,14 @@ impl Heap {
         }
         let epoch = self.epoch;
         let mode = self.young_mode();
+        // 挂着跨堆：可共享的年轻对象都要搬过去（老对象直接指着的也搬，记忆集里的槽跟着改）
+        #[cfg(crossheap)]
+        let mode = if self.cross.is_some() { YoungEvacuation::Full } else { mode };
+        #[cfg(crossheap)]
+        let cross = self.cross.as_ref().map(|c| Arc::clone(&c.0));
+        // 晋升期间待在跨堆的门里（和本进程别的线程、别的进程的 mutator 一样）
+        #[cfg(crossheap)]
+        let _inside = cross.as_deref().map(Gate::enter);
         let remembered = Self::drain(&self.remembered);
         let counting = *self.rc_valid.get_mut();
         let parity = *self.rc_parity.get_mut();
@@ -547,7 +600,10 @@ impl Heap {
                 Marking::seed_slots(&self.grey, &remembered, epoch);
                 &[]
             };
-            mark.evacuating(&self.roots, &self.available, &self.blocks, &self.pages, &moved, epoch).relocating_slots(slots).run(pool);
+            let mark = mark.evacuating(&self.roots, &self.available, &self.blocks, &self.pages, &moved, epoch).relocating_slots(slots);
+            #[cfg(crossheap)]
+            let mark = mark.promoting(cross.as_deref());
+            mark.run(pool);
         }
         // 引用计数（可信时）在标记之后结算（对象可能搬了，用搬后的地址）：当前的根 +1、登记过的槽按「新值 +1、
         // 上次计入的值 −1」结算，上一轮的根延迟到现在 −1
@@ -624,6 +680,11 @@ impl Heap {
 
     /// 完整回收：[`Heap::finish_marking`] 后立刻把清扫做完（返回时死对象都已析构）。
     pub fn collect(&mut self) {
+        // 挂着跨堆：先做一次年轻回收，把可共享的年轻对象晋升过去（完整回收会把它们标成老对象，之后就不再晋升了）
+        #[cfg(crossheap)]
+        if self.cross.is_some() {
+            self.collect_young();
+        }
         self.finish_marking();
         self.sweep_concurrently();
     }
@@ -686,7 +747,11 @@ impl Heap {
         for addr in Self::drain(&self.black) {
             self.grey.push(addr);
         }
+        #[cfg(crossheap)]
+        let crossing = Injector::new();
         let mark = Marking::new(workers, epoch, &self.grey).counting(count);
+        #[cfg(crossheap)]
+        let mark = mark.crossing(self.cross.is_some().then_some(&crossing));
         let moved = AtomicUsize::new(0);
         if evacuate > 0 {
             mark.evacuating(&self.roots, &targets, &self.blocks, &self.pages, &moved, self.epoch).run(pool);
@@ -701,6 +766,8 @@ impl Heap {
         }
         // SAFETY: 没有 mutator；标记（含疏散）做完了、还没清扫
         unsafe { self.weaks.clear_unreached(epoch, *self.rc_parity.get_mut()) };
+        #[cfg(crossheap)]
+        self.collect_cross(&crossing);
         self.end_full(epoch, (evacuate, moved.into_inner()));
     }
 
@@ -1051,6 +1118,17 @@ impl<'gc> Mutator<'gc> {
 
     /// 分配一个对象。
     pub fn alloc<T: Trace + 'gc>(&self, value: T) -> Gc<'gc, T> {
+        self.alloc_with(value, Header::new::<T>)
+    }
+
+    /// 分配一个可共享的对象（类型同时是 [`Shared`]、没有析构）：堆挂着跨堆时（[`Heap::attach_cross_heap`]），
+    /// 它活过一次年轻回收就被晋升进跨堆，别的进程凭签名、弱引用找得到它。它的边只能指向可共享的对象。
+    #[cfg(crossheap)]
+    pub fn alloc_shared<T: Trace + Shared + 'gc>(&self, value: T) -> Gc<'gc, T> {
+        self.alloc_with(value, Header::new_shared::<T>)
+    }
+
+    fn alloc_with<T: Trace + 'gc>(&self, value: T, header: fn(usize, bool, u32) -> Header) -> Gc<'gc, T> {
         const { assert!(align_of::<T>() <= GRANULE, "对象数据的对齐不能超过 8 字节") };
         let bytes = (HEADER + size_of::<T>()).next_multiple_of(GRANULE);
         let large = bytes > LARGE;
@@ -1067,7 +1145,7 @@ impl<'gc> Mutator<'gc> {
         }
         // SAFETY: p 是 bytes 字节、按粒度对齐的新内存，归这次分配独有
         unsafe {
-            p.cast::<Header>().write(Header::new::<T>(bytes, large, mark));
+            p.cast::<Header>().write(header(bytes, large, mark));
             let data = Header::data(p.cast()).cast::<T>();
             data.write(value);
             Gc::from_data(data)
@@ -1103,6 +1181,12 @@ impl<'gc> MutatorInternal<'gc> for Mutator<'gc> {
 
     fn written(&self, slot: &RawSlot, old: Option<*const Header>, new: Option<*const Header>) {
         let addr = (&raw const *slot).expose_provenance();
+        // 跨堆对象里的槽：私有堆不记它（不计数、不进记忆集）；写进去的必须也在跨堆里（私有对象要先晋升）
+        #[cfg(crossheap)]
+        if Region::holds_fixed(addr) {
+            assert!(new.is_none(), "跨堆对象里不能写私有堆的对象：先做一次年轻回收把它晋升过去");
+            return;
+        }
         if let Some(epoch) = self.marking {
             if let Some(old) = old {
                 self.heap.remember(old, epoch.get());
@@ -1408,7 +1492,27 @@ impl Inner {
     }
 
     /// 同 [`Inner::collect`]；`shrink` 时清扫出来的空块一个不留、全部还给系统。
+    /// 只由主人回收的堆（[`crate::Heap::attach_cross_heap`]）主人还在时什么都不做：主人的私有堆里的根这里看不到。
     fn collect_with(&self, shrink: bool) {
+        if self.sup().owner_only.load(Ordering::Acquire) != 0 && self.is_alive() {
+            return;
+        }
+        self.collect_rooted(&[], shrink);
+    }
+
+    /// 主人（挂着它的私有堆）回收：`extra` 是私有堆追踪到的、指着本堆对象的数据地址，也当根。返回这一轮的纪元。
+    pub fn collect_owned(&self, extra: &[usize], shrink: bool) -> u32 {
+        self.collect_rooted(extra, shrink);
+        self.sup().epoch.load(Ordering::Acquire)
+    }
+
+    /// `data`（本堆对象的数据地址）在纪元 `epoch` 那一轮回收里活下来了。
+    pub fn survived(data: *mut u8, epoch: u32) -> bool {
+        // SAFETY: 本堆的对象，还没被再次分配覆盖（调用方在回收刚结束、没有 mutator 时问）
+        unsafe { &*PHeader::of(data) }.core.is_marked(epoch)
+    }
+
+    fn collect_rooted(&self, extra: &[usize], shrink: bool) {
         let mut retry = Retry::new();
         loop {
             if !self.claim_collection(true) {
@@ -1421,7 +1525,7 @@ impl Inner {
             retry.pause();
         }
         self.reap_dead();
-        Self::collect_members(&[self], shrink);
+        Self::collect_members(&[self], extra, shrink);
         self.release();
     }
 
@@ -1448,7 +1552,7 @@ impl Inner {
         for m in members {
             m.reap_dead();
         }
-        Self::collect_members(members, false);
+        Self::collect_members(members, &[], false);
         for m in members.iter().rev() {
             m.release();
         }
@@ -1563,6 +1667,12 @@ impl Inner {
         self.space.region().base().as_ptr().wrapping_add(usize::try_from(off).expect("公开偏移"))
     }
 
+    /// 本进程里的绝对地址在公开地址区里时，它的公开偏移。
+    pub fn offset_of(&self, addr: usize) -> Option<u64> {
+        let base = self.space.region().base().as_ptr().addr();
+        addr.checked_sub(base).filter(|&o| o < REGION && o != 0).map(|o| o as u64)
+    }
+
     /// 公开偏移落在这个堆的窗口里。
     pub fn owns(&self, off: u64) -> bool {
         usize::try_from(off).is_ok_and(|o| o / WINDOW == self.index)
@@ -1608,7 +1718,7 @@ impl Inner {
     }
 
     /// 类型号：先看缓冲里上一次的，再看本进程的缓存，最后去类型表里找或登记。
-    fn type_of<T: Shared>(&self, tlab: &Tlab) -> u32 {
+    pub fn type_of<T: Shared>(&self, tlab: &Tlab) -> u32 {
         let tag = type_name::<T>().as_ptr().addr();
         if let Some((t, ty)) = tlab.last.get()
             && t == tag
@@ -1762,7 +1872,8 @@ impl Inner {
     ///
     /// 几个堆一起时：持有方是组里某个堆的入口不当根（由追踪决定死活），标完后按追踪到的跨堆边重建这些登记——先登记新的、
     /// 再还旧的，中间被杀也只多不少（接手的单独回收照样把它们当根）。
-    fn collect_members(members: &[&Self], shrink: bool) {
+    /// `extra`：单独回收时另加的根（第一个堆里对象的数据地址，主人的私有堆追踪到的）。
+    fn collect_members(members: &[&Self], extra: &[usize], shrink: bool) {
         let in_group = |e: &Entry| members.len() > 1 && Self::held_by(members, e.holder.load(Ordering::Acquire), e.holder_incarnation.load(Ordering::Acquire));
         let mut epochs = Vec::with_capacity(members.len());
         let mut roots = Vec::new();
@@ -1786,6 +1897,7 @@ impl Inner {
                 }
             }
         }
+        roots.extend(extra.iter().map(|&data| (0, PHeader::of(core::ptr::with_exposed_provenance(data)).expose_provenance())));
         let marked: Vec<Member<'_>> = members.iter().zip(&epochs).map(|(&heap, &epoch)| Member { heap, epoch }).collect();
         let found = Injector::new();
         let pool = members[0].pool();
@@ -2153,8 +2265,8 @@ impl CrossHeap {
     /// 几个公开堆（都映射在本进程里）一起回收，收掉跨堆的环：持有方是组里某个堆的 [`crate::CrossHeapRef`] 登记不当根，
     /// 由追踪决定死活；标完后组内的跨堆登记换成这次追踪到的。同一个堆不能出现两次。
     pub fn collect_group(heaps: &[&CrossHeap]) {
-        // 已经死了的堆不参加：它持有的登记由各堆回收时按死活还掉
-        let mut members: Vec<&Inner> = heaps.iter().map(|h| &*h.0).filter(|m| m.is_alive()).collect();
+        // 已经死了的堆不参加：它持有的登记由各堆回收时按死活还掉。只由主人回收的（挂在私有堆上当老年代的）也不参加
+        let mut members: Vec<&Inner> = heaps.iter().map(|h| &*h.0).filter(|m| m.is_alive() && m.sup().owner_only.load(Ordering::Acquire) == 0).collect();
         members.sort_by_key(|m| m.index);
         assert!(members.windows(2).all(|w| w[0].index != w[1].index), "同一个公开堆不能在组里出现两次");
         if !members.is_empty() {
@@ -2176,6 +2288,57 @@ impl CrossHeap {
             collections: sup.collections.load(Ordering::Relaxed),
             takeovers: sup.takeovers.load(Ordering::Relaxed),
         }
+    }
+}
+
+/// 年轻回收里一个回收工人的晋升器：把可共享的年轻对象复制进主人的跨堆（自己的分配缓冲，各工人互不干扰）。
+/// 回收方是跨堆的主人，跨堆只由主人回收，所以复制期间跨堆不会被回收。
+#[cfg(crossheap)]
+pub struct Promoter<'h> {
+    heap: &'h Inner,
+    tlab: Tlab,
+    /// 跨堆上次完成的纪元（空行判定）与这一批对象的出生戳
+    epoch: u32,
+    stamp: u32,
+}
+
+#[cfg(crossheap)]
+impl<'h> Promoter<'h> {
+    pub fn new(heap: &'h Inner) -> Self {
+        let mut tlab = Tlab::default();
+        tlab.adopt((core::ptr::from_ref(heap).addr(), heap.sup().collections.load(Ordering::Acquire)));
+        let epoch = heap.sup().epoch.load(Ordering::Acquire);
+        Self { heap, tlab, epoch, stamp: heap.stamp(epoch) }
+    }
+
+    /// `T` 在跨堆类型表里的号（没有就登记）。
+    pub fn type_of<T: Shared>(&self) -> u32 {
+        self.heap.type_of::<T>(&self.tlab)
+    }
+
+    /// 把私有堆对象 `from` 的数据复制进跨堆（类型号 `ty`），返回新数据地址。
+    /// SAFETY（调用方）：`from` 是本线程认领了的活对象，类型号是它自己回答的。
+    pub unsafe fn copy(&self, from: *const Header, ty: u32) -> *mut u8 {
+        // SAFETY: 见上
+        let data = unsafe { &*from }.bytes() - HEADER;
+        let bytes = (PHEADER + data).next_multiple_of(GRANULE);
+        let large = bytes > LARGE;
+        let (p, run) = if large {
+            let (p, first, n) = self.heap.alloc_large(bytes);
+            (p, Some((first, n)))
+        } else {
+            (self.tlab.bump(bytes, self.epoch, || self.heap.acquire(), |_| self.heap.acquire()), None)
+        };
+        // SAFETY: p 是 bytes 字节、按粒度对齐的新内存；数据按字节复制（可共享的类型没有析构、边都是绝对地址）
+        unsafe {
+            p.cast::<PHeader>().write(PHeader::new(bytes, large, ty, self.stamp));
+            PHeader::data(p.cast()).copy_from_nonoverlapping(Header::data(from), data);
+        }
+        match run {
+            Some((first, n)) => self.heap.publish_large(first, n),
+            None => Block::containing(p).set_start(p),
+        }
+        PHeader::data(p.cast())
     }
 }
 
@@ -2339,6 +2502,15 @@ impl<'p> CrossHeapMutator<'p> {
         }
         heap.release_entry(index);
         true
+    }
+
+    /// 私有堆里指着本堆对象的 [`Gc`]（年轻回收晋升过来的，见 [`Heap::attach_cross_heap`]）换成本堆的对象，好签名、放进
+    /// 本堆的槽；不指着本堆、或类型不是 `B` 的返回 None。
+    pub fn adopt<B: CrossHeapBrand, T>(&self, gc: Gc<'_, T>) -> Option<CrossHeapGc<'p, B::Of<'p>>> {
+        let off = self.heap.offset_of(gc.as_ptr().addr()).filter(|&off| self.heap.owns(off))?;
+        let data = self.heap.ptr(off);
+        // SAFETY: 本堆里的对象（晋升过来的）、类型对得上；在这次 mutate 里不会被回收
+        self.heap.is_type::<B::Of<'p>>(data).then(|| unsafe { CrossHeapGc::from_data(data) })
     }
 
     /// 对象的签名：发给别的进程，对方打开本堆后凭它找到这个对象（[`CrossHeapMutator::resolve`]）。签名不保活对象。

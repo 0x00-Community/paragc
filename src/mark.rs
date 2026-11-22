@@ -33,10 +33,11 @@ use crossbeam_utils::{Backoff, CachePadded};
 use crate::{Gc, Slot, WordSlot};
 use crate::handle::{GcInternal, RawSlot, RootTable, SlotInternal, WordSlotInternal};
 #[cfg(crossheap)]
+use crate::handle::{EDGE_KINDS, FAR_EDGE, PTR_EDGE, WORD_EDGE, word_pointer};
 #[cfg(crossheap)]
-use crate::handle::FAR_EDGE;
+use crate::heap::{Inner, Promoter};
 #[cfg(crossheap)]
-use crate::heap::Inner;
+use crate::shm::Region;
 use crate::layout::{Block, Claim, Header, Pages};
 #[cfg(crossheap)]
 #[cfg(crossheap)]
@@ -84,11 +85,34 @@ pub struct Tracer<'t> {
     log: Option<&'t Injector<usize>>,
     /// 一起回收几个堆（[`crate::Heap::collect_group`]）：追踪到的 Far 把（目标堆的根表, 目标对象的头）报到这里
     group: Option<&'t Injector<(usize, usize)>>,
+    /// 年轻回收把可共享的年轻对象晋升进跨堆（挂着跨堆的私有堆）
+    #[cfg(crossheap)]
+    promoter: Option<&'t Promoter<'t>>,
+    /// 正在问对象的类型可不可以共享：可以的回答它在跨堆里的类型号（见 [`Header::new_shared`]）
+    #[cfg(crossheap)]
+    asking: bool,
+    /// 问到的答案
+    #[cfg(crossheap)]
+    answer: Option<u32>,
+    /// 正在重定位一个晋升过去的对象：它的边不许留在私有堆
+    #[cfg(crossheap)]
+    in_shared: bool,
+    /// 主人一起回收跨堆：追踪到的、指着跨堆对象的边（数据地址）报到这里，当跨堆的根
+    #[cfg(crossheap)]
+    crossing: Option<&'t Injector<usize>>,
 }
+
+/// 晋升过去的对象在工作队列里的标记（头按粒度对齐，最低位空着）：项是旧头，要重定位的是它搬到跨堆的那份
+#[cfg(crossheap)]
+const PROMOTED_ITEM: usize = 1;
 
 impl Tracer<'_> {
 
     fn inc(&self, header: *const Header) {
+        #[cfg(crossheap)]
+        if Region::holds_fixed(header.addr()) {
+            return;
+        }
         if let Some(parity) = self.count {
             // SAFETY: header 是活对象
             let h = unsafe { &*header };
@@ -103,6 +127,10 @@ impl Tracer<'_> {
     /// 一条边（只读：并发标记、不疏散的回收）。
     pub fn edge<T: Trace>(&mut self, gc: Gc<'_, T>) {
         if let Some(decs) = self.decs.as_deref_mut() {
+            #[cfg(crossheap)]
+            if Region::holds_fixed(gc.as_ptr().addr()) {
+                return;
+            }
             decs.push(gc.header().expose_provenance());
             return;
         }
@@ -124,6 +152,65 @@ impl Tracer<'_> {
         if core::ptr::eq(old, new) { gc } else { unsafe { Gc::from_data(Header::data(new).cast()) } }
     }
 
+    /// 回收器在问类型可不可以共享（[`Header::new_shared`] 的类型回答，别的不回答）。
+    #[cfg(crossheap)]
+    pub fn asking(&self) -> bool {
+        self.asking
+    }
+
+    /// 回答：类型是 `T`（可共享）。
+    #[cfg(crossheap)]
+    pub fn answer<T: crate::Shared>(&mut self) {
+        self.answer = self.promoter.map(Promoter::type_of::<T>);
+    }
+
+}
+
+#[cfg(crossheap)]
+impl Tracer<'_> {
+    /// 碰到一个跨堆的对象（`header` 是按私有堆的头算的位置，只用来认地址）：私有堆不碰它；主人一起回收时报上去当根。
+    fn crossed(&self, header: *const Header) -> bool {
+        if !Region::holds_fixed(header.addr()) {
+            return false;
+        }
+        if let Some(c) = self.crossing {
+            c.push(Header::data(header).addr());
+        }
+        true
+    }
+
+    /// 对象的类型可以共享时，它在跨堆里的类型号。
+    fn shareable(&mut self, header: *const Header) -> Option<u32> {
+        self.asking = true;
+        // SAFETY: header 是活对象；问类型时 visit 不碰数据
+        unsafe { Header::visit(header, self) };
+        self.asking = false;
+        self.answer.take()
+    }
+
+    /// 年轻回收里的可共享年轻对象：晋升进跨堆，返回新位置（按私有堆的头算，见 [`Promoter::copy`]）。
+    fn promote(&mut self, header: *const Header, no_edges: bool) -> Option<*const Header> {
+        let p = self.promoter?;
+        // SAFETY: header 是活对象
+        let h = unsafe { &*header };
+        if h.is_marked(self.epoch) || !(h.is_large() || Block::containing(header.cast()).is_evacuating()) {
+            return None;
+        }
+        let ty = self.shareable(header)?;
+        Some(match h.claim() {
+            Claim::Moved(to) => to,
+            Claim::Mine => {
+                // SAFETY: 本线程认领了它；类型号是它自己回答的
+                let to = Header::of(unsafe { p.copy(header, ty) });
+                // SAFETY: 同上
+                unsafe { Header::forward(header, to) };
+                if !no_edges {
+                    self.work.push(header.expose_provenance() | PROMOTED_ITEM);
+                }
+                to
+            }
+        })
+    }
 }
 
 /// 只给本 crate 用的操作：trait 在私有模块里、不导出，crate 外拿不到。
@@ -173,7 +260,26 @@ pub trait TracerInternal<'t> {
 
 impl<'t> TracerInternal<'t> for Tracer<'t> {
     fn new(work: &'t Worker<usize>, epoch: u32, copier: Option<&'t mut Copier>) -> Self {
-        Self { work, epoch, copier, count: None, decs: None, exclusive: false, log: None, group: None }
+        Self {
+            work,
+            epoch,
+            copier,
+            count: None,
+            decs: None,
+            exclusive: false,
+            log: None,
+            group: None,
+            #[cfg(crossheap)]
+            promoter: None,
+            #[cfg(crossheap)]
+            asking: false,
+            #[cfg(crossheap)]
+            answer: None,
+            #[cfg(crossheap)]
+            in_shared: false,
+            #[cfg(crossheap)]
+            crossing: None,
+        }
     }
 
     fn counting(mut self, parity: Option<bool>, exclusive: bool) -> Self {
@@ -183,7 +289,9 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
     }
 
     fn releasing(work: &'t Worker<usize>, decs: &'t mut Vec<usize>) -> Self {
-        Self { work, epoch: 0, copier: None, count: None, decs: Some(decs), exclusive: false, log: None, group: None }
+        let mut t = Self::new(work, 0, None);
+        t.decs = Some(decs);
+        t
     }
 
     fn logging(mut self, log: Option<&'t Injector<usize>>) -> Self {
@@ -215,6 +323,10 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
     }
 
     fn raw(&mut self, raw: &RawSlot, no_edges: bool) {
+        #[cfg(crossheap)]
+        if let Some(p) = raw.cross() {
+            self.crossed(Header::of(p));
+        }
         if let Some(decs) = self.decs.as_deref_mut() {
             if let Some(h) = raw.counted() {
                 decs.push(h.expose_provenance());
@@ -244,6 +356,10 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
     }
 
     fn raw_mut(&mut self, raw: &RawSlot, no_edges: bool) {
+        #[cfg(crossheap)]
+        if let Some(p) = raw.cross() {
+            self.crossed(Header::of(p));
+        }
         if let Some(old) = raw.current() {
             let new = self.forward(old, no_edges);
             if !core::ptr::eq(old, new) {
@@ -258,6 +374,16 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
     }
 
     fn forward(&mut self, header: *const Header, no_edges: bool) -> *const Header {
+        #[cfg(crossheap)]
+        {
+            if self.crossed(header) {
+                return header;
+            }
+            if let Some(to) = self.promote(header, no_edges) {
+                return to;
+            }
+            assert!(!self.in_shared, "可共享的对象指着一个晋升不了的私有对象（不可共享的类型、老对象或别的堆直接指着的）");
+        }
         // SAFETY: header 来自本堆的 Gc / 根，对象活着
         let h = unsafe { &*header };
         // 本轮已经原地标过的不搬（年轻疏散里老对象直接指着的、别的堆指着的年轻对象先原地标上了）
@@ -285,6 +411,10 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
     }
 
     fn visit(&mut self, header: *const Header, no_edges: bool) {
+        #[cfg(crossheap)]
+        if self.crossed(header) {
+            return;
+        }
         // SAFETY: header 来自本堆的 Gc / 根，对象活着
         let h = unsafe { &*header };
         if !h.mark(self.epoch) {
@@ -299,6 +429,17 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
     }
 
     fn scan(&mut self, item: usize) {
+        #[cfg(crossheap)]
+        if item & PROMOTED_ITEM != 0 {
+            let old = core::ptr::with_exposed_provenance::<Header>(item & !PROMOTED_ITEM);
+            // SAFETY: 晋升时压进来的旧头，转发地址已经写好；旧数据要到清扫才释放，它的访问函数还在
+            let to = unsafe { &*old }.forwardee();
+            self.in_shared = true;
+            // SAFETY: 跨堆那份是同一个类型、刚复制好，只被本线程取出（独占）
+            unsafe { Header::visit_data(old, Header::data(to), self) };
+            self.in_shared = false;
+            return;
+        }
         let header = core::ptr::with_exposed_provenance::<Header>(item);
         // SAFETY: 队列里只有本轮标记过的活对象；重定位模式时它只被这一个线程取出（独占）
         unsafe { Header::visit(header, self) };
@@ -525,6 +666,12 @@ pub struct Marking<'g> {
     group: Option<&'g Injector<(usize, usize)>>,
     /// 年轻疏散（[`crate::YoungEvacuation::Full`]）：0 号工人把记忆集里这些槽改成搬走后的新地址
     slots: &'g [usize],
+    /// 可共享的年轻对象晋升进这个跨堆
+    #[cfg(crossheap)]
+    promote: Option<&'g Inner>,
+    /// 指着跨堆的边报到这里
+    #[cfg(crossheap)]
+    crossing: Option<&'g Injector<usize>>,
 }
 
 // SAFETY: 每个工号的复制缓冲只被一个线程取走（工号互不相同）；其余是线程安全的
@@ -541,7 +688,25 @@ impl<'g> Marking<'g> {
             log: None,
             group: None,
             slots: &[],
+            #[cfg(crossheap)]
+            promote: None,
+            #[cfg(crossheap)]
+            crossing: None,
         }
+    }
+
+    /// 年轻疏散时把可共享的年轻对象晋升进 `cross`。
+    #[cfg(crossheap)]
+    pub fn promoting(mut self, cross: Option<&'g Inner>) -> Self {
+        self.promote = cross;
+        self
+    }
+
+    /// 追踪到的、指着跨堆对象的边报到 `crossing`。
+    #[cfg(crossheap)]
+    pub fn crossing(mut self, crossing: Option<&'g Injector<usize>>) -> Self {
+        self.crossing = crossing;
+        self
     }
 
     /// 年轻疏散：记忆集里的槽（地址）由 0 号工人改成搬走后的新地址（同时把目标标灰）。
@@ -613,8 +778,15 @@ impl<'g> Marking<'g> {
         let local = self.crew.take(me);
         // SAFETY: 复制缓冲也按工号取一次，只在这个工号的线程上
         let mut copier = self.copiers.get(me).and_then(|c| unsafe { (*c.get()).take() });
+        #[cfg(crossheap)]
+        let promoter = self.promote.map(Promoter::new);
         // 只有一个工人时没有别人改计数（mutator 不碰计数，减量队列此时为空）
         let mut t = Tracer::new(&local, self.epoch, copier.as_mut()).counting(self.count, self.crew.len() == 1).logging(self.log).grouping(self.group);
+        #[cfg(crossheap)]
+        {
+            t.promoter = promoter.as_ref();
+            t.crossing = self.crossing;
+        }
         if me == 0
             && let Some(roots) = self.roots
         {
@@ -809,9 +981,19 @@ impl<'h> Marker<'h> {
         let ty = unsafe { (*h).ty };
         let data = PHeader::data(h);
         for &edge in source.edges(ty) {
-            let (far, off) = (edge & FAR_EDGE != 0, (edge & !FAR_EDGE) as usize);
+            let (far, off) = (edge & FAR_EDGE != 0, (edge & !EDGE_KINDS) as usize);
             // SAFETY: 指针图里的偏移都是这个类型里指针槽（一个 AtomicU64）的位置
-            let v = unsafe { &*data.add(off).cast::<AtomicU64>() }.load(Ordering::Acquire);
+            let raw = unsafe { &*data.add(off).cast::<AtomicU64>() }.load(Ordering::Acquire);
+            // 存绝对地址的边换成公开偏移（地址区外的——私有堆的对象——不归这里管）
+            let absolute = match edge & (WORD_EDGE | PTR_EDGE) {
+                WORD_EDGE => Some(word_pointer(raw).map_or(0, <*mut u8>::addr)),
+                PTR_EDGE => usize::try_from(raw).ok(),
+                _ => None,
+            };
+            let v = match absolute {
+                Some(addr) => source.offset_of(addr).unwrap_or(0),
+                None => raw,
+            };
             if v == 0 {
                 continue;
             }

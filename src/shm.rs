@@ -41,6 +41,12 @@ pub const REGION: usize = WINDOW * WINDOWS;
 
 const _: () = assert!(REGION.is_power_of_two() && WINDOW.is_power_of_two());
 
+/// 固定地址的公开地址区放在这里（每个进程都一样，所以对象里存的绝对地址在每个进程里都对）：64 TiB 处，按区大小对齐，
+/// 避开 x86-64 / AArch64（48 位虚拟地址）上可执行文件、堆、mmap 常用的地方
+pub const FIXED_BASE: usize = 64 << 40;
+
+const _: () = assert!(FIXED_BASE.is_multiple_of(REGION));
+
 pub struct Region {
     base: NonNull<u8>,
 }
@@ -51,6 +57,12 @@ unsafe impl Send for Region {}
 unsafe impl Sync for Region {}
 
 impl Region {
+    /// `addr` 落在固定地址的公开地址区里（[`FIXED_BASE`]）。Miri 下没有固定地址区。
+    #[inline]
+    pub fn holds_fixed(addr: usize) -> bool {
+        !cfg!(miri) && addr & !(REGION - 1) == FIXED_BASE
+    }
+
     /// 区内地址 `p` 所在区的起点（抹掉低位）。
     pub fn base_of(p: usize) -> usize {
         p & !(REGION - 1)
@@ -86,6 +98,23 @@ impl Region {
             libc::munmap(base.wrapping_add(REGION).cast(), REGION - head);
         }
         Ok(Self { base: NonNull::new(base).expect("mmap 不会返回空") })
+    }
+
+    /// 在 [`FIXED_BASE`] 保留整个区；那里已经有映射（或地址空间不够大）就失败。
+    pub fn reserve_fixed() -> io::Result<Self> {
+        let want = core::ptr::without_provenance_mut::<libc::c_void>(FIXED_BASE);
+        // SAFETY: MAP_FIXED_NOREPLACE 不覆盖已有映射
+        let raw = unsafe { libc::mmap(want, REGION, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_FIXED_NOREPLACE, -1, 0) };
+        if raw == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        if raw.addr() != FIXED_BASE {
+            // 老内核不认 MAP_FIXED_NOREPLACE，当提示用了：放回去
+            // SAFETY: 刚映射的
+            unsafe { libc::munmap(raw, REGION) };
+            return Err(io::Error::new(io::ErrorKind::AddrInUse, "固定地址的公开地址区被占了"));
+        }
+        Ok(Self { base: NonNull::new(raw.cast()).expect("mmap 不会返回空") })
     }
 
     /// 把文件映射到第 `k` 个窗口（整个窗口一次映射；文件比窗口短，只访问已经延长过的部分）。
@@ -155,6 +184,10 @@ impl Region {
         // SAFETY: 大小非零
         let p = unsafe { std::alloc::alloc_zeroed(Self::LAYOUT) };
         Ok(Self { base: NonNull::new(p).unwrap_or_else(|| std::alloc::handle_alloc_error(Self::LAYOUT)) })
+    }
+
+    pub fn reserve_fixed() -> io::Result<Self> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 
     pub unsafe fn map_file(&self, _: usize, _: &File) -> io::Result<()> {
@@ -447,6 +480,8 @@ const _: () = assert!(WINDOWS <= u64::BITS as usize, "窗口占用位图是一�
 
 pub struct Space {
     region: Region,
+    /// 地址区在 [`FIXED_BASE`]
+    fixed: bool,
     /// 窗口占用位图
     used: AtomicU64,
 }
@@ -454,6 +489,10 @@ pub struct Space {
 impl Space {
     pub fn region(&self) -> &Region {
         &self.region
+    }
+
+    pub fn is_fixed(&self) -> bool {
+        self.fixed
     }
 
     /// 占第 `k` 个窗口；已经被占返回 false。
@@ -478,7 +517,14 @@ pub struct CrossHeapSpace(Arc<Space>);
 
 impl CrossHeapSpace {
     pub fn reserve() -> io::Result<Self> {
-        Ok(Self(Arc::new(Space { region: Region::reserve()?, used: AtomicU64::new(0) })))
+        Ok(Self(Arc::new(Space { region: Region::reserve()?, fixed: false, used: AtomicU64::new(0) })))
+    }
+
+    /// 在固定地址（[`FIXED_BASE`]，每个进程都一样）保留公开地址区：对象里可以存绝对地址（[`crate::Gc`]、[`crate::Slot`]、
+    /// [`crate::WordSlot`]），别的进程读出来照样对。私有堆把年轻对象晋升进公开堆（[`crate::Heap::attach_cross_heap`]）要这种区；
+    /// 一个进程只能有一个。那里已经被占了就失败。
+    pub fn reserve_fixed() -> io::Result<Self> {
+        Ok(Self(Arc::new(Space { region: Region::reserve_fixed()?, fixed: true, used: AtomicU64::new(0) })))
     }
 
     /// 在 `path`（共享内存文件系统上的新文件，比如 `/dev/shm/…` 或自己挂的 tmpfs / hugetlbfs）建一个公开堆。

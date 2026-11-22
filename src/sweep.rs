@@ -74,8 +74,11 @@ impl Large {
     /// 析构并释放。SAFETY（调用方）：死了，没人会再碰它。
     unsafe fn free(self) {
         let bytes = self.header().bytes();
-        // SAFETY: 没标记 ⇒ 不可达
-        unsafe { Header::finalize(self.0.as_ptr()) };
+        // 晋升进跨堆的（搬走了）没有析构，析构函数那个字存着新地址
+        if !self.header().is_forwarded() {
+            // SAFETY: 没标记 ⇒ 不可达
+            unsafe { Header::finalize(self.0.as_ptr()) };
+        }
         #[cfg(all(target_os = "linux", not(miri)))]
         if bytes >= LARGE_MMAP {
             // SAFETY: Large::alloc 按同样的字节数映射的

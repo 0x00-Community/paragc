@@ -754,3 +754,105 @@ fn shrink_returns_empty_blocks_and_open_by_fd() {
     drop((kept, again, b, a));
     assert!(!path.exists());
 }
+
+/// 私有堆里分配、可以晋升进跨堆的节点
+#[repr(C)]
+#[derive(Trace, Shared)]
+struct SNode<'gc> {
+    value: u64,
+    next: paragc::Slot<'gc, SNode<'gc>>,
+}
+
+brand!(SNodeB = for<'gc> SNode<'gc>);
+cross_heap_brand!(SNodeX = for<'p> SNode<'p>);
+
+/// 私有堆里的普通对象，指着一个可共享的节点
+#[derive(Trace)]
+struct Keeper<'gc> {
+    node: paragc::Slot<'gc, SNode<'gc>>,
+}
+
+brand!(KeeperB = for<'gc> Keeper<'gc>);
+
+fn snode_sum(heap: &Heap, root: &Root<SNodeB>) -> (u64, bool) {
+    heap.mutate(|m| {
+        let (mut sum, mut all_crossed, mut cur) = (0, true, Some(m.get(root)));
+        while let Some(n) = cur {
+            sum += n.value;
+            all_crossed &= in_fixed(n.as_ptr().addr());
+            cur = n.next.get();
+        }
+        (sum, all_crossed)
+    })
+}
+
+/// 固定地址的地址区：从 64 TiB 起的 1 TiB
+const FIXED_BASE: usize = 64 << 40;
+const FIXED_REGION: usize = 1 << 40;
+
+fn in_fixed(addr: usize) -> bool {
+    (FIXED_BASE..FIXED_BASE + FIXED_REGION).contains(&addr)
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "Miri 没有固定地址的地址区")]
+fn young_survivors_promote_into_attached_cross_heap() {
+    const LEN: u64 = 5000;
+    let space = CrossHeapSpace::reserve_fixed().unwrap();
+    let cross = space.create_anonymous(THREADS).unwrap();
+    let mut heap = Heap::new(THREADS);
+    heap.attach_cross_heap(&cross).unwrap();
+    let (root, keeper, weak) = heap.mutate(|m| {
+        let mut top: Option<paragc::Gc<'_, SNode<'_>>> = None;
+        for value in 0..LEN {
+            top = Some(m.alloc_shared(SNode { value, next: top.into() }));
+        }
+        let top = top.unwrap();
+        let keeper = m.alloc(Keeper { node: top.next.get().into() });
+        (m.root::<SNodeB>(top), m.root::<KeeperB>(keeper), m.weak::<SNodeB>(top))
+    });
+    assert_eq!(snode_sum(&heap, &root), (triangle(LEN), false));
+    heap.collect_young();
+    assert_eq!(snode_sum(&heap, &root), (triangle(LEN), true), "整条链都晋升进跨堆、值不变");
+    let node_bytes = (HEADER + size_of::<SNode<'static>>()).next_multiple_of(8);
+    let sig = heap.mutate(|m| {
+        let keeper = m.get(&keeper);
+        assert!(!in_fixed(keeper.as_ptr().addr()), "不可共享的对象留在私有堆");
+        assert_eq!(keeper.node.get().map(|n| n.value), Some(LEN - 2), "私有对象里的槽改成了新地址");
+        assert!(m.upgrade(&weak).is_some_and(|n| in_fixed(n.as_ptr().addr())), "弱引用跟着搬");
+        cross.mutate(|cm| cm.sign(cm.adopt::<SNodeX, _>(m.get(&root)).expect("在跨堆里")))
+    });
+    assert_eq!(cross.mutate(|cm| cm.resolve::<SNodeX>(&sig).map(|n| n.value)), Some(LEN - 1), "签名找得到晋升过去的对象");
+    // 跨堆只由主人回收：单独回收什么都不做
+    cross.collect();
+    assert_eq!(cross.stats().collections, 0);
+    // 主人完整回收：私有堆指着的都活着
+    heap.collect();
+    assert_eq!(cross.stats().live, node_bytes * usize::try_from(LEN).unwrap());
+    assert_eq!(snode_sum(&heap, &root), (triangle(LEN), true));
+    // 只剩私有的 keeper 指着第二个节点：链头死掉、后面的经 keeper 活着
+    drop(root);
+    heap.collect();
+    assert_eq!(cross.stats().live, node_bytes * usize::try_from(LEN - 1).unwrap());
+    assert!(heap.mutate(|m| m.upgrade(&weak).is_none()), "跨堆对象死了，私有弱引用清空");
+    assert!(cross.mutate(|cm| cm.resolve::<SNodeX>(&sig).is_none()));
+    drop(keeper);
+    heap.collect();
+    assert_eq!(cross.stats().live, 0);
+}
+
+#[test]
+#[should_panic(expected = "跨堆对象里不能写私有堆的对象")]
+#[cfg_attr(miri, ignore = "Miri 没有固定地址的地址区")]
+fn private_values_cannot_be_written_into_cross_heap_objects() {
+    let space = CrossHeapSpace::reserve_fixed().unwrap();
+    let cross = space.create_anonymous(THREADS).unwrap();
+    let mut heap = Heap::new(THREADS);
+    heap.attach_cross_heap(&cross).unwrap();
+    let root = heap.mutate(|m| m.root::<SNodeB>(m.alloc_shared(SNode { value: 1, next: None.into() })));
+    heap.collect_young();
+    heap.mutate(|m| {
+        let fresh = m.alloc_shared(SNode { value: 2, next: None.into() });
+        m.get(&root).next.set(m, Some(fresh));
+    });
+}

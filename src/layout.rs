@@ -158,8 +158,32 @@ impl Header {
         }
     }
 
+    /// 可共享的对象（类型同时是 [`crate::Shared`]）：挂着跨堆的私有堆做年轻回收时，它被晋升进 [`crate::CrossHeap`]。
+    /// 类型不能有析构（编译期检查）。
+    #[cfg(crossheap)]
+    pub fn new_shared<T: Trace + crate::Shared>(bytes: usize, large: bool, mark: u32) -> Self {
+        const { assert!(!needs_drop::<T>(), "可共享的对象不能有析构") };
+        Self { core: Core::new(bytes, large, mark), visit: Self::visit_shared_as::<T>, drop: None }
+    }
+
+    /// 同 [`Header::visit_as`]；回收器问类型时（[`Tracer::asking`]）回答 `T`。SAFETY 同 [`Header::visit_as`]
+    #[cfg(crossheap)]
+    unsafe fn visit_shared_as<T: Trace + crate::Shared>(data: *mut u8, t: &mut Tracer<'_>) {
+        if t.asking() {
+            t.answer::<T>();
+            return;
+        }
+        // SAFETY: 见上
+        unsafe { Self::visit_as::<T>(data, t) };
+    }
+
     /// SAFETY（调用方）：`data` 指向一个活着的 `T`；重定位模式时调用方独占它（没有 mutator、别的回收线程不碰它的数据）
     unsafe fn visit_as<T: Trace>(data: *mut u8, t: &mut Tracer<'_>) {
+        // 回收器问可不可以共享：不可以（可以的走 visit_shared_as）
+        #[cfg(crossheap)]
+        if t.asking() {
+            return;
+        }
         if t.relocating() {
             // SAFETY: 见上
             unsafe { &mut *data.cast::<T>() }.relocate(t);
@@ -314,7 +338,7 @@ impl Header {
         }
     }
 
-    fn forwardee(&self) -> *const Self {
+    pub fn forwardee(&self) -> *const Self {
         // SAFETY: 只在看到 FORWARDED 之后调用，新地址已经写好
         unsafe { (&raw const self.drop).cast::<*const Self>().read() }
     }
@@ -323,6 +347,13 @@ impl Header {
     pub unsafe fn visit(this: *const Self, t: &mut Tracer<'_>) {
         // SAFETY: 见上；visit 是按对象自己的类型生成的
         unsafe { ((*this).visit)(Self::data(this), t) };
+    }
+
+    /// 按 `this` 的类型访问另一份数据 `data`（晋升后搬到跨堆里的那份）。SAFETY（调用方）：`data` 是同一个类型的活对象，其余同 [`Header::visit`]。
+    #[cfg(crossheap)]
+    pub unsafe fn visit_data(this: *const Self, data: *mut u8, t: &mut Tracer<'_>) {
+        // SAFETY: 见上
+        unsafe { ((*this).visit)(data, t) };
     }
 
     /// 析构对象数据。SAFETY（调用方）：对象已死、之后不再使用，而且没被搬走。
@@ -887,7 +918,8 @@ pub struct Super {
     pub owner_start: AtomicU64,
     /// 非 0：堆已经死了（主人走了），文件已经或正在删除；还映射着它的进程只能放手
     pub dead: AtomicU32,
-    _pad_dead: u32,
+    /// 非 0：只有主人回收（它挂在主人的私有堆上当老年代，主人的私有堆指着它的对象，别人看不到这些根）
+    pub owner_only: AtomicU32,
 }
 
 #[cfg(crossheap)]
@@ -919,7 +951,7 @@ impl Super {
             persist: AtomicU32::new(0),
             owner_start: AtomicU64::new(owner.start),
             dead: AtomicU32::new(0),
-            _pad_dead: 0,
+            owner_only: AtomicU32::new(0),
         }
     }
 }
