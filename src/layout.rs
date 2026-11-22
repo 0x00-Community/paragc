@@ -818,7 +818,7 @@ impl Drop for Pages {
 
 /// 超级块里的魔数：认出这是 paragc 的公开堆、布局版本对得上
 #[cfg(target_os = "linux")]
-pub const MAGIC: u64 = u64::from_le_bytes(*b"paragcP4");
+pub const MAGIC: u64 = u64::from_le_bytes(*b"paragcP5");
 /// 页大小：各段按页对齐、按页延长文件
 #[cfg(target_os = "linux")]
 pub const PAGE: usize = 4096;
@@ -866,7 +866,10 @@ pub struct Super {
     pub map: AtomicU32,
     /// 入口表里下一个没用过的项
     pub entries: AtomicU32,
-    _pad: u32,
+    /// 信箱收到过的件数（futex 字）：投递时加一并叫醒主人
+    pub mail: AtomicU32,
+    /// 信箱：投递进来、还没取走的入口栈的头（见 [`crate::sync::Stack`]，「下一个」用入口的 `next`）
+    pub mailbox: AtomicU64,
     /// 还回来的入口栈的头
     pub free_entries: AtomicU64,
     /// 文件已经延长到的地方（窗口偏移）：类型表、指针图、入口表、块状态表各一个
@@ -905,7 +908,8 @@ impl Super {
             types: AtomicU32::new(0),
             map: AtomicU32::new(0),
             entries: AtomicU32::new(0),
-            _pad: 0,
+            mail: AtomicU32::new(0),
+            mailbox: AtomicU64::new(0),
             free_entries: AtomicU64::new(0),
             committed: core::array::from_fn(|_| AtomicU64::new(0)),
             live: AtomicU64::new(0),
@@ -1076,7 +1080,9 @@ pub struct PHeader {
     pub core: Core,
     /// 类型表里的序号
     pub ty: u32,
-    _pad: u32,
+    /// 出生戳：由堆身份与分配时的纪元算出（见 [`crate::heap::Inner::stamp`]）。同一个位置先后住过的两个对象戳不同（概率意义上），
+    /// 跨堆弱引用与签名靠它认出原来的对象已经死了、位置被别人占了
+    pub stamp: u32,
 }
 
 /// 公开堆对象头的字节数；数据紧跟在后面
@@ -1088,9 +1094,9 @@ const _: () = assert!(PHEADER == 16, "公开堆的对象头是 16 字节");
 
 #[cfg(target_os = "linux")]
 impl PHeader {
-    pub fn new(bytes: usize, large: bool, ty: u32) -> Self {
+    pub fn new(bytes: usize, large: bool, ty: u32, stamp: u32) -> Self {
         // 新对象的标记 0 不等于任何纪元（纪元从 1 开始）
-        Self { core: Core::new(bytes, large, 0), ty, _pad: 0 }
+        Self { core: Core::new(bytes, large, 0), ty, stamp }
     }
 
     pub fn data(this: *const Self) -> *mut u8 {

@@ -37,7 +37,7 @@ use crossbeam_utils::{Backoff, CachePadded};
 use crate::{Gc, Trace};
 use crate::handle::{GcInternal, Invariant, RawSlot, RootTable};
 #[cfg(target_os = "linux")]
-use crate::handle::{EdgeMap, Public, PublicBrand, PublicGc, PublicGcInternal, PublicInternal, Shared};
+use crate::handle::{EdgeMap, Public, PublicBrand, PublicGc, PublicGcInternal, PublicInternal, STAMP_MASK, Shared, Signature, WeakWord};
 use crate::layout::{BLOCK, Block, Pages, WARM_CYCLES, YOUNG_COPY_DEN, YOUNG_COPY_NUM, LINE, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, HEADER, Header, LARGE, MAX_EPOCH, MIN_SPARE_BLOCKS, MIN_TRIGGER, OVERFLOW_TRIES, FRAG_NUM, FRAG_DEN, YOUNG_PER_FULL, YOUNG_PER_FULL_RC};
 #[cfg(target_os = "linux")]
 use crate::layout::{Core, State};
@@ -1155,11 +1155,21 @@ const ALIVE_RECHECK: Duration = Duration::from_millis(10);
 /// 清扫时每次领多少块
 #[cfg(target_os = "linux")]
 const SWEEP_BATCH: usize = 16;
+/// 出生戳的打散用 SplitMix64：纪元乘的黄金比例常数
+#[cfg(target_os = "linux")]
+const SPLITMIX_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
+/// SplitMix64 末尾三轮的右移位数
+#[cfg(target_os = "linux")]
+const SPLITMIX_SHIFTS: [u32; 3] = [30, 27, 31];
+/// SplitMix64 末尾两轮的乘数
+#[cfg(target_os = "linux")]
+const SPLITMIX_MULS: [u64; 2] = [0xbf58_476d_1ce4_e5b9, 0x94d0_49bb_1331_11eb];
 /// 窗口背后是什么。
 #[cfg(target_os = "linux")]
 pub enum Backing {
-    /// 共享内存文件系统上的文件；`owner` = 本句柄建的（本进程是主人），析构时堆跟着死、删文件与标记（除非 persist）
-    File { file: File, path: PathBuf, owner: bool },
+    /// 共享内存文件系统上的文件；`owner` = 本句柄建的（本进程是主人），析构时堆跟着死、删文件与标记（除非 persist）。
+    /// 凭别人交来的文件描述符打开的没有路径（[`crate::PublicSpace::open_fd`]）
+    File { file: File, path: Option<PathBuf>, owner: bool },
     /// 匿名共享内存（只在本进程）
     Anonymous,
 }
@@ -1170,6 +1180,15 @@ impl Backing {
     fn commit(&self, offset: usize, len: usize) {
         if let Self::File { file, .. } = self {
             Region::commit(file, offset, len).expect("公开堆所在的文件系统满了");
+        }
+    }
+
+    /// 窗口的 `[offset, offset + len)`（从 `window` 起算）还给系统：文件打洞（长度不变，之后读到零），匿名内存 `MADV_REMOVE`。
+    /// 尽力而为：文件系统不支持（比如 hugetlbfs 没按大页对齐）就留着。
+    fn punch(&self, window: *mut u8, offset: usize, len: usize) {
+        match self {
+            Self::File { file, .. } => Region::punch(file, offset, len),
+            Self::Anonymous => Region::remove(window.wrapping_add(offset), len),
         }
     }
 }
@@ -1385,6 +1404,11 @@ impl Inner {
     /// 暂停式回收：拿回收权（别人刚回收完就返回）、等 mutate 走空（等不到就放开重来）、收拾死掉的挂接、标记 + 清扫。
     /// 标记只写新纪元、纪元到最后才发布，清扫只在标记做完后才开始，所以被杀了由别人从头重做是安全的。
     fn collect(&self) {
+        self.collect_with(false);
+    }
+
+    /// 同 [`Inner::collect`]；`shrink` 时清扫出来的空块一个不留、全部还给系统。
+    fn collect_with(&self, shrink: bool) {
         let mut retry = Retry::new();
         loop {
             if !self.claim_collection(true) {
@@ -1397,7 +1421,7 @@ impl Inner {
             retry.pause();
         }
         self.reap_dead();
-        Self::collect_members(&[self]);
+        Self::collect_members(&[self], shrink);
         self.release();
     }
 
@@ -1424,7 +1448,7 @@ impl Inner {
         for m in members {
             m.reap_dead();
         }
-        Self::collect_members(members);
+        Self::collect_members(members, false);
         for m in members.iter().rev() {
             m.release();
         }
@@ -1447,7 +1471,7 @@ impl Inner {
     /// 堆文件的路径（匿名堆没有）。
     fn path(&self) -> Option<&std::path::Path> {
         match &self.backing {
-            Backing::File { path, .. } => Some(path),
+            Backing::File { path, .. } => path.as_deref(),
             Backing::Anonymous => None,
         }
     }
@@ -1464,13 +1488,17 @@ impl Inner {
         if sup.dead.load(Ordering::Acquire) != 0 {
             return false;
         }
-        let Some(path) = self.path() else { return true };
+        if matches!(self.backing, Backing::Anonymous) {
+            return true;
+        }
         let owner = Process { pid: sup.owner_pid.load(Ordering::Acquire), start: sup.owner_start.load(Ordering::Acquire) };
         if sup.persist.load(Ordering::Acquire) != 0 || owner.alive() {
             return true;
         }
         sup.dead.store(1, Ordering::Release);
-        Registry::of(path).bury(path, self.index, self.incarnation());
+        if let Some(path) = self.path() {
+            Registry::of(path).bury(path, self.index, self.incarnation());
+        }
         false
     }
 
@@ -1734,7 +1762,7 @@ impl Inner {
     ///
     /// 几个堆一起时：持有方是组里某个堆的入口不当根（由追踪决定死活），标完后按追踪到的跨堆边重建这些登记——先登记新的、
     /// 再还旧的，中间被杀也只多不少（接手的单独回收照样把它们当根）。
-    fn collect_members(members: &[&Self]) {
+    fn collect_members(members: &[&Self], shrink: bool) {
         let in_group = |e: &Entry| members.len() > 1 && Self::held_by(members, e.holder.load(Ordering::Acquire), e.holder_incarnation.load(Ordering::Acquire));
         let mut epochs = Vec::with_capacity(members.len());
         let mut roots = Vec::new();
@@ -1767,7 +1795,7 @@ impl Inner {
             Self::reregister(members, &found);
         }
         for (heap, epoch) in members.iter().zip(epochs) {
-            heap.sweep_all(epoch);
+            heap.sweep_all(epoch, shrink);
         }
     }
 
@@ -1806,8 +1834,9 @@ impl Inner {
     }
 
     /// 清扫（标记已经用 `epoch` 做完）：可用栈清空、各块重新分类，发布纪元。
-    fn sweep_all(&self, epoch: u32) {
+    fn sweep_all(&self, epoch: u32, shrink: bool) {
         let sup = self.sup();
+        let spare = if shrink { 0 } else { (usize::try_from(sup.allocated.load(Ordering::Relaxed)).unwrap_or(usize::MAX) / BLOCK).max(MIN_SPARE_BLOCKS) };
         let blocks = sup.blocks.load(Ordering::Acquire) as usize;
         let pool = self.pool();
         let workers = pool.sized(blocks);
@@ -1815,27 +1844,30 @@ impl Inner {
         sup.available.store(0, Ordering::Release);
         let cursor = AtomicUsize::new(0);
         let swept = pool.run(workers, |_| self.sweep_some(&cursor, blocks, epoch));
-        let mut live = 0;
-        for (bytes, dead) in swept {
+        let (mut live, mut empty) = (0, Vec::new());
+        for (bytes, dead, emptied) in swept {
             live += bytes;
+            empty.extend(emptied);
             // 死掉的大对象等全部块扫完再拆：拆开的块会变成小对象块，正在扫的工人不能把它们当小块再扫一遍
             for head in dead {
-                self.free_large(head);
+                self.free_large(head, &mut empty);
             }
         }
+        empty.sort_unstable();
+        self.punch_blocks(empty.get(spare..).unwrap_or_default());
         sup.live.store(live as u64, Ordering::Relaxed);
         sup.allocated.store(0, Ordering::Relaxed);
         sup.collections.fetch_add(1, Ordering::AcqRel);
         sup.epoch.store(epoch, Ordering::Release);
     }
 
-    /// 清扫一批批领到的块；返回存活字节数与死掉的大对象（第一块的序号）。
-    fn sweep_some(&self, cursor: &AtomicUsize, blocks: usize, epoch: u32) -> (usize, Vec<u32>) {
-        let (mut live, mut dead) = (0, Vec::new());
+    /// 清扫一批批领到的块；返回存活字节数、死掉的大对象（第一块的序号）与扫空了的小对象块。
+    fn sweep_some(&self, cursor: &AtomicUsize, blocks: usize, epoch: u32) -> (usize, Vec<u32>, Vec<u32>) {
+        let (mut live, mut dead, mut empty) = (0, Vec::new(), Vec::new());
         loop {
             let start = cursor.fetch_add(SWEEP_BATCH, Ordering::AcqRel);
             if start >= blocks {
-                return (live, dead);
+                return (live, dead, empty);
             }
             for i in start..(start + SWEEP_BATCH).min(blocks) {
                 let i = u32::try_from(i).expect("块序号");
@@ -1844,6 +1876,9 @@ impl Inner {
                         // SAFETY: 标记做完了，没有 mutator；块里是公开堆的对象
                         let (state, bytes) = unsafe { self.block(i).sweep::<PHeader>(epoch, None) };
                         live += bytes;
+                        if matches!(state, State::Empty) {
+                            empty.push(i);
+                        }
                         if !matches!(state, State::Full) {
                             Stack::on(&self.sup().available).push(i, &self.state(i).next);
                         }
@@ -1865,7 +1900,7 @@ impl Inner {
 
     /// 拆掉一个死掉的大对象：它占的块元数据清零、改成小对象块，压进可用栈。先拆后面的块、最后拆头：
     /// 拆到一半进程被杀，头还在，下一次回收再拆一遍，已经拆过的（不再是 LargeTail）跳过，不会重复进栈。
-    fn free_large(&self, head: u32) {
+    fn free_large(&self, head: u32, empty: &mut Vec<u32>) {
         // SAFETY: 大对象的头在第一块开头，还没拆
         let n = unsafe { &*self.block(head).line(0).cast::<Core>() }.bytes().div_ceil(BLOCK);
         let tails = head + 1..head + u32::try_from(n).expect("块数");
@@ -1876,7 +1911,77 @@ impl Inner {
             b.reused();
             self.state(j).kind.store(Kind::Small as u32, Ordering::Release);
             Stack::on(&self.sup().available).push(j, &self.state(j).next);
+            empty.push(j);
         }
+    }
+
+    /// 空块（序号排好序）还给系统：连着的一段打一次洞。块的元数据也一起清零，全零正是空块的合法状态（同 [`Block::reset`]），
+    /// 块状态表不在块里、不受影响，所以它们照样留在可用栈里，再领到时缺页拿到零页。
+    fn punch_blocks(&self, sorted: &[u32]) {
+        for run in sorted.chunk_by(|a, b| a + 1 == *b) {
+            let (first, n) = (run[0] as usize, run.len());
+            self.backing.punch(self.window.as_ptr(), self.layout.blocks + first * BLOCK, n * BLOCK);
+        }
+    }
+
+    /// 本堆在纪元 `epoch` 里分配的对象的出生戳：堆身份与纪元一起打散。同一个位置先后住过的两个对象分配在不同纪元
+    /// （位置只在清扫后才空出来、清扫后纪元一定变大），堆号重用后身份也不同，所以戳只会以约 2^-[`STAMP_BITS`] 的概率撞上。
+    pub fn stamp(&self, epoch: u32) -> u32 {
+        let mut z = self.incarnation() ^ u64::from(epoch).wrapping_mul(SPLITMIX_GAMMA);
+        z = (z ^ (z >> SPLITMIX_SHIFTS[0])).wrapping_mul(SPLITMIX_MULS[0]);
+        z = (z ^ (z >> SPLITMIX_SHIFTS[1])).wrapping_mul(SPLITMIX_MULS[1]);
+        u32::try_from((z ^ (z >> SPLITMIX_SHIFTS[2])) >> u32::BITS).expect("高 32 位")
+    }
+
+    /// 弱引用的字指着本堆里一个活对象（位置上有对象的头、出生戳对得上）时，给出它的数据地址。字是别的进程发来的也安全：
+    /// 只读已经有内存的表项与块，越界、没开过的块、对象中间、大对象的后续块都是 None。
+    /// 只在本堆的 mutate 里调用（回收在等 mutator 走空，核对与之后的使用之间对象不会被回收）。
+    pub fn locate(&self, word: WeakWord) -> Option<*mut u8> {
+        let off = word.offset();
+        if off == 0 || !self.owns(off) {
+            return None;
+        }
+        let local = usize::try_from(off).ok()? - self.index * WINDOW;
+        let rel = local.checked_sub(self.layout.blocks)?;
+        let i = rel / BLOCK;
+        let sup = self.sup();
+        if i >= sup.blocks.load(Ordering::Acquire) as usize {
+            return None;
+        }
+        let states = usize::try_from(sup.committed[Segment::States.index()].load(Ordering::Acquire)).ok()?;
+        if self.layout.states + (i + 1) * size_of::<BlockState>() > states {
+            return None;
+        }
+        let i = u32::try_from(i).ok()?;
+        let b = self.block(i);
+        let data = self.at::<u8>(local);
+        let header = data.wrapping_sub(PHEADER);
+        let at_object = match Kind::from(self.state(i).kind.load(Ordering::Acquire)) {
+            Kind::Small if header.addr() >= b.line(Block::FIRST_LINE).addr() => {
+                let (word, bit) = b.start_bit(header);
+                // SAFETY: 起点位图在块的元数据里，块开过（有内存）
+                unsafe { &*word }.load(Ordering::Acquire) & bit != 0
+            }
+            Kind::LargeHead => core::ptr::eq(header, b.line(0)),
+            _ => false,
+        };
+        // SAFETY: 上面认过 header 处是一个已经写完的对象头
+        (at_object && unsafe { (*header.cast::<PHeader>()).stamp } & STAMP_MASK == word.stamp()).then_some(data)
+    }
+
+    /// `data` 处（[`Inner::locate`] 认过的对象）的类型是 `T`：先看本进程缓存的类型号，对不上再比类型键。
+    pub fn is_type<T: Shared>(&self, data: *const u8) -> bool {
+        // SAFETY: 见上
+        let ty = unsafe { (*PHeader::of(data)).ty };
+        let tag = type_name::<T>().as_ptr().addr();
+        self.types.iter().any(|&(t, k)| t == tag && k == ty) || self.same_type::<T>(ty)
+    }
+
+    /// `data` 处对象的类型键。
+    fn key_of(&self, data: *const u8) -> [u64; 2] {
+        // SAFETY: data 是本堆一个活对象，类型号来自它登记过的类型
+        let ty = unsafe { (*PHeader::of(data)).ty };
+        self.type_entry(ty).key.each_ref().map(|k| k.load(Ordering::Relaxed))
     }
 }
 
@@ -1891,7 +1996,7 @@ impl Drop for Inner {
         }
         // 建堆的句柄（主人）放手、又没有 persist：堆跟着死——标死（还映射着它的进程就知道了），删掉文件与标记。
         // 要在拆映射之前读写超级块
-        if let Backing::File { path, owner: true, .. } = &self.backing
+        if let Backing::File { path: Some(path), owner: true, .. } = &self.backing
             && self.sup().persist.load(Ordering::Acquire) == 0
         {
             self.sup().dead.store(1, Ordering::Release);
@@ -2001,7 +2106,7 @@ impl PublicHeap {
             tlab.adopt((Arc::as_ptr(&self.0).addr(), self.0.sup().collections.load(Ordering::Acquire)));
             // 回收只在没有 mutator 时进行，所以一次 mutate 里纪元不变
             let epoch = self.0.sup().epoch.load(Ordering::Acquire);
-            f(&PublicMutator { heap: &self.0, tlab: &tlab, epoch, _brand: PhantomData })
+            f(&PublicMutator { heap: &self.0, tlab: &tlab, epoch, stamp: self.0.stamp(epoch), _brand: PhantomData })
         };
         let tlab = Box::into_raw(tlab);
         if self.0.spare.compare_exchange(null_mut(), tlab, Ordering::AcqRel, Ordering::Relaxed).is_err() {
@@ -2016,6 +2121,33 @@ impl PublicHeap {
     /// 不要在这个堆的 mutate 里调用（会一直等自己走空）。
     pub fn collect(&self) {
         self.0.collect();
+    }
+
+    /// 同 [`PublicHeap::collect`]，并把清扫出来的空块全部还给系统（平时的回收按上次以来的分配量留一些备用）。
+    /// 还掉的块之后再分配进去要重新缺页。
+    pub fn shrink(&self) {
+        self.0.collect_with(true);
+    }
+
+    /// 堆文件的描述符（匿名堆没有）：经 `SCM_RIGHTS` 交给别的进程，对方用 [`crate::PublicSpace::open_fd`] 打开，
+    /// 不需要能访问堆文件的路径。
+    pub fn fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        match &self.0.backing {
+            Backing::File { file, .. } => Some(file.as_fd()),
+            Backing::Anonymous => None,
+        }
+    }
+
+    /// 信箱收到过的件数（见 [`PublicMutator::post`]）。
+    pub fn mail(&self) -> u32 {
+        self.0.sup().mail.load(Ordering::SeqCst)
+    }
+
+    /// 信箱收到过的件数还是 `seen` 就睡，最多 `timeout`（醒来不保证有新信，再看 [`PublicHeap::mail`]）。
+    /// 不要在这个堆的 mutate 里等（回收会一直等你走空）。
+    pub fn wait_mail(&self, seen: u32, timeout: Duration) {
+        self.0.sup().mail.wait(seen, timeout);
     }
 
     /// 几个公开堆（都映射在本进程里）一起回收，收掉跨堆的环：持有方是组里某个堆的 [`crate::PublicRef`] 登记不当根，
@@ -2128,6 +2260,8 @@ pub struct PublicMutator<'p> {
     tlab: &'p Tlab,
     /// 上次完成的纪元（空行判定）
     epoch: u32,
+    /// 这次 mutate 里分配的对象的出生戳（[`Inner::stamp`]）
+    stamp: u32,
     _brand: Invariant<'p>,
 }
 
@@ -2151,7 +2285,7 @@ impl<'p> PublicMutator<'p> {
         };
         // SAFETY: p 是 bytes 字节、按粒度对齐的新内存，归这次分配独有
         let gc = unsafe {
-            p.cast::<PHeader>().write(PHeader::new(bytes, large, ty));
+            p.cast::<PHeader>().write(PHeader::new(bytes, large, ty, self.stamp));
             let data = PHeader::data(p.cast());
             data.cast::<T>().write(value);
             PublicGc::from_data(data)
@@ -2207,6 +2341,48 @@ impl<'p> PublicMutator<'p> {
         true
     }
 
+    /// 对象的签名：发给别的进程，对方打开本堆后凭它找到这个对象（[`PublicMutator::resolve`]）。签名不保活对象。
+    pub fn sign<T: Shared>(&self, gc: PublicGc<'p, T>) -> Signature {
+        (WeakWord::from(gc), self.heap.incarnation(), self.heap.key_of(gc.as_ptr().cast())).into()
+    }
+
+    /// 签名指着本堆里一个活对象、类型键也对得上（不需要知道 Rust 类型；签名可以来自不可信的一方，核对只读）。
+    pub fn verify(&self, sig: &Signature) -> bool {
+        self.find_signed(sig).is_some()
+    }
+
+    /// 凭签名取对象：签名指着本堆里一个活对象、类型是 `B` 时给出它，否则 None（对象已经被回收、堆号换了主人、类型不对、伪造的）。
+    /// 取到的只在这次 mutate 里有效，要留着就挂到 [`Public`] 上或写进别的对象。
+    pub fn resolve<B: PublicBrand>(&self, sig: &Signature) -> Option<PublicGc<'p, B::Of<'p>>> {
+        let data = self.find_signed(sig)?;
+        // SAFETY: find_signed 认过本堆此刻一个活对象，在这次 mutate 里不会被回收
+        self.heap.is_type::<B::Of<'p>>(data).then(|| unsafe { PublicGc::from_data(data) })
+    }
+
+    fn find_signed(&self, sig: &Signature) -> Option<*mut u8> {
+        if sig.incarnation() != self.heap.incarnation() {
+            return None;
+        }
+        self.heap.locate(sig.into()).filter(|&data| self.heap.key_of(data) == sig.key())
+    }
+
+    /// 把对象投进本堆的信箱，交给堆的主人处理（别的进程请主人代办）：领一个不归任何进程的入口指着它（投递方退出或被杀，
+    /// 信照样在），压进信箱，叫醒等信的主人。返回入口号。主人用 [`PublicMutator::take_mail`] 取，处理完用
+    /// [`PublicMutator::release`] 还掉入口。
+    pub fn post<T: Shared>(&self, gc: PublicGc<'p, T>) -> u32 {
+        let i = self.heap.claim_entry_for(gc.offset(), 0, 0);
+        let sup = self.heap.sup();
+        Stack::on(&sup.mailbox).push(i, &self.heap.entry(i).next);
+        sup.mail.fetch_add(1, Ordering::SeqCst);
+        sup.mail.wake_all();
+        i
+    }
+
+    /// 取走信箱里全部的信（入口号，先投的在前）。用 [`PublicMutator::find`] 按类型拿到对象，处理完 [`PublicMutator::release`]。
+    pub fn take_mail(&self) -> Vec<u32> {
+        Stack::on(&self.heap.sup().mailbox).take_all(|i| &self.heap.entry(i).next)
+    }
+
     fn alloc_small(&self, bytes: usize) -> *mut u8 {
         self.tlab.bump(bytes, self.epoch, || self.heap.acquire(), |_| self.heap.acquire())
     }
@@ -2228,6 +2404,12 @@ pub trait PublicMutatorInternal {
 
     /// 堆身份。
     fn incarnation(&self) -> u64;
+
+    /// 见 [`Inner::locate`]。
+    fn locate(&self, word: WeakWord) -> Option<*mut u8>;
+
+    /// 见 [`Inner::is_type`]。
+    fn is_type<T: Shared>(&self, data: *const u8) -> bool;
 }
 
 #[cfg(target_os = "linux")]
@@ -2250,5 +2432,13 @@ impl PublicMutatorInternal for PublicMutator<'_> {
 
     fn incarnation(&self) -> u64 {
         self.heap.incarnation()
+    }
+
+    fn locate(&self, word: WeakWord) -> Option<*mut u8> {
+        self.heap.locate(word)
+    }
+
+    fn is_type<T: Shared>(&self, data: *const u8) -> bool {
+        self.heap.is_type::<T>(data)
     }
 }

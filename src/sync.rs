@@ -476,6 +476,29 @@ impl<'a> Stack<'a> {
             }
         }
     }
+
+    /// 整个栈一次拿走，先压进去的在前。拿走的元素只归调用方。
+    pub fn take_all<'n>(&self, next_of: impl Fn(u32) -> &'n AtomicU32) -> Vec<u32> {
+        let mut head = self.head.load(Ordering::Acquire);
+        loop {
+            if head & STACK_TOP == 0 {
+                return Vec::new();
+            }
+            let new = (head >> STACK_TAG_SHIFT).wrapping_add(1) << STACK_TAG_SHIFT;
+            match self.head.compare_exchange_weak(head, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(now) => head = now,
+            }
+        }
+        let mut out = Vec::new();
+        let mut top = (head & STACK_TOP) as u32;
+        while let Some(i) = top.checked_sub(1) {
+            out.push(i);
+            top = next_of(i).load(Ordering::Relaxed);
+        }
+        out.reverse();
+        out
+    }
 }
 
 #[cfg(target_os = "linux")]

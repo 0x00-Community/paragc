@@ -120,6 +120,20 @@ impl Region {
         // SAFETY: 只改文件长度与分配
         if unsafe { libc::fallocate(file.as_raw_fd(), 0, offset, len) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
     }
+
+    /// 文件的 `[offset, offset + len)` 打洞（长度不变，之后读到零）。尽力而为，失败就留着。
+    pub fn punch(file: &File, offset: usize, len: usize) {
+        use std::os::fd::AsRawFd;
+        let (Ok(offset), Ok(len)) = (i64::try_from(offset), i64::try_from(len)) else { return };
+        // SAFETY: 只丢文件这一段的内容
+        unsafe { libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, offset, len) };
+    }
+
+    /// 共享匿名内存的 `[at, at + len)` 还给系统（之后读到零）。尽力而为。
+    pub fn remove(at: *mut u8, len: usize) {
+        // SAFETY: 调用方给的是本区一个窗口里的一段，里面没有还要用的东西
+        unsafe { libc::madvise(at.cast(), len, libc::MADV_REMOVE) };
+    }
 }
 
 #[cfg(not(miri))]
@@ -155,6 +169,10 @@ impl Region {
         // SAFETY: 窗口在区内；之后没人再访问
         unsafe { self.window(k).write_bytes(0, WINDOW) };
     }
+
+    pub fn punch(_: &File, _: usize, _: usize) {}
+
+    pub fn remove(_: *mut u8, _: usize) {}
 
     pub fn commit(_: &File, _: usize, _: usize) -> io::Result<()> {
         Ok(())
@@ -486,7 +504,7 @@ impl PublicSpace {
                 return Err(e);
             }
         };
-        let backing = Backing::File { file, path: path.to_path_buf(), owner: true };
+        let backing = Backing::File { file, path: Some(path.to_path_buf()), owner: true };
         self.attach(k, backing, threads, true).inspect_err(|_| {
             let _ = std::fs::remove_file(path);
             abandon();
@@ -523,16 +541,27 @@ impl PublicSpace {
     pub fn open(&self, path: impl AsRef<Path>, threads: NonZeroUsize) -> io::Result<PublicHeap> {
         let path = path.as_ref();
         let file = OpenOptions::new().read(true).write(true).open(path)?;
+        self.open_file(file, Some(path), threads)
+    }
+
+    /// 凭文件描述符打开公开堆（别的进程经 `SCM_RIGHTS` 交来的 [`PublicHeap::fd`]），不需要能访问堆文件的路径。
+    pub fn open_fd(&self, fd: std::os::fd::OwnedFd, threads: NonZeroUsize) -> io::Result<PublicHeap> {
+        self.open_file(File::from(fd), None, threads)
+    }
+
+    fn open_file(&self, file: File, path: Option<&Path>, threads: NonZeroUsize) -> io::Result<PublicHeap> {
         let header = FileHeader::read(&file)?;
         if header.is_dead() {
-            Registry::of(path).bury(path, header.heap, header.incarnation);
+            if let Some(path) = path {
+                Registry::of(path).bury(path, header.heap, header.incarnation);
+            }
             return Err(io::Error::new(io::ErrorKind::NotFound, "这个公开堆已经死了（主人不在了）"));
         }
         let k = header.heap;
         if !self.0.claim(k) {
             return Err(io::Error::new(io::ErrorKind::AddrInUse, "这个公开堆的窗口在本地址区已被占用"));
         }
-        self.attach(k, Backing::File { file, path: path.to_path_buf(), owner: false }, threads, false)
+        self.attach(k, Backing::File { file, path: path.map(Path::to_path_buf), owner: false }, threads, false)
     }
 
     /// 把窗口 `k` 映射上 `backing`，`fresh` 时写新的超级块。失败时还掉窗口。

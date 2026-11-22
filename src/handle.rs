@@ -37,9 +37,11 @@ use crate::heap::{HeapInternal, MutatorInternal};
 #[cfg(target_os = "linux")]
 use crate::heap::{Inner, PublicHeap, PublicHeapInternal, PublicMutator, PublicMutatorInternal};
 use crate::layout::Header;
+#[cfg(target_os = "linux")]
+use crate::layout::{GRANULE, PHeader};
 use crate::mark::TracerInternal;
 #[cfg(target_os = "linux")]
-use crate::shm::Region;
+use crate::shm::{REGION, Region};
 use crate::sync::{PushList, SegVec};
 
 /// 品牌：`'gc` 不变（invariant），`Gc` 逃不出 [`crate::Heap::mutate`] 的闭包。
@@ -1029,6 +1031,219 @@ impl<'a, B: PublicBrand> PublicRef<'a, B> {
 unsafe impl<B: PublicBrand> Shared for PublicRef<'_, B> {
     fn edges(map: &mut EdgeMap, at: u32) {
         map.far(at);
+    }
+}
+
+/// 跨堆弱引用与签名里的那一个字：高位是对象数据的公开偏移（去掉按粒度对齐的低位），低位是对象的出生戳；0 = 空。
+/// 一个字，所以读写都是一次原子操作，不用加锁。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[cfg(target_os = "linux")]
+pub struct WeakWord(u64);
+
+/// 偏移按粒度对齐，低这么多位总是 0
+#[cfg(target_os = "linux")]
+const OFF_SHIFT: u32 = GRANULE.trailing_zeros();
+/// 偏移去掉低位后要的位数（整个公开地址区）
+#[cfg(target_os = "linux")]
+const OFF_BITS: u32 = REGION.trailing_zeros() - OFF_SHIFT;
+/// 留给出生戳的位数（对象头里的戳是 32 位）
+#[cfg(target_os = "linux")]
+const STAMP_BITS: u32 = if u64::BITS - OFF_BITS < u32::BITS { u64::BITS - OFF_BITS } else { u32::BITS };
+/// 出生戳在字里留下的那几位
+#[cfg(target_os = "linux")]
+pub const STAMP_MASK: u32 = u32::MAX >> (u32::BITS - STAMP_BITS);
+
+#[cfg(target_os = "linux")]
+impl From<(u64, u32)> for WeakWord {
+    /// （对象数据的公开偏移, 出生戳）
+    fn from((off, stamp): (u64, u32)) -> Self {
+        Self(((off >> OFF_SHIFT) << STAMP_BITS) | u64::from(stamp & STAMP_MASK))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<u64> for WeakWord {
+    fn from(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<WeakWord> for u64 {
+    fn from(w: WeakWord) -> Self {
+        w.0
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<T> From<PublicGc<'_, T>> for WeakWord {
+    fn from(gc: PublicGc<'_, T>) -> Self {
+        // SAFETY: gc 是公开堆里一个活对象，头在数据前面
+        let stamp = unsafe { (*PHeader::of(gc.as_ptr().cast())).stamp };
+        (gc.offset(), stamp).into()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl WeakWord {
+    /// 对象数据的公开偏移（空的是 0）。
+    pub fn offset(self) -> u64 {
+        (self.0 >> STAMP_BITS) << OFF_SHIFT
+    }
+
+    pub fn stamp(self) -> u32 {
+        u32::try_from(self.0 & u64::from(STAMP_MASK)).expect("戳只占低 32 位以内")
+    }
+
+    /// 指向哪个公开堆（空的、越界的是 None）。
+    pub fn heap(self) -> Option<usize> {
+        (self.0 != 0).then(|| Inner::heap_of(self.offset())).flatten()
+    }
+}
+
+/// 公开堆对象里（或任何地方）指向某个公开堆对象的弱引用：一个字（偏移 + 出生戳），不在目标堆登记、不保活目标、
+/// 回收谁都不看它，所以跨堆、跨进程也不会拖住任何一方的回收。目标被回收后读出来是 None——位置被新对象占了也一样
+/// （出生戳对不上）。读要带目标堆的 mutator（在它的 mutate 里，目标此刻不会被回收）。
+///
+/// 读写都是一次原子操作，不加锁：多个进程同时改，读到的是某一次写进去的值。
+#[repr(transparent)]
+#[cfg(target_os = "linux")]
+pub struct CrossHeapWeak<B: PublicBrand> {
+    word: AtomicU64,
+    _brand: PhantomData<fn() -> B>,
+}
+
+#[cfg(target_os = "linux")]
+impl<B: PublicBrand> Default for CrossHeapWeak<B> {
+    fn default() -> Self {
+        Self { word: AtomicU64::new(0), _brand: PhantomData }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<B: PublicBrand> From<Option<PublicGc<'_, B::Of<'_>>>> for CrossHeapWeak<B> {
+    fn from(v: Option<PublicGc<'_, B::Of<'_>>>) -> Self {
+        Self { word: AtomicU64::new(v.map_or(0, |gc| WeakWord::from(gc).into())), _brand: PhantomData }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<B: PublicBrand> From<PublicGc<'_, B::Of<'_>>> for CrossHeapWeak<B> {
+    fn from(gc: PublicGc<'_, B::Of<'_>>) -> Self {
+        Some(gc).into()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<B: PublicBrand> CrossHeapWeak<B> {
+    /// 改指向（`None` 清空）。不用目标堆的 mutator：偏移和出生戳都从对象本身读。
+    pub fn set(&self, v: Option<PublicGc<'_, B::Of<'_>>>) {
+        self.word.store(v.map_or(0, |gc| WeakWord::from(gc).into()), Ordering::Release);
+    }
+
+    /// 取目标对象；`target` 是它所在那个堆的 mutator。空的、指向别的堆的、目标已经被回收的（位置空着或被新对象占了）、
+    /// 类型对不上的，都是 None。
+    pub fn get<'b>(&self, target: &PublicMutator<'b>) -> Option<PublicGc<'b, B::Of<'b>>> {
+        let data = target.locate(self.word.load(Ordering::Acquire).into())?;
+        // SAFETY: locate 认过：target 堆里此刻一个活对象的数据；在 target 的 mutate 里不会被回收
+        target.is_type::<B::Of<'b>>(data).then(|| unsafe { PublicGc::from_data(data) })
+    }
+
+    /// 指向哪个公开堆（要读得先打开它）；空的是 None。
+    pub fn heap(&self) -> Option<usize> {
+        WeakWord::from(self.word.load(Ordering::Acquire)).heap()
+    }
+
+    /// 里面那个字（发给别处、再用 [`CrossHeapWeak::from_word`] 还原）。
+    pub fn word(&self) -> u64 {
+        self.word.load(Ordering::Acquire)
+    }
+
+    pub fn from_word(word: u64) -> Self {
+        Self { word: AtomicU64::new(word), _brand: PhantomData }
+    }
+}
+
+// SAFETY: 弱引用不是边：回收不跟它
+#[cfg(target_os = "linux")]
+unsafe impl<B: PublicBrand> Shared for CrossHeapWeak<B> {
+    const NO_EDGES: bool = true;
+    fn edges(_: &mut EdgeMap, _: u32) {}
+}
+
+// SAFETY: 对私有堆没有边
+#[cfg(target_os = "linux")]
+unsafe impl<B: PublicBrand> Trace for CrossHeapWeak<B> {
+    const NO_EDGES: bool = true;
+    fn trace(&self, _: &mut Tracer<'_>) {}
+}
+
+/// 一个公开堆对象的签名：可以发给别的进程（经套接字、经 dowin 转发），对方打开同一个堆后凭它找到这个对象。
+/// 内容是弱引用的那个字（偏移 + 出生戳）、目标堆的身份、对象的类型键（类型名、大小、指针图的哈希），32 字节。
+///
+/// 签名不保活对象（同 [`CrossHeapWeak`]）：发出的一方不再引用它，它在下一次回收死，对方再凭签名找就是 None。
+/// 对方不需要知道 Rust 类型也能核对（[`PublicMutator::verify`]）；按类型取用 [`PublicMutator::resolve`]。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg(target_os = "linux")]
+pub struct Signature {
+    word: WeakWord,
+    incarnation: u64,
+    key: [u64; 2],
+}
+
+/// 签名序列化后的字节数
+#[cfg(target_os = "linux")]
+pub const SIGNATURE_BYTES: usize = 32;
+
+#[cfg(target_os = "linux")]
+impl Signature {
+    /// 对象所在的公开堆号（要读得先打开它）。
+    pub fn heap(&self) -> Option<usize> {
+        self.word.heap()
+    }
+
+    /// 对象所在堆的身份（堆号会被重用，身份不会）。
+    pub fn incarnation(&self) -> u64 {
+        self.incarnation
+    }
+
+    /// 对象的类型键。
+    pub fn key(&self) -> [u64; 2] {
+        self.key
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<(WeakWord, u64, [u64; 2])> for Signature {
+    fn from((word, incarnation, key): (WeakWord, u64, [u64; 2])) -> Self {
+        Self { word, incarnation, key }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<&Signature> for WeakWord {
+    fn from(s: &Signature) -> Self {
+        s.word
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<Signature> for [u8; SIGNATURE_BYTES] {
+    fn from(s: Signature) -> Self {
+        let mut out = [0; SIGNATURE_BYTES];
+        for (chunk, v) in out.as_chunks_mut::<{ size_of::<u64>() }>().0.iter_mut().zip([s.word.into(), s.incarnation, s.key[0], s.key[1]]) {
+            chunk.copy_from_slice(&u64::to_le_bytes(v));
+        }
+        out
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<&[u8; SIGNATURE_BYTES]> for Signature {
+    fn from(bytes: &[u8; SIGNATURE_BYTES]) -> Self {
+        let mut words = bytes.as_chunks::<{ size_of::<u64>() }>().0.iter().map(|c| u64::from_le_bytes(*c));
+        let mut next = || words.next().expect("4 段");
+        Self { word: next().into(), incarnation: next(), key: [next(), next()] }
     }
 }
 

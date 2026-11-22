@@ -5,7 +5,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use paragc::{HeapDead, Heap, Public, PublicGc, PublicHeap, PublicRef, PublicSlot, PublicSpace, Root, Shared, Trace, brand, public_brand};
+use paragc::{HeapDead, Heap, Public, PublicGc, PublicHeap, PublicRef, PublicSlot, PublicSpace, CrossHeapWeak, Root, SIGNATURE_BYTES, Shared, Signature, Trace, brand, public_brand};
 
 /// 每个堆的回收线程数（Miri 下减少）
 const THREADS: NonZeroUsize = NonZeroUsize::new(if cfg!(miri) { 2 } else { 4 }).unwrap();
@@ -621,4 +621,136 @@ fn references_to_a_dead_heap_do_not_crash() {
     y.collect();
     assert_eq!(y.stats().live, LINK, "死堆持有的登记被还掉，y 里只剩挂着句柄的那个");
     drop((y_link, z_obj));
+}
+
+/// 放在别的堆里、弱指着一个 Node
+#[repr(C)]
+#[derive(Shared)]
+struct Watcher {
+    target: CrossHeapWeak<NodeB>,
+}
+
+public_brand!(WatcherB = for<'p> Watcher);
+
+#[test]
+fn weak_reference_across_heaps_does_not_keep_target() {
+    let space = PublicSpace::reserve().unwrap();
+    let (a, b) = (space.create_anonymous(THREADS).unwrap(), space.create_anonymous(THREADS).unwrap());
+    let target = b.mutate(|m| m.root::<NodeB>(m.alloc(Node { value: 7, next: None.into() })));
+    let watcher = a.mutate_with(&b, |ma, mb| ma.root::<WatcherB>(ma.alloc(Watcher { target: target.get(mb).into() })));
+    let read = || a.mutate_with(&b, |ma, mb| watcher.get(ma).target.get(mb).map(|n| n.value));
+    assert_eq!(read(), Some(7));
+    b.collect();
+    assert_eq!(read(), Some(7), "目标还有根");
+    drop(target);
+    b.collect();
+    assert_eq!(b.stats().live, 0, "弱引用不保活目标");
+    assert_eq!(read(), None);
+    // 位置被新对象占了也认得出不是原来那个
+    let fresh = list(&b, 1000);
+    assert_eq!(read(), None);
+    assert_eq!(a.mutate(|m| watcher.get(m).target.heap()), Some(b.id()));
+    drop(fresh);
+}
+
+/// 弱引用的字里偏移从第几位开始（64 位地址区 1 TiB、粒度 8 字节时出生戳占低 27 位）
+const OFFSET_SHIFT: u32 = 27;
+/// 伪造扫描覆盖原对象前后各多少字节
+const NEARBY: usize = 4096 * 8;
+
+#[test]
+#[cfg_attr(miri, ignore = "偏移位数按 64 位地址区写的")]
+fn signature_round_trip_and_forgeries() {
+    const LEN: u64 = 2000;
+    let space = PublicSpace::reserve().unwrap();
+    let heap = space.create_anonymous(THREADS).unwrap();
+    let root = list(&heap, LEN);
+    let sig = heap.mutate(|m| m.sign(root.get(m)));
+    let bytes: [u8; SIGNATURE_BYTES] = sig.into();
+    let back = Signature::from(&bytes);
+    assert_eq!(back, sig);
+    assert_eq!(back.heap(), Some(heap.id()));
+    heap.mutate(|m| {
+        assert!(m.verify(&back));
+        assert_eq!(m.resolve::<NodeB>(&back).map(|n| n.value), Some(LEN - 1));
+        assert!(m.resolve::<HolderB>(&back).is_none(), "类型不对");
+    });
+    let forged = |f: &dyn Fn(&mut [u8; SIGNATURE_BYTES])| {
+        let mut b = bytes;
+        f(&mut b);
+        Signature::from(&b)
+    };
+    heap.mutate(|m| {
+        assert!(!m.verify(&forged(&|b| b[0] ^= 1)), "出生戳不对");
+        assert!(!m.verify(&forged(&|b| b[8] ^= 1)), "堆身份不对");
+        assert!(!m.verify(&forged(&|b| b[16] ^= 1)), "类型键不对");
+    });
+    // 把字里的偏移挪到附近每一个粒度上：只有活对象的数据起点能过（同一次 mutate 分配的戳相同），其余不崩、不过
+    let word = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let hits = heap.mutate(|m| {
+        let mut hits = 0;
+        for delta in -4096_i64..4096 {
+            let w = word.wrapping_add_signed(delta << OFFSET_SHIFT);
+            let s = forged(&|b| b[..8].copy_from_slice(&w.to_le_bytes()));
+            hits += usize::from(m.verify(&s));
+        }
+        hits
+    });
+    assert!((1..=NEARBY / NODE + 1).contains(&hits), "原签名能过、只有对象起点能过：{hits}");
+    drop(root);
+    heap.collect();
+    heap.mutate(|m| assert!(!m.verify(&sig), "对象死了以后签名失效"));
+}
+
+#[test]
+fn mailbox_delivers_in_order() {
+    let space = PublicSpace::reserve().unwrap();
+    let heap = space.create_anonymous(THREADS).unwrap();
+    let seen = heap.mail();
+    heap.mutate(|m| {
+        for value in 0..3 {
+            m.post(m.alloc(Node { value, next: None.into() }));
+        }
+    });
+    assert_eq!(heap.mail(), seen + 3);
+    heap.wait_mail(seen, std::time::Duration::ZERO);
+    heap.collect();
+    let got = heap.mutate(|m| {
+        let mail = m.take_mail();
+        let values: Vec<u64> = mail.iter().map(|&i| m.find::<NodeB>(i).expect("信在").get(m).value).collect();
+        for i in mail {
+            assert!(m.release(i));
+        }
+        assert!(m.take_mail().is_empty());
+        values
+    });
+    assert_eq!(got, [0, 1, 2], "回收后信还在，先投的先取");
+    heap.collect();
+    assert_eq!(heap.stats().live, 0);
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "Miri 跑不了文件映射")]
+fn shrink_returns_empty_blocks_and_open_by_fd() {
+    use std::os::unix::fs::MetadataExt;
+    let path = shm_path("shrink");
+    let (sa, sb) = (PublicSpace::reserve().unwrap(), PublicSpace::reserve().unwrap());
+    let a = sa.create(&path, THREADS).unwrap();
+    let b = sb.open_fd(a.fd().unwrap().try_clone_to_owned().unwrap(), THREADS).unwrap();
+    let kept = list(&a, 100);
+    drop(list(&a, 400_000));
+    let full = std::fs::metadata(&path).unwrap().blocks();
+    a.collect();
+    let collected = std::fs::metadata(&path).unwrap().blocks();
+    b.shrink();
+    let shrunk = std::fs::metadata(&path).unwrap().blocks();
+    assert!(collected <= full);
+    assert!(shrunk * 4 < full, "收缩把空块还掉（{full} ⇒ {collected} ⇒ {shrunk} 个 512 字节）");
+    let sig = a.mutate(|m| m.sign(kept.get(m)));
+    assert_eq!(b.mutate(|m| m.resolve::<NodeB>(&sig).map(|n| n.value)), Some(99), "凭 fd 打开的映射认得签名");
+    assert_eq!(sum(&a, &kept), triangle(100));
+    let again = list(&a, 400_000);
+    assert_eq!(sum(&a, &again), triangle(400_000), "还掉的块再用");
+    drop((kept, again, b, a));
+    assert!(!path.exists());
 }
