@@ -151,3 +151,22 @@ fn concurrent_marking_keeps_moved_handles() {
     heap.collect();
     assert_eq!(drops.load(Ordering::Relaxed), 1);
 }
+
+/// An id kept as a plain word turns back into the same handle
+#[test]
+fn ids_turn_back_into_handles() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut heap = Heap::new(THREADS);
+    let (keep, id): (Root<KeepB>, usize) = heap.mutate(|m| {
+        let h = m.alloc_handle(Item { value: 9, tag: Counted(drops.clone()) });
+        (m.root(m.alloc(Keep { items: vec![h] })), h.id())
+    });
+    heap.collect();
+    heap.collect();
+    heap.mutate(|m| {
+        // SAFETY: the id came from a handle that the rooted Keep still holds
+        let h: Handle<'_, Item> = unsafe { Handle::from_id(id) };
+        assert!(h == m.get(&keep).items[0]);
+        assert_eq!(h.value, 9);
+    });
+}

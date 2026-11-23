@@ -43,6 +43,8 @@ heap.mutate(|m| {
 - Reading through a handle costs one dependent load more than a `Gc` (entry, then object). Objects do not move within
   a `mutate`, so resolve once with `Handle::get` and keep the `Gc` for the rest of it.
 - Writing a handle needs no mutator and no barrier: plain fields and `HandleSlot::set`.
+- An id can be stored as a plain word (a NaN-boxed value, a constant in generated code) and turned back with the
+  unsafe `Handle::from_id`, as long as something traced still holds the handle.
 
 How the collector keeps this sound without a barrier:
 

@@ -27,10 +27,11 @@ open an issue or use the edit link at the top of the page.
 
 ## Versions
 
-This edition describes paragc **0.6.2**:
+This edition describes paragc **0.6.3**:
 
 - 0.6.0 added cross-heap weak references, signatures, the mailbox, shrinking and promotion;
 - 0.6.1 added tail allocation;
-- 0.6.2 added handles.
+- 0.6.2 added handles;
+- 0.6.3 added `Handle::from_id`.
 
 The crate is on [crates.io](https://crates.io/crates/paragc) and its API reference is on [docs.rs](https://docs.rs/paragc).

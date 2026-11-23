@@ -26,10 +26,11 @@ paragc 是一个追踪式垃圾回收器，堆采用 Immix 式的标记-区域�
 
 ## 版本
 
-本版对应 paragc **0.6.2**：
+本版对应 paragc **0.6.3**：
 
 - 0.6.0 加了跨堆弱引用、签名、信箱、收缩与晋升；
 - 0.6.1 加了带尾巴的分配；
-- 0.6.2 加了 handle。
+- 0.6.2 加了 handle；
+- 0.6.3 加了 `Handle::from_id`。
 
 crate 在 [crates.io](https://crates.io/crates/paragc)，API 文档在 [docs.rs](https://docs.rs/paragc)。
