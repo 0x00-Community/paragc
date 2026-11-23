@@ -1,0 +1,22 @@
+[book]
+title = "paragc：Rust 的并行垃圾回收器"
+description = "paragc 的完整讲解：Immix 式私有堆、并发与年轻回收、引用计数、堆之间的引用、跨进程共享的跨堆"
+authors = ["0x00 Community"]
+language = "zh-CN"
+src = "src"
+
+[build]
+# 中文版输出到站点的 /zh-CN/（英文版在根，先编英文：它会清空 ../book）
+build-dir = "../book/zh-CN"
+
+[output.html]
+git-repository-url = "https://github.com/0x00-Community/paragc"
+edit-url-template = "https://github.com/0x00-Community/paragc/edit/main/mdbook/zh-CN/src/{path}"
+site-url = "/zh-CN/"
+default-theme = "light"
+preferred-dark-theme = "navy"
+additional-js = ["lang.js"]
+
+[output.html.fold]
+enable = true
+level = 1

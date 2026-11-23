@@ -15,7 +15,7 @@
 [![Mark](https://img.shields.io/badge/mark-parallel%20%C2%B7%20work%20stealing-262D3A?style=flat-square)](#-怎么做的)
 [![std](https://img.shields.io/badge/std-required-283272?style=flat-square)](#-规则)
 
-[🇺🇸 English](README.md) · **🇨🇳 简体中文**
+[🇺🇸 English](README.md) · **🇨🇳 简体中文** · [📖 paragc 之书](https://paragc.app238.com/zh-CN/)
 
 </div>
 
