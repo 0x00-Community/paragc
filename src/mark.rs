@@ -30,8 +30,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_utils::{Backoff, CachePadded};
 
-use crate::{Gc, Slot, WordSlot};
-use crate::handle::{GcInternal, RawSlot, RootTable, SlotInternal, WordSlotInternal};
+use crate::{Gc, Handle, HandleSlot, Slot, WordSlot};
+use crate::handle::{GcInternal, HandleInternal, RawSlot, RootTable, SlotInternal, WordSlotInternal};
 #[cfg(crossheap)]
 use crate::handle::{EDGE_KINDS, FAR_EDGE, PTR_EDGE, WORD_EDGE, word_pointer};
 #[cfg(crossheap)]
@@ -248,6 +248,9 @@ pub trait TracerInternal<'t> {
     /// A type-erased slot, rewritable (evacuating collections)
     fn raw_mut(&mut self, raw: &RawSlot, no_edges: bool);
 
+    /// A handle's target: marked (moving if needed; the entry is rewritten after marking), never counted.
+    fn handle(&mut self, header: *const Header, no_edges: bool);
+
     /// Mark an object, moving it if it is in an evacuation candidate block; return its current header.
     fn forward(&mut self, header: *const Header, no_edges: bool) -> *const Header;
 
@@ -373,6 +376,12 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
         }
     }
 
+    fn handle(&mut self, header: *const Header, no_edges: bool) {
+        if self.decs.is_none() {
+            self.forward(header, no_edges);
+        }
+    }
+
     fn forward(&mut self, header: *const Header, no_edges: bool) -> *const Header {
         #[cfg(crossheap)]
         {
@@ -477,6 +486,30 @@ unsafe impl Trace for WordSlot<'_> {
 
     fn relocate(&mut self, t: &mut Tracer<'_>) {
         t.raw_mut(self.raw(), false);
+    }
+}
+
+// SAFETY: the handle's target is an edge; the handle itself never changes
+unsafe impl<T: Trace> Trace for Handle<'_, T> {
+    fn trace(&self, t: &mut Tracer<'_>) {
+        t.handle(HandleInternal::header(*self), T::NO_EDGES);
+    }
+
+    fn relocate(&mut self, t: &mut Tracer<'_>) {
+        self.trace(t);
+    }
+}
+
+// SAFETY: the handle in the slot (if any) is an edge
+unsafe impl<T: Trace> Trace for HandleSlot<'_, T> {
+    fn trace(&self, t: &mut Tracer<'_>) {
+        if let Some(h) = self.get() {
+            h.trace(t);
+        }
+    }
+
+    fn relocate(&mut self, t: &mut Tracer<'_>) {
+        self.trace(t);
     }
 }
 
@@ -666,6 +699,8 @@ pub struct Marking<'g> {
     group: Option<&'g Injector<(usize, usize)>>,
     /// Young evacuation ([`crate::YoungEvacuation::Full`]): worker 0 rewrites these remembered slots to the moved addresses
     slots: &'g [usize],
+    /// Young evacuation: worker 0 moves the objects of these handle entries like roots (the entries themselves are rewritten after marking)
+    handles: Option<&'g RootTable>,
     /// Shareable young objects are promoted into this cross-heap
     #[cfg(crossheap)]
     promote: Option<&'g Inner>,
@@ -688,6 +723,7 @@ impl<'g> Marking<'g> {
             log: None,
             group: None,
             slots: &[],
+            handles: None,
             #[cfg(crossheap)]
             promote: None,
             #[cfg(crossheap)]
@@ -712,6 +748,12 @@ impl<'g> Marking<'g> {
     /// Young evacuation: worker 0 rewrites these remembered slots (addresses) to the moved addresses (greying the targets at the same time).
     pub fn relocating_slots(mut self, slots: &'g [usize]) -> Self {
         self.slots = slots;
+        self
+    }
+
+    /// Young evacuation: every entry of the handle table acts as a root and its object may move.
+    pub fn relocating_handles(mut self, handles: &'g RootTable) -> Self {
+        self.handles = Some(handles);
         self
     }
 
@@ -791,6 +833,11 @@ impl<'g> Marking<'g> {
             && let Some(roots) = self.roots
         {
             roots.relocate(|h| t.forward(h, false));
+            if let Some(handles) = self.handles {
+                for entry in handles.entries() {
+                    t.forward(entry, false);
+                }
+            }
             for &slot in self.slots {
                 // SAFETY: the slot lives in the old object written to and is not freed before this collection (see Mutator::written); no mutator writes it during the pause
                 let slot = unsafe { &*core::ptr::with_exposed_provenance::<RawSlot>(slot) };

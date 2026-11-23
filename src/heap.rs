@@ -36,7 +36,8 @@ use crossbeam_deque::{Injector, Steal};
 use crossbeam_utils::{Backoff, CachePadded};
 
 use crate::{Gc, Trace};
-use crate::handle::{GcInternal, Invariant, RawSlot, RootTable};
+use crate::Handle;
+use crate::handle::{GcInternal, HandleInternal, Invariant, NO_HOLDER, RawSlot, RootTable};
 #[cfg(crossheap)]
 use crate::handle::{EdgeMap, CrossHeapRoot, CrossHeapBrand, CrossHeapGc, CrossHeapGcInternal, CrossHeapRootInternal, STAMP_MASK, Shared, Signature, WeakWord};
 use crate::layout::{BLOCK, Block, Pages, WARM_CYCLES, YOUNG_COPY_DEN, YOUNG_COPY_NUM, LINE, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, HEADER, Header, LARGE, MAX_EPOCH, MIN_SPARE_BLOCKS, MIN_TRIGGER, OVERFLOW_TRIES, FRAG_NUM, FRAG_DEN, YOUNG_PER_FULL, YOUNG_PER_FULL_RC};
@@ -107,6 +108,10 @@ pub struct Heap {
     roots: Arc<RootTable>,
     /// Weak table: slots of [`crate::Weak`] (not roots; every collection clears the unmarked ones after marking)
     weaks: Arc<RootTable>,
+    /// Handle table: one entry per object allocated with [`Mutator::alloc_handle`], holding its current header. [`crate::Handle`]s point at the entry, so moving the object
+    /// rewrites only the entry. Entries are roots in young collections and in the snapshot of concurrent marking; full and group collections trace them through the handles held by objects,
+    /// and entries whose object died are cleared and reused
+    handles: RootTable,
     /// Bytes newly taken since the last collection (counted by blocks / large objects)
     allocated: AtomicUsize,
     /// Blocks taken in each of the last [`WARM_CYCLES`] rounds (caps the warm pool of [`Pages`])
@@ -208,6 +213,7 @@ impl Heap {
             pages: Pages::default(),
             roots: Arc::default(),
             weaks: Arc::default(),
+            handles: RootTable::default(),
             allocated: AtomicUsize::new(0),
             recent: [0; WARM_CYCLES],
             young_allocated: 0,
@@ -335,6 +341,9 @@ impl Heap {
         // SAFETY: the request is set and nobody is inside mutate ⇒ no mutators (dropping root handles is unaffected)
         let roots = unsafe { self.roots.settle() };
         Marking::seed(&self.grey, &roots, epoch);
+        // Handles are copied around as plain values with no barrier, so the snapshot cannot tell which entries lose their last holder meanwhile: every entry is a root this round
+        // SAFETY: as above
+        Marking::seed(&self.grey, &unsafe { self.handles.settle() }, epoch);
         self.gate.fetch_and(!REQUEST, Ordering::AcqRel);
         let pool = self.pool();
         Marking::new(pool.threads(), epoch, &self.grey).counting(Some(parity)).logging(&self.rc_log).run(pool);
@@ -594,6 +603,9 @@ impl Heap {
         if mode == YoungEvacuation::Off {
             // SAFETY: &mut self ⇒ no mutators
             Marking::seed(&self.grey, &unsafe { self.roots.settle() }, epoch);
+            // Old objects store handles with no barrier, so no remembered slot records an old object holding a young object's handle: every entry is a root of a young collection
+            // SAFETY: as above
+            Marking::seed(&self.grey, &unsafe { self.handles.settle() }, epoch);
             Marking::seed_slots(&self.grey, &remembered, epoch);
             mark.run(pool);
         } else {
@@ -615,7 +627,7 @@ impl Heap {
                 Marking::seed_slots(&self.grey, &remembered, epoch);
                 &[]
             };
-            let mark = mark.evacuating(&self.roots, &self.available, &self.blocks, &self.pages, &moved, epoch).relocating_slots(slots);
+            let mark = mark.evacuating(&self.roots, &self.available, &self.blocks, &self.pages, &moved, epoch).relocating_slots(slots).relocating_handles(&self.handles);
             #[cfg(crossheap)]
             let mark = mark.promoting(cross.as_deref());
             mark.run(pool);
@@ -657,6 +669,8 @@ impl Heap {
         }
         // SAFETY: no mutators; marking (including young evacuation) is done and sweeping has not started
         unsafe { self.weaks.clear_unreached(epoch, parity) };
+        // SAFETY: as above
+        unsafe { self.handles.reap(epoch, parity) };
         // Sweep only blocks taken for allocation since the last collection (young objects can only be there); untouched old blocks go back as they are
         let (young, old): (Vec<Block>, Vec<Block>) = self.blocks.take().into_iter().partition(|b| b.live_since_sweep().is_none());
         self.blocks.extend(old);
@@ -781,6 +795,8 @@ impl Heap {
         }
         // SAFETY: no mutators; marking (including evacuation) is done and sweeping has not started
         unsafe { self.weaks.clear_unreached(epoch, *self.rc_parity.get_mut()) };
+        // SAFETY: as above
+        unsafe { self.handles.reap(epoch, *self.rc_parity.get_mut()) };
         #[cfg(crossheap)]
         self.collect_cross(&crossing);
         self.end_full(epoch, (evacuate, moved.into_inner()));
@@ -878,6 +894,8 @@ impl Heap {
             unsafe { h.roots.clear_dead(inside, epoch) };
             // SAFETY: as above
             unsafe { h.weaks.clear_unreached(epoch, *h.rc_parity.get_mut()) };
+            // SAFETY: as above
+            unsafe { h.handles.reap(epoch, *h.rc_parity.get_mut()) };
             h.end_full(epoch, (0, 0));
         }
         for h in heaps.iter() {
@@ -892,6 +910,8 @@ pub trait HeapInternal {
 
     fn weaks(&self) -> &Arc<RootTable>;
 
+    fn handles(&self) -> &RootTable;
+
     /// The heap's identity: the address of its root table (the heap itself may move); never [`crate::handle::NO_HOLDER`].
     fn id(&self) -> usize;
 }
@@ -903,6 +923,10 @@ impl HeapInternal for Heap {
 
     fn weaks(&self) -> &Arc<RootTable> {
         &self.weaks
+    }
+
+    fn handles(&self) -> &RootTable {
+        &self.handles
     }
 
     fn id(&self) -> usize {
@@ -1134,6 +1158,17 @@ impl<'gc> Mutator<'gc> {
     /// Allocate an object.
     pub fn alloc<T: Trace + 'gc>(&self, value: T) -> Gc<'gc, T> {
         self.alloc_with(value, Header::new::<T>, 0, |_| {})
+    }
+
+    /// Allocate an object with a stable identity: the [`Handle`] points at an entry of the heap's handle table, not at the object, so it stays the same when the object moves
+    /// and can be compared, hashed and embedded in generated code by its [`Handle::id`]. Reading through it costs one extra load. The object stays alive while any object (or root) holding
+    /// the handle is alive, and dies with them; its entry is then reused. Old objects that hold handles keep their targets until the next full collection.
+    pub fn alloc_handle<T: Trace + 'gc>(&self, value: T) -> Handle<'gc, T> {
+        let gc = self.alloc(value);
+        let table = self.heap.handles();
+        let entry = table.slot(table.claim(gc.header(), NO_HOLDER));
+        // SAFETY: the entry lives in the heap's handle table (a segmented vector, never moved) and now holds this object
+        unsafe { Handle::from_entry(entry) }
     }
 
     /// Allocate an object followed by `tail` bytes of plain data (no pointers: the collector never looks inside, and copies them with the object when it moves or is promoted).
