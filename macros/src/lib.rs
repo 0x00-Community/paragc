@@ -1,7 +1,7 @@
 //! `#[derive(Trace)]`: traces (`trace`) and relocates (`relocate`, rewriting edges during evacuating collections) field by field; `NO_EDGES` is the AND over all fields.
 //!
 //! By default it also checks that the type does not implement `Drop` (finalization order is unspecified, so `Drop` could touch an already finalized object);
-//! when you really need one, write `#[trace(unsafe_drop)]` and guarantee that `Drop` touches no `Gc`.
+//! when you really need one, write `#[trace(unsafe_drop)]` and guarantee that `Drop` touches no `ScopeLocal`.
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as Tokens};
 use quote::{format_ident, quote};

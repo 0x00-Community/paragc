@@ -29,7 +29,7 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::heap::{Backing, Inner, CrossHeap};
+use crate::heap::{Backing, CrossHeap, CrossHeapInternal, Inner};
 use crate::layout::{MAGIC, Super};
 
 /// Size of one window (all the addresses of one public heap)
@@ -520,7 +520,7 @@ impl CrossHeapSpace {
         Ok(Self(Arc::new(Space { region: Region::reserve()?, fixed: false, used: AtomicU64::new(0) })))
     }
 
-    /// Reserve the public region at the fixed address ([`FIXED_BASE`], the same in every process): objects may store absolute addresses ([`crate::Gc`], [`crate::GcSlot`],
+    /// Reserve the public region at the fixed address ([`FIXED_BASE`], the same in every process): objects may store absolute addresses ([`crate::ScopeLocal`], [`crate::Slot`],
     /// [`crate::WordSlot`]) and other processes read them correctly. A private heap that promotes young objects into a public heap ([`crate::Heap::attach_cross_heap`]) needs such a region;
     /// a process can have only one. Fails if the address is taken.
     pub fn reserve_fixed() -> io::Result<Self> {
@@ -533,9 +533,12 @@ impl CrossHeapSpace {
     /// Heap numbers are unique across processes within a directory: they are claimed under the lock of a `.paragc-<number>` marker file (reclaimed when the heap it names is dead).
     /// This process owns the heap: when this handle (and every [`crate::CrossHeapGlobal`] made from it) is dropped, or this process exits / is killed, the heap dies,
     /// unless [`CrossHeap::persist`] was called.
-    pub fn create(&self, path: impl AsRef<Path>, threads: NonZeroUsize) -> io::Result<CrossHeap> {
+    pub fn create<R>(&self, path: impl AsRef<Path>, threads: NonZeroUsize, f: impl for<'xheap> FnOnce(CrossHeap<'xheap>) -> R) -> io::Result<R> {
+        self.create_heap(path.as_ref(), threads).map(|h| f(CrossHeap::rebrand(h)))
+    }
+
+    fn create_heap(&self, path: &Path, threads: NonZeroUsize) -> io::Result<CrossHeap<'static>> {
         use std::os::unix::fs::OpenOptionsExt;
-        let path = path.as_ref();
         let k = self.claim_number(path)?;
         let abandon = || {
             if let Some(name) = path.file_name() {
@@ -578,24 +581,36 @@ impl CrossHeapSpace {
     }
 
     /// A public heap without a file (used only within this process; for tests and Miri).
-    pub fn create_anonymous(&self, threads: NonZeroUsize) -> io::Result<CrossHeap> {
+    pub fn create_anonymous<R>(&self, threads: NonZeroUsize, f: impl for<'xheap> FnOnce(CrossHeap<'xheap>) -> R) -> io::Result<R> {
+        self.create_anonymous_heap(threads).map(|h| f(CrossHeap::rebrand(h)))
+    }
+
+    fn create_anonymous_heap(&self, threads: NonZeroUsize) -> io::Result<CrossHeap<'static>> {
         let k = self.0.claim_any().ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "out of windows in the public region"))?;
         self.attach(k, Backing::Anonymous, threads, true)
     }
 
     /// Open a public heap created by someone else (or by another region of this process), mapped at the window of its heap number.
-    pub fn open(&self, path: impl AsRef<Path>, threads: NonZeroUsize) -> io::Result<CrossHeap> {
+    pub fn open<R>(&self, path: impl AsRef<Path>, threads: NonZeroUsize, f: impl for<'xheap> FnOnce(CrossHeap<'xheap>) -> R) -> io::Result<R> {
+        self.open_heap(path.as_ref(), threads).map(|h| f(CrossHeap::rebrand(h)))
+    }
+
+    fn open_heap(&self, path: &Path, threads: NonZeroUsize) -> io::Result<CrossHeap<'static>> {
         let path = path.as_ref();
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         self.open_file(file, Some(path), threads)
     }
 
     /// Open a public heap from a file descriptor (a [`CrossHeap::fd`] passed by another process through `SCM_RIGHTS`), without access to the heap file's path.
-    pub fn open_fd(&self, fd: std::os::fd::OwnedFd, threads: NonZeroUsize) -> io::Result<CrossHeap> {
+    pub fn open_fd<R>(&self, fd: std::os::fd::OwnedFd, threads: NonZeroUsize, f: impl for<'xheap> FnOnce(CrossHeap<'xheap>) -> R) -> io::Result<R> {
+        self.open_fd_heap(fd, threads).map(|h| f(CrossHeap::rebrand(h)))
+    }
+
+    fn open_fd_heap(&self, fd: std::os::fd::OwnedFd, threads: NonZeroUsize) -> io::Result<CrossHeap<'static>> {
         self.open_file(File::from(fd), None, threads)
     }
 
-    fn open_file(&self, file: File, path: Option<&Path>, threads: NonZeroUsize) -> io::Result<CrossHeap> {
+    fn open_file(&self, file: File, path: Option<&Path>, threads: NonZeroUsize) -> io::Result<CrossHeap<'static>> {
         let header = FileHeader::read(&file)?;
         if header.is_dead() {
             if let Some(path) = path {
@@ -611,7 +626,7 @@ impl CrossHeapSpace {
     }
 
     /// Map `backing` at window `k`, writing a new superblock when `fresh`. Gives the window back on failure.
-    fn attach(&self, k: usize, backing: Backing, threads: NonZeroUsize, fresh: bool) -> io::Result<CrossHeap> {
+    fn attach(&self, k: usize, backing: Backing, threads: NonZeroUsize, fresh: bool) -> io::Result<CrossHeap<'static>> {
         // SAFETY: window k was just taken and is unused
         let mapped = unsafe {
             match &backing {

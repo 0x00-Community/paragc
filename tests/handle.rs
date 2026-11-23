@@ -9,7 +9,7 @@ use paragc::{Handle, HandleSlot, Heap, Global, Trace, Tracer, YoungEvacuation, b
 /// Collector threads per heap; 2 under Miri
 const THREADS: NonZeroUsize = NonZeroUsize::new(if cfg!(miri) { 2 } else { 4 }).unwrap();
 
-/// Counts on drop (no Gc, so it may have Drop).
+/// Counts on drop (no ScopeLocal, so it may have Drop).
 struct Counted(Arc<AtomicUsize>);
 
 impl Drop for Counted {
@@ -18,7 +18,7 @@ impl Drop for Counted {
     }
 }
 
-// SAFETY: no Gc
+// SAFETY: no ScopeLocal
 unsafe impl Trace for Counted {
     const NO_EDGES: bool = true;
     fn trace(&self, _: &mut Tracer<'_>) {}

@@ -3,12 +3,12 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use paragc::{Far, Gc, Heap, Global, GcSlot, Trace, Tracer, Weak, YoungEvacuation, brand};
+use paragc::{Far, ScopeLocal, Heap, Global, Slot, Trace, Tracer, Weak, YoungEvacuation, brand};
 
 /// Collector threads per heap; 2 under Miri
 const THREADS: NonZeroUsize = NonZeroUsize::new(if cfg!(miri) { 2 } else { 4 }).unwrap();
 
-/// Counts on drop (no Gc, so it may have Drop).
+/// Counts on drop (no ScopeLocal, so it may have Drop).
 struct Counted(Arc<AtomicUsize>);
 
 impl Drop for Counted {
@@ -17,7 +17,7 @@ impl Drop for Counted {
     }
 }
 
-// SAFETY: no Gc
+// SAFETY: no ScopeLocal
 unsafe impl Trace for Counted {
     const NO_EDGES: bool = true;
     fn trace(&self, _: &mut Tracer<'_>) {}
@@ -34,7 +34,7 @@ brand!(ItemB = for<'scope> Item);
 /// Strong references to a run of objects (inside one object)
 #[derive(Trace)]
 struct Keep<'scope> {
-    items: Vec<Gc<'scope, Item>>,
+    items: Vec<ScopeLocal<'scope, Item>>,
 }
 
 brand!(KeepB = for<'scope> Keep<'scope>);
@@ -42,7 +42,7 @@ brand!(KeepB = for<'scope> Keep<'scope>);
 /// A mutable strong reference, plus a weak reference stored in a heap object
 #[derive(Trace)]
 struct Holder<'scope> {
-    item: GcSlot<'scope, Item>,
+    item: Slot<'scope, Item>,
     weak: Vec<Weak<'static, ItemB>>,
 }
 
@@ -179,7 +179,7 @@ fn upgrade_during_concurrent_marking_keeps_target() {
     let drops = Arc::new(AtomicUsize::new(0));
     let mut heap = Heap::new_static(THREADS);
     let (keep, weak) = items(&heap, &drops, 2, |_| true);
-    let holder: Global<'_, HolderB> = heap.scope(|m| m.global(m.alloc(Holder { item: GcSlot::default(), weak: Vec::new() })));
+    let holder: Global<'_, HolderB> = heap.scope(|m| m.global(m.alloc(Holder { item: Slot::default(), weak: Vec::new() })));
     heap.collect();
     drop(keep);
     assert!(heap.mark_concurrently());
@@ -210,7 +210,7 @@ fn weak_inside_heap_objects() {
     for _ in 0..ROUNDS {
         let holder: Global<'_, HolderB> = heap.scope(|m| {
             let weak = m.get(&keep).items.iter().map(|&x| m.weak::<ItemB>(x)).collect();
-            m.global(m.alloc(Holder { item: GcSlot::default(), weak }))
+            m.global(m.alloc(Holder { item: Slot::default(), weak }))
         });
         heap.collect();
         let sum: u64 = heap.scope(|m| m.get(&holder).weak.iter().map(|w| m.upgrade(w).expect("attached").value).sum());
@@ -260,7 +260,7 @@ fn weak_churn_while_marking_concurrently() {
     const ROUNDS: usize = if cfg!(miri) { 2 } else { 8 };
     let drops = Arc::new(AtomicUsize::new(0));
     let mut heap = Heap::new_static(THREADS);
-    let holders: Vec<Global<'_, HolderB>> = heap.scope(|m| (0..THREADS_M).map(|_| m.global(m.alloc(Holder { item: GcSlot::default(), weak: Vec::new() }))).collect());
+    let holders: Vec<Global<'_, HolderB>> = heap.scope(|m| (0..THREADS_M).map(|_| m.global(m.alloc(Holder { item: Slot::default(), weak: Vec::new() }))).collect());
     let mut weak: Vec<Vec<(u64, Weak<'_, ItemB>)>> = (0..THREADS_M).map(|_| Vec::new()).collect();
     let mut made = 0usize;
     for round in 0..ROUNDS {

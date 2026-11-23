@@ -30,8 +30,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_utils::{Backoff, CachePadded};
 
-use crate::{Gc, Handle, HandleSlot, GcSlot, WordSlot};
-use crate::handle::{GcInternal, HandleInternal, RawSlot, RootTable, GcSlotInternal, WordSlotInternal};
+use crate::{ScopeLocal, Handle, HandleSlot, Slot, WordSlot};
+use crate::handle::{ScopeLocalInternal, HandleInternal, RawSlot, RootTable, SlotInternal, WordSlotInternal};
 #[cfg(crossheap)]
 use crate::handle::{EDGE_KINDS, FAR_EDGE, PTR_EDGE, WORD_EDGE, word_pointer};
 #[cfg(crossheap)]
@@ -49,14 +49,14 @@ use crate::sync::{Pool, SegVec};
 /// A type that can live in the heap. Generate it with `#[derive(Trace)]`; do not write it by hand.
 ///
 /// - `Send + Sync`: objects may be read on any thread and traced and finalized by collector threads
-/// - types with `Gc` fields must not implement `Drop` (finalization order is unspecified, so `Drop` could touch an already finalized object); the derive checks this
+/// - types with `ScopeLocal` fields must not implement `Drop` (finalization order is unspecified, so `Drop` could touch an already finalized object); the derive checks this
 ///
 /// # Safety
-/// `trace` must call [`Tracer::edge`] once for every directly held `Gc` / `GcSlot` (or call `trace` on the field); a missed one is a dangling pointer;
+/// `trace` must call [`Tracer::edge`] once for every directly held `ScopeLocal` / `Slot` (or call `trace` on the field); a missed one is a dangling pointer;
 /// `relocate` likewise calls [`Tracer::relocate`] once per edge (or `relocate` on the field), and the collector rewrites moved objects to their new address.
-/// `NO_EDGES` may be true only when the type really holds no `Gc`.
+/// `NO_EDGES` may be true only when the type really holds no `ScopeLocal`.
 pub unsafe trait Trace: Send + Sync {
-    /// The type holds no `Gc`: the collector need not trace it after marking
+    /// The type holds no `ScopeLocal`: the collector need not trace it after marking
     const NO_EDGES: bool = false;
 
     fn trace(&self, t: &mut Tracer<'_>);
@@ -64,7 +64,7 @@ pub unsafe trait Trace: Send + Sync {
     /// Replaces `trace` during evacuating collections (heap held exclusively, no mutators): may rewrite edges. Types without edges use the default.
     fn relocate(&mut self, t: &mut Tracer<'_>) {
         let _ = t;
-        assert!(Self::NO_EDGES, "types holding Gc must implement Trace::relocate (use #[derive(Trace)])");
+        assert!(Self::NO_EDGES, "types holding ScopeLocal must implement Trace::relocate (use #[derive(Trace)])");
     }
 }
 
@@ -125,7 +125,7 @@ impl Tracer<'_> {
     }
 
     /// An edge (read only: concurrent marking, non-evacuating collections).
-    pub fn edge<T: Trace>(&mut self, gc: Gc<'_, T>) {
+    pub fn edge<T: Trace>(&mut self, gc: ScopeLocal<'_, '_, T>) {
         if let Some(decs) = self.decs.as_deref_mut() {
             #[cfg(crossheap)]
             if Region::holds_fixed(gc.as_ptr().addr()) {
@@ -139,17 +139,17 @@ impl Tracer<'_> {
     }
 
     /// A rewritable edge (evacuating collections): rewritten to the new address if the object moved.
-    pub fn relocate<T: Trace>(&mut self, gc: &mut Gc<'_, T>) {
+    pub fn relocate<T: Trace>(&mut self, gc: &mut ScopeLocal<'_, '_, T>) {
         *gc = self.forward_gc(*gc);
         self.inc(gc.header());
     }
 
     /// Mark (moving if needed) and return the object's current location; no counting.
-    fn forward_gc<'scope, T: Trace>(&mut self, gc: Gc<'scope, T>) -> Gc<'scope, T> {
+    fn forward_gc<'heap, 'scope, T: Trace>(&mut self, gc: ScopeLocal<'heap, 'scope, T>) -> ScopeLocal<'heap, 'scope, T> {
         let old = gc.header();
         let new = self.forward(old, T::NO_EDGES);
         // SAFETY: new is the same object (or its moved header), with the same brand and type
-        if core::ptr::eq(old, new) { gc } else { unsafe { Gc::from_data(Header::data(new).cast()) } }
+        if core::ptr::eq(old, new) { gc } else { unsafe { ScopeLocal::from_data(Header::data(new).cast()) } }
     }
 
     /// The collector is asking whether the type is shareable (types from [`Header::new_shared`] answer, others do not).
@@ -237,12 +237,12 @@ pub trait TracerInternal<'t> {
     fn relocating(&self) -> bool;
 
     /// A slot (read only): normally just an edge; in counting mode it switches to counting the current value and increments it; in release mode it hands over the last counted value for a decrement.
-    fn slot<T: Trace>(&mut self, slot: &GcSlot<'_, T>);
+    fn slot<T: Trace>(&mut self, slot: &Slot<'_, '_, T>);
 
     /// A rewritable slot (evacuating collections): rewritten to the new address if moved; in counting mode counts the new value and increments it.
-    fn slot_mut<T: Trace>(&mut self, slot: &mut GcSlot<'_, T>);
+    fn slot_mut<T: Trace>(&mut self, slot: &mut Slot<'_, '_, T>);
 
-    /// A type-erased slot ([`GcSlot`], [`crate::WordSlot`]), read only; `no_edges`: the target has no edges
+    /// A type-erased slot ([`Slot`], [`crate::WordSlot`]), read only; `no_edges`: the target has no edges
     fn raw(&mut self, raw: &RawSlot, no_edges: bool);
 
     /// A type-erased slot, rewritable (evacuating collections)
@@ -317,11 +317,11 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
         self.copier.is_some()
     }
 
-    fn slot<T: Trace>(&mut self, slot: &GcSlot<'_, T>) {
+    fn slot<T: Trace>(&mut self, slot: &Slot<'_, '_, T>) {
         self.raw(slot.raw_slot(), T::NO_EDGES);
     }
 
-    fn slot_mut<T: Trace>(&mut self, slot: &mut GcSlot<'_, T>) {
+    fn slot_mut<T: Trace>(&mut self, slot: &mut Slot<'_, '_, T>) {
         self.raw_mut(slot.raw_slot(), T::NO_EDGES);
     }
 
@@ -393,7 +393,7 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
             }
             assert!(!self.in_shared, "a shareable object points at a private object that cannot be promoted (a non-shareable type, an old object, or one pointed to directly from another heap)");
         }
-        // SAFETY: header comes from this heap's Gc / roots, the object is alive
+        // SAFETY: header comes from this heap's ScopeLocal / roots, the object is alive
         let h = unsafe { &*header };
         // Objects already marked in place this round are not moved (young objects pointed to directly from old objects or from another heap are marked in place first during young evacuation)
         if let Some(copier) = self.copier.as_deref_mut()
@@ -424,7 +424,7 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
         if self.crossed(header) {
             return;
         }
-        // SAFETY: header comes from this heap's Gc / roots, the object is alive
+        // SAFETY: header comes from this heap's ScopeLocal / roots, the object is alive
         let h = unsafe { &*header };
         if !h.mark(self.epoch) {
             return;
@@ -456,8 +456,8 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
 }
 
 
-// SAFETY: a Gc is itself an edge
-unsafe impl<T: Trace> Trace for Gc<'_, T> {
+// SAFETY: a ScopeLocal is itself an edge
+unsafe impl<T: Trace> Trace for ScopeLocal<'_, '_, T> {
     fn trace(&self, t: &mut Tracer<'_>) {
         t.edge(*self);
     }
@@ -468,7 +468,7 @@ unsafe impl<T: Trace> Trace for Gc<'_, T> {
 }
 
 // SAFETY: the value in the slot is an edge
-unsafe impl<T: Trace> Trace for GcSlot<'_, T> {
+unsafe impl<T: Trace> Trace for Slot<'_, '_, T> {
     fn trace(&self, t: &mut Tracer<'_>) {
         t.slot(self);
     }
@@ -479,7 +479,7 @@ unsafe impl<T: Trace> Trace for GcSlot<'_, T> {
 }
 
 // SAFETY: the pointer in the word (if any) is an edge; the target type is unknown, so it is treated as having edges
-unsafe impl Trace for WordSlot<'_> {
+unsafe impl Trace for WordSlot<'_, '_> {
     fn trace(&self, t: &mut Tracer<'_>) {
         t.raw(self.raw(), false);
     }
@@ -490,7 +490,7 @@ unsafe impl Trace for WordSlot<'_> {
 }
 
 // SAFETY: the handle's target is an edge; the handle itself never changes
-unsafe impl<T: Trace> Trace for Handle<'_, T> {
+unsafe impl<T: Trace> Trace for Handle<'_, '_, T> {
     fn trace(&self, t: &mut Tracer<'_>) {
         t.handle(HandleInternal::header(*self), T::NO_EDGES);
     }
@@ -501,7 +501,7 @@ unsafe impl<T: Trace> Trace for Handle<'_, T> {
 }
 
 // SAFETY: the handle in the slot (if any) is an edge
-unsafe impl<T: Trace> Trace for HandleSlot<'_, T> {
+unsafe impl<T: Trace> Trace for HandleSlot<'_, '_, T> {
     fn trace(&self, t: &mut Tracer<'_>) {
         if let Some(h) = self.get() {
             h.trace(t);
@@ -513,10 +513,10 @@ unsafe impl<T: Trace> Trace for HandleSlot<'_, T> {
     }
 }
 
-/// Types without `Gc`: nothing to trace.
+/// Types without `ScopeLocal`: nothing to trace.
 macro_rules! leaf {
     ($($ty:ty),* $(,)?) => {$(
-        // SAFETY: no Gc
+        // SAFETY: no ScopeLocal
         unsafe impl Trace for $ty {
             const NO_EDGES: bool = true;
             fn trace(&self, _: &mut Tracer<'_>) {}

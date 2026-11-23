@@ -3,12 +3,12 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use paragc::{GroupMember, Far, Gc, Heap, Global, GcSlot, Trace, Tracer, YoungEvacuation, brand};
+use paragc::{GroupMember, Far, ScopeLocal, Heap, Global, Slot, Trace, Tracer, YoungEvacuation, brand};
 
 /// Collector threads per heap (fewer under Miri)
 const THREADS: NonZeroUsize = NonZeroUsize::new(if cfg!(miri) { 2 } else { 4 }).unwrap();
 
-/// Counts on drop (no Gc, so it may have Drop).
+/// Counts on drop (no ScopeLocal, so it may have Drop).
 struct Counted(Arc<AtomicUsize>);
 
 impl Drop for Counted {
@@ -17,7 +17,7 @@ impl Drop for Counted {
     }
 }
 
-// SAFETY: no Gc
+// SAFETY: no ScopeLocal
 unsafe impl Trace for Counted {
     const NO_EDGES: bool = true;
     fn trace(&self, _: &mut Tracer<'_>) {}
@@ -46,7 +46,7 @@ brand!(HolderB = for<'scope> Holder<'scope>);
 struct Link<'scope> {
     heap: usize,
     _counted: Counted,
-    out: GcSlot<'scope, Hop<'scope>>,
+    out: Slot<'scope, Hop<'scope>>,
 }
 
 #[derive(Trace)]
@@ -106,7 +106,7 @@ fn far_targets_are_pinned_during_evacuation() {
                 assert_eq!(via_far.value, *value);
                 let root = &roots.iter().find(|(v, _)| v == value).expect("same value").1;
                 // Roots follow the objects that move; those pointed to by a Far must stay put, and both paths reach the same object
-                assert!(Gc::ptr_eq(mb.get(root), via_far), "an object pointed to by a Far was moved");
+                assert!(ScopeLocal::ptr_eq(mb.get(root), via_far), "an object pointed to by a Far was moved");
             }
         });
     });
@@ -156,7 +156,7 @@ fn far_survives_holder_heap_drop_order() {
 
 /// Make a cycle: one Link per heap in `heaps`, the i-th pointing through a Hop directly at the (i+1)-th, the last back to the first. Returns the root of the first Link.
 fn ring(heaps: &[Heap<'static>], drops: &Arc<AtomicUsize>) -> Global<'static, LinkB> {
-    let links: Vec<Global<'_, LinkB>> = heaps.iter().enumerate().map(|(i, h)| h.scope(|m| m.global(m.alloc(Link { heap: i, _counted: Counted(drops.clone()), out: GcSlot::default() })))).collect();
+    let links: Vec<Global<'_, LinkB>> = heaps.iter().enumerate().map(|(i, h)| h.scope(|m| m.global(m.alloc(Link { heap: i, _counted: Counted(drops.clone()), out: Slot::default() })))).collect();
     for i in 0..heaps.len() {
         let j = (i + 1) % heaps.len();
         heaps[i].scope(|ma| {
@@ -171,7 +171,7 @@ fn ring(heaps: &[Heap<'static>], drops: &Arc<AtomicUsize>) -> Global<'static, Li
 
 /// Walk once around the cycle from the first Link and return the heap ids passed.
 fn walk(heaps: &[Heap<'static>], first: &Global<'static, LinkB>) -> Vec<usize> {
-    fn step<'a>(heaps: &[Heap<'static>], at: usize, link: Gc<'a, Link<'a>>, seen: &mut Vec<usize>) {
+    fn step<'a>(heaps: &[Heap<'static>], at: usize, link: ScopeLocal<'a, Link<'a>>, seen: &mut Vec<usize>) {
         seen.push(link.heap);
         let next = (at + 1) % heaps.len();
         if next == 0 {
@@ -249,7 +249,7 @@ fn rings_over_eight_heaps() {
 /// One board per heap: a row of slots, each holding a Holder (pointing directly at an Item in another heap)
 #[derive(Trace)]
 struct Board<'scope> {
-    cells: Vec<GcSlot<'scope, Holder<'scope>>>,
+    cells: Vec<Slot<'scope, Holder<'scope>>>,
 }
 
 brand!(BoardB = for<'scope> Board<'scope>);
@@ -273,7 +273,7 @@ fn eight_threads_relink_far_holders() {
     let mut hs = heaps(HEAPS);
     let drops = Arc::new(AtomicUsize::new(0));
     let made = AtomicUsize::new(0);
-    let boards: Vec<Global<'_, BoardB>> = hs.iter().map(|h| h.scope(|m| m.global(m.alloc(Board { cells: (0..CELLS).map(|_| GcSlot::default()).collect() })))).collect();
+    let boards: Vec<Global<'_, BoardB>> = hs.iter().map(|h| h.scope(|m| m.global(m.alloc(Board { cells: (0..CELLS).map(|_| Slot::default()).collect() })))).collect();
     for round in 0..ROUNDS {
         std::thread::scope(|s| {
             for t in 0..HEAPS {

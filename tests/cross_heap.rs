@@ -300,7 +300,7 @@ impl Drop for Counted {
     }
 }
 
-// SAFETY: no Gc
+// SAFETY: no ScopeLocal
 unsafe impl Trace for Counted {
     const NO_EDGES: bool = true;
     fn trace(&self, _: &mut paragc::Tracer<'_>) {}
@@ -760,7 +760,7 @@ fn shrink_returns_empty_blocks_and_open_by_fd() {
 #[derive(Trace, Shared)]
 struct SNode<'scope> {
     value: u64,
-    next: paragc::GcSlot<'scope, SNode<'scope>>,
+    next: paragc::Slot<'scope, SNode<'scope>>,
 }
 
 brand!(SNodeB = for<'scope> SNode<'scope>);
@@ -769,7 +769,7 @@ cross_heap_brand!(SNodeX = for<'scope> SNode<'scope>);
 /// A plain object in a private heap, pointing at a shareable node
 #[derive(Trace)]
 struct Keeper<'scope> {
-    node: paragc::GcSlot<'scope, SNode<'scope>>,
+    node: paragc::Slot<'scope, SNode<'scope>>,
 }
 
 brand!(KeeperB = for<'scope> Keeper<'scope>);
@@ -810,7 +810,7 @@ fn young_survivors_promote_into_attached_cross_heap() {
     let mut heap = Heap::new_static(THREADS);
     heap.attach_cross_heap(&cross).unwrap();
     let (root, keeper, weak) = heap.scope(|m| {
-        let mut top: Option<paragc::Gc<'_, SNode<'_>>> = None;
+        let mut top: Option<paragc::ScopeLocal<'_, SNode<'_>>> = None;
         for value in 0..LEN {
             top = Some(m.alloc_shared(SNode { value, next: top.into() }));
         }

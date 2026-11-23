@@ -5,7 +5,7 @@
 //! Two ways to collect:
 //! - [`Heap::collect`] (`&mut self`): the borrow rules exclude mutators, and marking + sweeping happen in this one call
 //! - [`Heap::mark_concurrently`] (`&self`): one short handshake at the start (wait until no thread is inside a scope, snapshot the roots); afterwards mutators keep running while
-//!   collector threads mark concurrently; on the mutator side, `GcSlot` writes go through a snapshot-at-the-beginning (SATB) write barrier and new objects are marked with this round (black allocation).
+//!   collector threads mark concurrently; on the mutator side, `Slot` writes go through a snapshot-at-the-beginning (SATB) write barrier and new objects are marked with this round (black allocation).
 //!   The [`Heap::collect`] that follows only drains the grey objects gathered by the write barrier and then sweeps
 //!
 //! The handshake word: the top bit is the "start marking" request, the low bits count threads inside a scope. While the request is set, threads entering scope wait for it to clear.
@@ -35,11 +35,11 @@ use std::sync::{Arc, OnceLock};
 use crossbeam_deque::{Injector, Steal};
 use crossbeam_utils::{Backoff, CachePadded};
 
-use crate::{Gc, Trace};
+use crate::{ScopeLocal, Trace};
 use crate::Handle;
-use crate::handle::{GcInternal, HandleInternal, Invariant, NO_HOLDER, RawSlot, RootTable};
+use crate::handle::{ScopeLocalInternal, HandleInternal, Invariant, NO_HOLDER, RawSlot, RootTable};
 #[cfg(crossheap)]
-use crate::handle::{EdgeMap, CrossHeapGlobal, CrossHeapBrand, CrossHeapGc, CrossHeapGcInternal, CrossHeapGlobalInternal, STAMP_MASK, Shared, Signature, WeakWord};
+use crate::handle::{EdgeMap, CrossHeapGlobal, CrossHeapBrand, CrossHeapLocal, CrossHeapLocalInternal, CrossHeapGlobalInternal, STAMP_MASK, Shared, Signature, WeakWord};
 use crate::layout::{BLOCK, Block, Pages, WARM_CYCLES, YOUNG_COPY_DEN, YOUNG_COPY_NUM, LINE, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, HEADER, Header, LARGE, MAX_EPOCH, MIN_SPARE_BLOCKS, MIN_TRIGGER, OVERFLOW_TRIES, FRAG_NUM, FRAG_DEN, YOUNG_PER_FULL, YOUNG_PER_FULL_RC};
 #[cfg(crossheap)]
 use crate::layout::{Core, State};
@@ -56,7 +56,7 @@ use crate::sync::{Pool, SegVec};
 use crate::sync::{FutexWord, Retry, Stack};
 
 pub struct Heap<'heap> {
-    /// The heap's brand: [`Global`]s and [`Weak`]s carry it, so they are used only with this heap
+    /// The heap's brand: [`ScopeGlobal`]s and [`Weak`]s carry it, so they are used only with this heap
     _brand: PhantomData<fn(&'heap ()) -> &'heap ()>,
     /// Collect with at most this many threads
     threads: NonZeroUsize,
@@ -128,7 +128,7 @@ pub struct Heap<'heap> {
     spare: AtomicPtr<Tlab>,
     /// The cross-heap used as the old generation ([`Heap::attach_cross_heap`])
     #[cfg(crossheap)]
-    cross: Option<CrossHeap>,
+    cross: Option<CrossHeap<'static>>,
     /// A private object was written into a cross-heap object since the last young collection
     #[cfg(crossheap)]
     promotion_pending: AtomicBool,
@@ -136,7 +136,7 @@ pub struct Heap<'heap> {
 
 /// Whether young collections move surviving young objects into compact blocks ([`Heap::set_young_evacuation`]).
 ///
-/// Young collections do not scan old objects: the only edges from old objects to young ones are the remembered slots (recorded when a [`crate::GcSlot`] is written).
+/// Young collections do not scan old objects: the only edges from old objects to young ones are the remembered slots (recorded when a [`crate::Slot`] is written).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum YoungEvacuation {
@@ -146,8 +146,8 @@ pub enum YoungEvacuation {
     /// moved objects are referenced only by young objects and roots, which are all relocated (`Trace::relocate`), so not a byte of an old object changes
     #[default]
     SkipRemembered,
-    /// Remembered slots are rewritten to the new address as well, so objects pointed to directly by old objects also move. Usable only when old objects store the address nowhere but in a `GcSlot`
-    /// (for example, a copy of the address kept next to the `GcSlot` would not be updated)
+    /// Remembered slots are rewritten to the new address as well, so objects pointed to directly by old objects also move. Usable only when old objects store the address nowhere but in a `Slot`
+    /// (for example, a copy of the address kept next to the `Slot` would not be updated)
     Full,
 }
 
@@ -178,15 +178,21 @@ pub struct Stats {
     pub evacuated_bytes: usize,
 }
 
-impl Heap<'static> {
-    /// A new heap that collects with at most `threads` threads, with a brand of its own: [`Global`]s and [`Weak`]s made in it cannot be used with
-    /// any other heap (checked at compile time). The heap lives for the closure.
+impl Heap<'_> {
+    /// A new heap that collects with at most `threads` threads, with a brand of its own: everything made in it carries `'heap`, so nothing of it can be used
+    /// with any other heap (checked at compile time). The heap is the outermost scope and lives for the closure.
     pub fn new<R>(threads: NonZeroUsize, f: impl for<'heap> FnOnce(Heap<'heap>) -> R) -> R {
         f(Heap::build(threads))
     }
+}
 
-    /// A new heap that can be stored anywhere. All such heaps share the brand `'static`, so using a [`Global`] with the wrong one is caught at run time.
-    pub fn new_static(threads: NonZeroUsize) -> Self {
+impl<'heap> Heap<'heap> {
+    /// A new heap with a brand the caller picks, for heaps that must be stored in structs or collections.
+    ///
+    /// # Safety
+    /// No two heaps alive at the same time may share a brand while objects of one could be handed to the other: the brand is what keeps a
+    /// [`ScopeLocal`] of one heap out of the other's objects.
+    pub unsafe fn new_unchecked(threads: NonZeroUsize) -> Self {
         Self::build(threads)
     }
 }
@@ -250,7 +256,7 @@ impl<'heap> Heap<'heap> {
     /// `cross` must be created in the fixed-address region ([`crate::CrossHeapSpace::reserve_fixed`]) so absolute addresses stored in objects are valid in every process.
     /// Shareable objects may only point at shareable objects: promotion panics on an edge to a non-shareable object. Concurrent marking and `collect_group` are not supported once attached.
     #[cfg(crossheap)]
-    pub fn attach_cross_heap(&mut self, cross: &CrossHeap) -> io::Result<()> {
+    pub fn attach_cross_heap(&mut self, cross: &CrossHeap<'_>) -> io::Result<()> {
         let inner = &cross.0;
         if !inner.space.is_fixed() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "a cross-heap used as the old generation must be created in the fixed-address region (CrossHeapSpace::reserve_fixed)"));
@@ -262,7 +268,7 @@ impl<'heap> Heap<'heap> {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "a cross-heap is already attached"));
         }
         inner.sup().owner_only.store(1, Ordering::Release);
-        self.cross = Some(CrossHeap(Arc::clone(inner)));
+        self.cross = Some(CrossHeap(Arc::clone(inner), PhantomData));
         Ok(())
     }
 
@@ -281,33 +287,57 @@ impl<'heap> Heap<'heap> {
         unsafe { self.weaks.clear_crossed(|p| Inner::survived(p, epoch)) };
     }
 
-    /// Work on the heap; can be called on several threads at once. Objects allocated in the closure survive the next collection only if they hang from a [`crate::Global`] (directly or indirectly).
-    pub fn scope<R>(&self, f: impl for<'scope> FnOnce(&Scope<'heap, 'scope>) -> R) -> R {
+    /// Open a scope holding the heap exclusively: allocate, derive smaller scopes, and collect inside it ([`Scope::collect`]).
+    /// Objects allocated in it survive the scope only if they hang from a [`ScopeGlobal`] (directly or indirectly).
+    pub fn scope<R>(&mut self, f: impl for<'life> FnOnce(&mut Scope<'heap, 'life>) -> R) -> R {
+        let mut tlab = self.take_tlab();
+        tlab.adopt((self.id(), self.collections));
+        let marking = NonZeroU32::new(*self.marking.get_mut());
+        let r = {
+            // Even if the closure panics, the gathered start bits must be written: if they were missed, the next pause recomputing lines would take lines of live objects as free
+            let flush = FlushStarts(&tlab);
+            let mut s = Scope { heap: NonNull::from(&mut *self), tlab: NonNull::from(flush.0), exclusive: true, marking: Cell::new(marking), _brand: PhantomData };
+            f(&mut s)
+        };
+        self.put_tlab(tlab);
+        r
+    }
+
+    /// Open a scope that may run on several threads at once (each with its own scope). It cannot collect; collections wait until every shared scope has ended.
+    pub fn scope_shared<R>(&self, f: impl for<'life> FnOnce(&mut Scope<'heap, 'life>) -> R) -> R {
+        let mut tlab = self.take_tlab();
+        let r = self.scope_shared_in(&mut tlab, f);
+        self.put_tlab(tlab);
+        r
+    }
+
+    /// As [`Heap::scope_shared`], but with the caller's own allocation buffer (a thread that opens scopes repeatedly keeps it, saving a new block every time).
+    pub fn scope_shared_in<R>(&self, tlab: &mut Tlab, f: impl for<'life> FnOnce(&mut Scope<'heap, 'life>) -> R) -> R {
+        let _inside = Inside::enter(self);
+        tlab.adopt((self.id(), self.collections));
+        // Concurrent marking starts only with no scopes open and ends only with the heap held exclusively, so it does not change within a shared scope
+        let marking = NonZeroU32::new(self.marking.load(Ordering::Acquire));
+        let flush = FlushStarts(tlab);
+        let mut s = Scope { heap: NonNull::from(self), tlab: NonNull::from(flush.0), exclusive: false, marking: Cell::new(marking), _brand: PhantomData };
+        f(&mut s)
+    }
+
+    fn take_tlab(&self) -> Box<Tlab> {
         let spare = self.spare.swap(null_mut(), Ordering::AcqRel);
-        let mut tlab = if spare.is_null() {
+        if spare.is_null() {
             Box::default()
         } else {
             // SAFETY: spare only ever holds Tlabs from Box::into_raw, and after the swap it is ours alone
             unsafe { Box::from_raw(spare) }
-        };
-        let r = self.scope_in(&mut tlab, f);
+        }
+    }
+
+    fn put_tlab(&self, tlab: Box<Tlab>) {
         let tlab = Box::into_raw(tlab);
         if self.spare.compare_exchange(null_mut(), tlab, Ordering::AcqRel, Ordering::Relaxed).is_err() {
             // SAFETY: it was not put back, so it is still ours alone
             drop(unsafe { Box::from_raw(tlab) });
         }
-        r
-    }
-
-    /// As [`Heap::scope`], but with the caller's own allocation buffer (a thread that scopes repeatedly keeps it, saving a new block every time).
-    pub fn scope_in<R>(&self, tlab: &mut Tlab, f: impl for<'scope> FnOnce(&Scope<'heap, 'scope>) -> R) -> R {
-        let _inside = Inside::enter(self);
-        tlab.adopt((self.id(), self.collections));
-        // Concurrent marking starts only with no mutators and ends only with the heap held exclusively, so it does not change within one scope
-        let marking = NonZeroU32::new(self.marking.load(Ordering::Acquire));
-        // Even if the closure panics, the gathered start bits must be written: if they were missed, the next pause recomputing lines would take lines of live objects as free
-        let tlab = FlushStarts(tlab);
-        f(&Scope { heap: self, tlab: tlab.0, marking, _brand: PhantomData })
     }
 
     fn pool(&self) -> &Pool {
@@ -748,7 +778,7 @@ impl<'heap> Heap<'heap> {
         *self.shrinking.get_mut() = false;
     }
 
-    /// Finish marking: if concurrent marking is in progress, drain the grey objects gathered by the write barrier to complete it; otherwise mark in parallel from every [`crate::Global`];
+    /// Finish marking: if concurrent marking is in progress, drain the grey objects gathered by the write barrier to complete it; otherwise mark in parallel from every [`crate::ScopeGlobal`];
     /// then hand every block to the sweeper and return — sweeping then proceeds concurrently with mutators (mutators sweep along when they need blocks,
     /// or some thread calls [`Heap::sweep_concurrently`]). The pause is only the end of marking.
     pub fn finish_marking(&mut self) {
@@ -856,7 +886,7 @@ impl<'heap> Heap<'heap> {
 
     /// Fully collect several heaps together, reclaiming cycles across heaps (A's object points to B through a [`crate::Far`] and B's points back; in single collections each other's entries are roots).
     ///
-    /// Fars held by heaps of the group are not roots: each heap marks from its own [`crate::Global`]s (and Fars held from outside the group), and a traced Far hands its target to the target heap
+    /// Fars held by heaps of the group are not roots: each heap marks from its own [`crate::ScopeGlobal`]s (and Fars held from outside the group), and a traced Far hands its target to the target heap
     /// to continue marking until nothing new appears; an unmarked entry means the Far holding it is dead, so it is cleared. No evacuation. On return dead objects are finalized.
     /// Heaps with concurrent marking in progress finish it on their own first.
     pub fn collect_group(heaps: &mut [&mut dyn GroupMember]) {
@@ -1168,33 +1198,91 @@ impl Drop for Inside<'_, '_> {
     }
 }
 
-/// The allocator and brand of one scope; used only on the calling thread.
-pub struct Scope<'heap, 'scope> {
-    heap: &'scope Heap<'heap>,
-    tlab: &'scope Tlab,
-    /// The epoch being marked concurrently when the scope began: for the write barrier and black allocation
-    marking: Option<NonZeroU32>,
-    _brand: Invariant<'scope>,
+/// A scope: a stretch of work on a heap in which objects do not move unless the scope itself collects. Scopes nest: the heap is the outermost, and every scope
+/// derives smaller ones with [`Scope::scope`] (the same struct, a shorter life).
+///
+/// - A [`ScopeLocal`] is a direct pointer borrowed from the scope it came from. Collecting in a scope, or deriving a smaller one, borrows the scope mutably,
+///   so every `ScopeLocal` of it (and of every scope around it) is dead by then; the compiler checks this.
+/// - A [`ScopeGlobal`] is a root: carry an object out to an enclosing scope with [`Scope::scope_out`] and back in with [`Scope::scope_in`]; collections rewrite it.
+///
+/// A scope from [`Heap::scope`] holds the heap exclusively and may collect ([`Scope::collect`] and friends). One from [`Heap::scope_shared`] can run on several
+/// threads at once and must not collect (it panics).
+pub struct Scope<'heap, 'life> {
+    heap: NonNull<Heap<'heap>>,
+    tlab: NonNull<Tlab>,
+    /// Holds the heap exclusively, so it may collect
+    exclusive: bool,
+    /// The epoch being marked concurrently, for the write barrier and black allocation (refreshed after collecting)
+    marking: Cell<Option<NonZeroU32>>,
+    _brand: PhantomData<(&'life mut Heap<'heap>, Invariant<'life>)>,
 }
 
-impl<'heap, 'scope> Scope<'heap, 'scope> {
+impl<'heap, 'life> Scope<'heap, 'life> {
+    fn heap(&self) -> &Heap<'heap> {
+        // SAFETY: the scope borrows the heap for its whole life
+        unsafe { self.heap.as_ref() }
+    }
+
+    fn tlab(&self) -> &Tlab {
+        // SAFETY: the allocation buffer is owned by the outermost scope and outlives every scope derived from it
+        unsafe { self.tlab.as_ref() }
+    }
 
     /// Whether this scope falls within concurrent marking (write barrier and black allocation in effect).
     pub fn is_marking(&self) -> bool {
-        self.marking.is_some()
+        self.marking.get().is_some()
+    }
+
+    /// Derive a smaller scope. Every [`ScopeLocal`] of this scope is dead inside it; carry objects in with [`ScopeGlobal`]s.
+    pub fn scope<R>(&mut self, f: impl for<'inner> FnOnce(&mut Scope<'heap, 'inner>) -> R) -> R {
+        let mut inner = Scope { heap: self.heap, tlab: self.tlab, exclusive: self.exclusive, marking: Cell::new(self.marking.get()), _brand: PhantomData };
+        let r = f(&mut inner);
+        self.marking.set(inner.marking.get());
+        r
+    }
+
+    /// [`Heap::collect`] from inside the scope: only [`ScopeGlobal`]s (and [`ScopeGlobal`]s) survive into what follows.
+    pub fn collect(&mut self) {
+        self.collecting(Heap::collect);
+    }
+
+    /// [`Heap::collect_young`] from inside the scope.
+    pub fn collect_young(&mut self) {
+        self.collecting(Heap::collect_young);
+    }
+
+    /// [`Heap::collect_if_needed`] from inside the scope.
+    pub fn collect_if_needed(&mut self) -> bool {
+        self.collecting(Heap::collect_if_needed)
+    }
+
+    /// [`Heap::shrink`] from inside the scope.
+    pub fn shrink(&mut self) {
+        self.collecting(Heap::shrink);
+    }
+
+    fn collecting<R>(&mut self, f: impl FnOnce(&mut Heap<'heap>) -> R) -> R {
+        assert!(self.exclusive, "a shared scope cannot collect (other threads may hold direct pointers)");
+        // SAFETY: exclusive: the scope chain holds the heap mutably and &mut self ends every ScopeLocal; the buffer belongs to this thread
+        let (heap, tlab) = unsafe { (self.heap.as_mut(), self.tlab.as_mut()) };
+        tlab.flush_starts();
+        let r = f(heap);
+        tlab.adopt((heap.id(), heap.collections));
+        self.marking.set(NonZeroU32::new(*heap.marking.get_mut()));
+        r
     }
 
     /// Allocate an object.
-    pub fn alloc<T: Trace + 'scope>(&self, value: T) -> Gc<'scope, T> {
+    pub fn alloc<'s, T: Trace + 's>(&'s self, value: T) -> ScopeLocal<'heap, 's, T> {
         self.alloc_with(value, Header::new::<T>, 0, |_| {})
     }
 
     /// Allocate an object with a stable identity: the [`Handle`] points at an entry of the heap's handle table, not at the object, so it stays the same when the object moves
     /// and can be compared, hashed and embedded in generated code by its [`Handle::id`]. Reading through it costs one extra load. The object stays alive while any object (or root) holding
     /// the handle is alive, and dies with them; its entry is then reused. Old objects that hold handles keep their targets until the next full collection.
-    pub fn alloc_handle<T: Trace + 'scope>(&self, value: T) -> Handle<'scope, T> {
+    pub fn alloc_handle<'s, T: Trace + 's>(&'s self, value: T) -> Handle<'heap, 's, T> {
         let gc = self.alloc(value);
-        let table = self.heap.handles();
+        let table = self.heap().handles();
         let entry = table.slot(table.claim(gc.header(), NO_HOLDER));
         // SAFETY: the entry lives in the heap's handle table (a segmented vector, never moved) and now holds this object
         unsafe { Handle::from_entry(entry) }
@@ -1202,37 +1290,38 @@ impl<'heap, 'scope> Scope<'heap, 'scope> {
 
     /// Allocate an object followed by `tail` bytes of plain data (no pointers: the collector never looks inside, and copies them with the object when it moves or is promoted).
     /// The tail starts `size_of::<T>()` bytes after the data pointer; `fill` writes all of it before the object is reachable. `T` keeps the tail's length itself.
-    pub fn alloc_tail<T: Trace + 'scope>(&self, value: T, tail: usize, fill: impl FnOnce(&mut [MaybeUninit<u8>])) -> Gc<'scope, T> {
+    pub fn alloc_tail<'s, T: Trace + 's>(&'s self, value: T, tail: usize, fill: impl FnOnce(&mut [MaybeUninit<u8>])) -> ScopeLocal<'heap, 's, T> {
         self.alloc_with(value, Header::new::<T>, tail, fill)
     }
 
     /// Allocate a shareable object (its type is also [`Shared`], with no destructor): when a cross-heap is attached ([`Heap::attach_cross_heap`]),
     /// it is promoted into the cross-heap once it survives a young collection, and other processes can find it by signature or weak reference. Its edges may only point at shareable objects.
     #[cfg(crossheap)]
-    pub fn alloc_shared<T: Trace + Shared + 'scope>(&self, value: T) -> Gc<'scope, T> {
+    pub fn alloc_shared<'s, T: Trace + Shared + 's>(&'s self, value: T) -> ScopeLocal<'heap, 's, T> {
         self.alloc_with(value, Header::new_shared::<T>, 0, |_| {})
     }
 
     /// [`Scope::alloc_tail`] for a shareable object: the tail goes with it into the cross-heap.
     #[cfg(crossheap)]
-    pub fn alloc_shared_tail<T: Trace + Shared + 'scope>(&self, value: T, tail: usize, fill: impl FnOnce(&mut [MaybeUninit<u8>])) -> Gc<'scope, T> {
+    pub fn alloc_shared_tail<'s, T: Trace + Shared + 's>(&'s self, value: T, tail: usize, fill: impl FnOnce(&mut [MaybeUninit<u8>])) -> ScopeLocal<'heap, 's, T> {
         self.alloc_with(value, Header::new_shared::<T>, tail, fill)
     }
 
-    fn alloc_with<T: Trace + 'scope>(&self, value: T, header: fn(usize, bool, u32) -> Header, tail: usize, fill: impl FnOnce(&mut [MaybeUninit<u8>])) -> Gc<'scope, T> {
+    fn alloc_with<'s, T: Trace + 's>(&'s self, value: T, header: fn(usize, bool, u32) -> Header, tail: usize, fill: impl FnOnce(&mut [MaybeUninit<u8>])) -> ScopeLocal<'heap, 's, T> {
         const { assert!(align_of::<T>() <= GRANULE, "object data alignment must not exceed 8 bytes") };
         let bytes = (HEADER + size_of::<T>() + tail).next_multiple_of(GRANULE);
         let large = bytes > LARGE;
-        let p = if large { self.heap.alloc_large(bytes) } else { self.alloc_small(bytes) };
+        let p = if large { self.heap().alloc_large(bytes) } else { self.alloc_small(bytes) };
         // Normally: young (mark 0 ≠ the last completed epoch; it lives in a block swept before being handed out, or a new one, so the sweep in progress never touches it).
         // During concurrent marking: black allocation (marked with this round right away, together with its lines)
-        let mark = self.marking.map_or(YOUNG, NonZeroU32::get);
-        if self.marking.is_some() {
+        let marking = self.marking.get();
+        let mark = marking.map_or(YOUNG, NonZeroU32::get);
+        if marking.is_some() {
             if !large {
                 Block::containing(p).mark_lines(p, bytes, mark);
             }
             // Marking never scans black objects: record them so their edges are counted at the end (reference counting)
-            self.heap.black.push(p.expose_provenance());
+            self.heap().black.push(p.expose_provenance());
         }
         // SAFETY: p is new memory of bytes bytes, granule aligned, owned by this allocation
         unsafe {
@@ -1240,20 +1329,21 @@ impl<'heap, 'scope> Scope<'heap, 'scope> {
             let data = Header::data(p.cast()).cast::<T>();
             data.write(value);
             fill(core::slice::from_raw_parts_mut(data.add(1).cast::<MaybeUninit<u8>>(), tail));
-            Gc::from_data(data)
+            ScopeLocal::from_data(data)
         }
     }
 
     fn alloc_small(&self, bytes: usize) -> *mut u8 {
-        let p = self.tlab.bump(bytes, self.heap.epoch, || self.heap.acquire(), |need| self.heap.acquire_for(need));
-        self.tlab.note_start(p);
+        let heap = self.heap();
+        let p = self.tlab().bump(bytes, heap.epoch, || heap.acquire(), |need| heap.acquire_for(need));
+        self.tlab().note_start(p);
         p
     }
 }
 
 /// Operations for this crate only: the trait lives in a private module and is not exported, so it is unreachable outside the crate.
-pub trait ScopeInternal<'heap, 'scope> {
-    fn heap(&self) -> &'scope Heap<'heap>;
+pub trait ScopeInternal<'heap> {
+    fn heap(&self) -> &Heap<'heap>;
 
     /// Write barrier. During concurrent marking: the overwritten old value is marked and greyed if not yet marked (snapshot at the beginning).
     /// Normally: when a young object (mark epoch not the last completed one) is written into a slot of an old object ([`RawSlot::is_young`] false), record the slot's address —
@@ -1266,9 +1356,9 @@ pub trait ScopeInternal<'heap, 'scope> {
     fn reached(&self, h: *const Header);
 }
 
-impl<'heap, 'scope> ScopeInternal<'heap, 'scope> for Scope<'heap, 'scope> {
-    fn heap(&self) -> &'scope Heap<'heap> {
-        self.heap
+impl<'heap> ScopeInternal<'heap> for Scope<'heap, '_> {
+    fn heap(&self) -> &Heap<'heap> {
+        Scope::heap(self)
     }
 
     fn written(&self, slot: &RawSlot, old: Option<*const Header>, new: Option<*const Header>) {
@@ -1278,32 +1368,32 @@ impl<'heap, 'scope> ScopeInternal<'heap, 'scope> for Scope<'heap, 'scope> {
         #[cfg(crossheap)]
         if Region::holds_fixed(addr) {
             if new.is_some() {
-                assert!(self.heap.cross.is_some(), "writing a private object into a cross-heap object needs a cross-heap attached (Heap::attach_cross_heap)");
-                self.heap.remembered.push(addr);
-                self.heap.promotion_pending.store(true, Ordering::Release);
+                assert!(self.heap().cross.is_some(), "writing a private object into a cross-heap object needs a cross-heap attached (Heap::attach_cross_heap)");
+                self.heap().remembered.push(addr);
+                self.heap().promotion_pending.store(true, Ordering::Release);
             }
             return;
         }
-        if let Some(epoch) = self.marking {
+        if let Some(epoch) = self.marking.get() {
             if let Some(old) = old {
-                self.heap.remember(old, epoch.get());
+                self.heap().remember(old, epoch.get());
             }
         } else if !slot.is_young()
             && let Some(new) = new
             // SAFETY: new is the live object just written into the slot
-            && !unsafe { &*new }.is_marked(self.heap.epoch)
+            && !unsafe { &*new }.is_marked(self.heap().epoch)
         {
-            self.heap.remembered.push(addr);
+            self.heap().remembered.push(addr);
         }
         // Reference count logging: both normally and during concurrent marking (slots rewritten during marking are settled at the end)
         if slot.log() {
-            self.heap.rc_log.push(addr);
+            self.heap().rc_log.push(addr);
         }
     }
 
     fn reached(&self, h: *const Header) {
-        if let Some(epoch) = self.marking {
-            self.heap.remember(h, epoch.get());
+        if let Some(epoch) = self.marking.get() {
+            self.heap().remember(h, epoch.get());
         }
     }
 }
@@ -1330,7 +1420,7 @@ pub const SAME_DIR: u32 = 1 << 30;
 /// The heap number bits of [`Entry::holder`]
 #[cfg(crossheap)]
 const HOLDER_INDEX: u32 = SAME_DIR - 1;
-/// How often `try_mutate` checks again that the owner is still there (reading /proc)
+/// How often `try_scope` checks again that the owner is still there (reading /proc)
 #[cfg(crossheap)]
 const ALIVE_RECHECK: Duration = Duration::from_millis(10);
 /// Blocks taken at once while sweeping
@@ -2224,12 +2314,12 @@ impl Drop for Inner {
 
 /// A public heap. Several threads can [`CrossHeap::scope`] at once; when the same heap is also mapped elsewhere (another region, another process), the handshake still excludes them mutually.
 #[cfg(crossheap)]
-pub struct CrossHeap(Arc<Inner>);
+pub struct CrossHeap<'xheap>(Arc<Inner>, PhantomData<fn(&'xheap ()) -> &'xheap ()>);
 
 #[cfg(crossheap)]
-impl From<Inner> for CrossHeap {
+impl From<Inner> for CrossHeap<'_> {
     fn from(inner: Inner) -> Self {
-        Self(Arc::new(inner))
+        Self(Arc::new(inner), PhantomData)
     }
 }
 
@@ -2264,7 +2354,7 @@ pub struct CrossHeapStats {
 }
 
 #[cfg(crossheap)]
-impl CrossHeap {
+impl<'xheap> CrossHeap<'xheap> {
     /// Heap number (= window number).
     pub fn id(&self) -> usize {
         self.0.index
@@ -2283,13 +2373,13 @@ impl CrossHeap {
 
     /// Work in this heap and `other` at once (two different public heaps): always enters the lower heap number first. Nesting into several public heaps in this order everywhere,
     /// group collections (holding back and waiting for each heap in heap-number order) never wait on mutators; reverse nesting is not wrong either, only slower as collections give up and retry.
-    pub fn scope_with<R>(&self, other: &CrossHeap, f: impl for<'a, 'b> FnOnce(&CrossHeapScope<'a>, &CrossHeapScope<'b>) -> R) -> R {
+    pub fn scope_with<'other, R>(&self, other: &CrossHeap<'other>, f: impl for<'a, 'b> FnOnce(&CrossHeapScope<'xheap, 'a>, &CrossHeapScope<'other, 'b>) -> R) -> R {
         assert!(self.id() != other.id(), "two different public heaps");
         if self.id() < other.id() { self.scope(|ma| other.scope(|mb| f(ma, mb))) } else { other.scope(|mb| self.scope(|ma| f(ma, mb))) }
     }
 
     /// As [`CrossHeap::scope`], but does not enter a dead heap (owner gone) and returns [`HeapDead`]. Use it for heaps created by other processes.
-    pub fn try_mutate<R>(&self, f: impl for<'scope> FnOnce(&CrossHeapScope<'scope>) -> R) -> Result<R, HeapDead> {
+    pub fn try_scope<R>(&self, f: impl for<'life> FnOnce(&CrossHeapScope<'xheap, 'life>) -> R) -> Result<R, HeapDead> {
         if !self.0.alive_cached() {
             return Err(HeapDead);
         }
@@ -2302,7 +2392,7 @@ impl CrossHeap {
     }
 
     /// Work on the heap; can be called on several threads at once. Objects allocated in the closure survive the next collection only if they hang from a [`CrossHeapGlobal`] (directly or indirectly).
-    pub fn scope<R>(&self, f: impl for<'scope> FnOnce(&CrossHeapScope<'scope>) -> R) -> R {
+    pub fn scope<R>(&self, f: impl for<'life> FnOnce(&CrossHeapScope<'xheap, 'life>) -> R) -> R {
         let spare = self.0.spare.swap(null_mut(), Ordering::AcqRel);
         let mut tlab = if spare.is_null() {
             Box::default()
@@ -2361,7 +2451,7 @@ impl CrossHeap {
 
     /// Collect several public heaps (all mapped in this process) together, reclaiming cycles across heaps: [`crate::CrossHeapRef`] registrations held by heaps of the group are not roots,
     /// tracing decides their liveness; after marking, the cross-heap registrations inside the group are replaced by the ones traced. The same heap must not appear twice.
-    pub fn collect_group(heaps: &[&CrossHeap]) {
+    pub fn collect_group(heaps: &[&CrossHeap<'_>]) {
         // Dead heaps do not take part: the registrations they hold are returned by each heap's collection according to liveness. Heaps collected only by their owner (attached to a private heap as old generation) do not take part either
         let mut members: Vec<&Inner> = heaps.iter().map(|h| &*h.0).filter(|m| m.is_alive() && m.sup().owner_only.load(Ordering::Acquire) == 0).collect();
         members.sort_by_key(|m| m.index);
@@ -2443,12 +2533,19 @@ impl<'h> Promoter<'h> {
 #[cfg(crossheap)]
 pub trait CrossHeapInternal {
     fn is(&self, inner: &Arc<Inner>) -> bool;
+
+    /// Give a heap made inside this crate its own brand.
+    fn rebrand(h: CrossHeap<'static>) -> Self;
 }
 
 #[cfg(crossheap)]
-impl CrossHeapInternal for CrossHeap {
+impl CrossHeapInternal for CrossHeap<'_> {
     fn is(&self, inner: &Arc<Inner>) -> bool {
         Arc::ptr_eq(&self.0, inner)
+    }
+
+    fn rebrand(h: CrossHeap<'static>) -> Self {
+        CrossHeap(Arc::clone(&h.0), PhantomData)
     }
 }
 
@@ -2515,21 +2612,21 @@ impl Drop for Gate<'_> {
 
 /// The allocator and brand of one public heap scope; used only on the calling thread.
 #[cfg(crossheap)]
-pub struct CrossHeapScope<'scope> {
-    heap: &'scope Arc<Inner>,
-    tlab: &'scope Tlab,
+pub struct CrossHeapScope<'xheap, 'life> {
+    heap: &'life Arc<Inner>,
+    tlab: &'life Tlab,
     /// The last completed epoch (to judge free lines)
     epoch: u32,
     /// The birth stamp of objects allocated in this scope ([`Inner::stamp`])
     stamp: u32,
-    _brand: Invariant<'scope>,
+    _brand: PhantomData<(Invariant<'life>, fn(&'xheap ()) -> &'xheap ())>,
 }
 
 #[cfg(crossheap)]
-impl<'scope> CrossHeapScope<'scope> {
+impl<'xheap, 'life> CrossHeapScope<'xheap, 'life> {
 
     /// Allocate an object. The type must not have a destructor (checked at compile time).
-    pub fn alloc<T: Shared>(&self, value: T) -> CrossHeapGc<'scope, T> {
+    pub fn alloc<'s, T: Shared>(&'s self, value: T) -> CrossHeapLocal<'xheap, 's, T> {
         const {
             assert!(!core::mem::needs_drop::<T>(), "public heap objects must not have destructors");
             assert!(align_of::<T>() <= GRANULE, "object data alignment must not exceed 8 bytes");
@@ -2548,7 +2645,7 @@ impl<'scope> CrossHeapScope<'scope> {
             p.cast::<PHeader>().write(PHeader::new(bytes, large, ty, self.stamp));
             let data = PHeader::data(p.cast());
             data.cast::<T>().write(value);
-            CrossHeapGc::from_data(data)
+            CrossHeapLocal::from_data(data)
         };
         // Register only after writing (the start bit of a small object, the block kind of a large one): if the process dies in between, sweeping never reads a half-written object
         match run {
@@ -2559,15 +2656,15 @@ impl<'scope> CrossHeapScope<'scope> {
     }
 
     /// Make a handle (entry) for an object.
-    pub fn global<B: CrossHeapBrand>(&self, gc: CrossHeapGc<'scope, B::Of<'scope>>) -> CrossHeapGlobal<B> {
+    pub fn global<'s, B: CrossHeapBrand>(&'s self, gc: CrossHeapLocal<'xheap, 's, B::Of<'xheap, 's>>) -> CrossHeapGlobal<'xheap, B> {
         let entry = self.heap.claim_entry(gc.offset());
-        // SAFETY: a Gc's data pointer is non-null
+        // SAFETY: a ScopeLocal's data pointer is non-null
         CrossHeapGlobal::new(self.heap.clone(), entry, unsafe { NonNull::new_unchecked(gc.as_ptr().cast_mut().cast()) })
     }
 
     /// Get a new handle to the object of an entry number ([`CrossHeapGlobal::index`], possibly from another mapping or process). None when the entry is empty
     /// or the object's type (type name + size + pointer map) does not match `B`.
-    pub fn find<B: CrossHeapBrand>(&self, index: u32) -> Option<CrossHeapGlobal<B>> {
+    pub fn find<B: CrossHeapBrand>(&self, index: u32) -> Option<CrossHeapGlobal<'xheap, B>> {
         let sup = self.heap.sup();
         if index >= sup.entries.load(Ordering::Acquire) {
             return None;
@@ -2580,7 +2677,7 @@ impl<'scope> CrossHeapScope<'scope> {
         let data = self.heap.ptr(off);
         // SAFETY: the entry points at a live object of this heap
         let ty = unsafe { (*PHeader::of(data)).ty };
-        if !self.heap.same_type::<B::Of<'scope>>(ty) {
+        if !self.heap.same_type::<B::Of<'xheap, '_>>(ty) {
             return None;
         }
         let entry = self.heap.claim_entry(off);
@@ -2601,27 +2698,27 @@ impl<'scope> CrossHeapScope<'scope> {
         true
     }
 
-    /// Turn a private heap [`Gc`] pointing at an object of this heap (promoted by a young collection, see [`Heap::attach_cross_heap`]) into an object of this heap, to sign it or put it into
+    /// Turn a private heap [`ScopeLocal`] pointing at an object of this heap (promoted by a young collection, see [`Heap::attach_cross_heap`]) into an object of this heap, to sign it or put it into
     /// this heap's slots; None if it does not point into this heap or the type is not `B`.
-    pub fn adopt<B: CrossHeapBrand, T>(&self, gc: Gc<'_, T>) -> Option<CrossHeapGc<'scope, B::Of<'scope>>> {
+    pub fn adopt<'s, B: CrossHeapBrand, T>(&'s self, gc: ScopeLocal<'_, '_, T>) -> Option<CrossHeapLocal<'xheap, 's, B::Of<'xheap, 's>>> {
         let off = self.heap.offset_of(gc.as_ptr().addr()).filter(|&off| self.heap.owns(off))?;
         let data = self.heap.ptr(off);
         // SAFETY: an object of this heap (promoted here) with a matching type; it is not collected within this scope
-        self.heap.is_type::<B::Of<'scope>>(data).then(|| unsafe { CrossHeapGc::from_data(data) })
+        self.heap.is_type::<B::Of<'xheap, 's>>(data).then(|| unsafe { CrossHeapLocal::from_data(data) })
     }
 
-    /// The signature of the object a private heap [`Gc`] points at, when it is an object of this heap (promoted here, see [`Heap::attach_cross_heap`]); None otherwise.
+    /// The signature of the object a private heap [`ScopeLocal`] points at, when it is an object of this heap (promoted here, see [`Heap::attach_cross_heap`]); None otherwise.
     /// Needs no brand: the type key is read from the object's header.
-    pub fn sign_promoted<T>(&self, gc: Gc<'_, T>) -> Option<Signature> {
+    pub fn sign_promoted<T>(&self, gc: ScopeLocal<'_, '_, T>) -> Option<Signature> {
         let off = self.heap.offset_of(gc.as_ptr().addr()).filter(|&off| self.heap.owns(off))?;
         let data = self.heap.ptr(off);
-        // SAFETY: a live Gc pointing into this heap is the data of a promoted object, with its header in front
+        // SAFETY: a live ScopeLocal pointing into this heap is the data of a promoted object, with its header in front
         let stamp = unsafe { (*PHeader::of(data)).stamp };
         Some((WeakWord::from((off, stamp)), self.heap.incarnation(), self.heap.key_of(data)).into())
     }
 
     /// The object's signature: send it to another process, which opens this heap and finds the object with it ([`CrossHeapScope::resolve`]). A signature keeps nothing alive.
-    pub fn sign<T: Shared>(&self, gc: CrossHeapGc<'scope, T>) -> Signature {
+    pub fn sign<T: Shared>(&self, gc: CrossHeapLocal<'xheap, '_, T>) -> Signature {
         (WeakWord::from(gc), self.heap.incarnation(), self.heap.key_of(gc.as_ptr().cast())).into()
     }
 
@@ -2632,10 +2729,10 @@ impl<'scope> CrossHeapScope<'scope> {
 
     /// Get an object by signature: when the signature points at a live object of this heap whose type is `B`, give it; otherwise None (the object was collected, the heap number changed owner, the type is wrong, or it is forged).
     /// The result is valid only within this scope; to keep it, hang it from a [`CrossHeapGlobal`] or write it into another object.
-    pub fn resolve<B: CrossHeapBrand>(&self, sig: &Signature) -> Option<CrossHeapGc<'scope, B::Of<'scope>>> {
+    pub fn resolve<'s, B: CrossHeapBrand>(&'s self, sig: &Signature) -> Option<CrossHeapLocal<'xheap, 's, B::Of<'xheap, 's>>> {
         let data = self.find_signed(sig)?;
         // SAFETY: find_signed checked a live object of this heap right now; it is not collected within this scope
-        self.heap.is_type::<B::Of<'scope>>(data).then(|| unsafe { CrossHeapGc::from_data(data) })
+        self.heap.is_type::<B::Of<'xheap, 's>>(data).then(|| unsafe { CrossHeapLocal::from_data(data) })
     }
 
     fn find_signed(&self, sig: &Signature) -> Option<*mut u8> {
@@ -2648,7 +2745,7 @@ impl<'scope> CrossHeapScope<'scope> {
     /// Post an object to this heap's mailbox for the heap's owner to handle (other processes asking the owner to act for them): take an entry owned by no process pointing at it (so the letter stays even if the poster exits or is killed),
     /// push it into the mailbox and wake the owner waiting for mail. Returns the entry number. The owner takes it with [`CrossHeapScope::take_mail`] and, when done,
     /// returns the entry with [`CrossHeapScope::release`].
-    pub fn post<T: Shared>(&self, gc: CrossHeapGc<'scope, T>) -> u32 {
+    pub fn post<T: Shared>(&self, gc: CrossHeapLocal<'xheap, '_, T>) -> u32 {
         let i = self.heap.claim_entry_for(gc.offset(), 0, 0);
         let sup = self.heap.sup();
         Stack::on(&sup.mailbox).push(i, &self.heap.entry(i).next);
@@ -2679,7 +2776,7 @@ pub trait CrossHeapScopeInternal {
     fn index(&self) -> usize;
 
     /// Register an entry in this heap for a reference held by heap `holder`.
-    fn register(&self, off: u64, holder: &CrossHeapScope<'_>);
+    fn register(&self, off: u64, holder: &CrossHeapScope<'_, '_>);
 
     /// Heap identity.
     fn incarnation(&self) -> u64;
@@ -2692,7 +2789,7 @@ pub trait CrossHeapScopeInternal {
 }
 
 #[cfg(crossheap)]
-impl CrossHeapScopeInternal for CrossHeapScope<'_> {
+impl CrossHeapScopeInternal for CrossHeapScope<'_, '_> {
     fn is(&self, inner: &Arc<Inner>) -> bool {
         Arc::ptr_eq(self.heap, inner)
     }
@@ -2705,7 +2802,7 @@ impl CrossHeapScopeInternal for CrossHeapScope<'_> {
         self.heap.index
     }
 
-    fn register(&self, off: u64, holder: &CrossHeapScope<'_>) {
+    fn register(&self, off: u64, holder: &CrossHeapScope<'_, '_>) {
         self.heap.claim_entry_for(off, holder.heap.holder_word(self.heap), holder.heap.incarnation());
     }
 

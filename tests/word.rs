@@ -4,9 +4,9 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use paragc::{Gc, Heap, Global, Trace, Tracer, WORD_PAYLOAD, WordSlot, YoungEvacuation, brand, word_pointer};
+use paragc::{ScopeLocal, Heap, Global, Trace, Tracer, WORD_PAYLOAD, WordSlot, YoungEvacuation, brand, word_pointer};
 
-/// Counts on drop (no Gc, so it may have Drop).
+/// Counts on drop (no ScopeLocal, so it may have Drop).
 struct Counted(Arc<AtomicUsize>);
 
 impl Drop for Counted {
@@ -15,7 +15,7 @@ impl Drop for Counted {
     }
 }
 
-// SAFETY: no Gc
+// SAFETY: no ScopeLocal
 unsafe impl Trace for Counted {
     const NO_EDGES: bool = true;
     fn trace(&self, _: &mut Tracer<'_>) {}
@@ -39,16 +39,16 @@ const END: f64 = -1.5;
 const THREADS: NonZeroUsize = NonZeroUsize::new(if cfg!(miri) { 2 } else { 4 }).unwrap();
 const LEN: usize = if cfg!(miri) { 100 } else { 10_000 };
 
-fn pointer(n: Gc<'_, Node<'_>>) -> u64 {
+fn pointer(n: ScopeLocal<'_, Node<'_>>) -> u64 {
     TAG | n.as_ptr().expose_provenance() as u64
 }
 
 /// The node in a word (the tag must be unchanged)
-fn node<'scope>(word: u64) -> Option<Gc<'scope, Node<'scope>>> {
+fn node<'scope>(word: u64) -> Option<ScopeLocal<'scope, Node<'scope>>> {
     let p = word_pointer(word)?;
     assert_eq!(word & !WORD_PAYLOAD, TAG, "the tag changed");
     // SAFETY: the word was made by `pointer`, and the node is pointed to by a reachable node of the chain
-    Some(unsafe { Gc::from_raw(p.cast::<Node<'scope>>()) })
+    Some(unsafe { ScopeLocal::from_raw(p.cast::<Node<'scope>>()) })
 }
 
 fn number(n: f64) -> u64 {

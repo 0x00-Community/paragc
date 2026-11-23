@@ -2,12 +2,12 @@
 use std::num::NonZeroUsize;
 
 use bench_common::{Args, Bench, Clock, FRAG_PER_ROUND, FRAG_ROUNDS, Footprint, Frag, GcBench, LONG_LIVED_DEPTH, MT_DEPTH, MT_ROUNDS, MT_TREES, PAUSE_DEPTH, STRETCH_DEPTH, Size, Took, Tree};
-use paragc::{Gc, Heap, Scope, Global, GcSlot, Tlab, Trace, brand};
+use paragc::{ScopeLocal, Heap, Scope, Global, Slot, Tlab, Trace, brand};
 
 #[derive(Trace)]
 struct Node<'scope> {
-    left: Option<Gc<'scope, Node<'scope>>>,
-    right: Option<Gc<'scope, Node<'scope>>>,
+    left: Option<ScopeLocal<'scope, Node<'scope>>>,
+    right: Option<ScopeLocal<'scope, Node<'scope>>>,
     value: u64,
 }
 
@@ -22,25 +22,25 @@ struct Blob<const N: usize> {
 /// The holder of the fragmentation load: one group of slots per size
 #[derive(Trace)]
 struct Holder<'scope> {
-    small: Vec<GcSlot<'scope, Blob<3>>>,
-    medium: Vec<GcSlot<'scope, Blob<30>>>,
-    large: Vec<GcSlot<'scope, Blob<200>>>,
-    huge: Vec<GcSlot<'scope, Blob<1500>>>,
+    small: Vec<Slot<'scope, Blob<3>>>,
+    medium: Vec<Slot<'scope, Blob<30>>>,
+    large: Vec<Slot<'scope, Blob<200>>>,
+    huge: Vec<Slot<'scope, Blob<1500>>>,
 }
 
 brand!(HolderB = for<'scope> Holder<'scope>);
 
 impl<'scope> Holder<'scope> {
     fn new() -> Self {
-        fn slots<'scope, const N: usize>(size: Size) -> Vec<GcSlot<'scope, Blob<N>>> {
-            (0..size.slots()).map(|_| GcSlot::default()).collect()
+        fn slots<'scope, const N: usize>(size: Size) -> Vec<Slot<'scope, Blob<N>>> {
+            (0..size.slots()).map(|_| Slot::default()).collect()
         }
         Self { small: slots(Size::Small), medium: slots(Size::Medium), large: slots(Size::Large), huge: slots(Size::Huge) }
     }
 
     /// Allocate an object and put it in a slot if needed (the old object overwritten becomes garbage).
     fn place(&self, m: &Scope<'_, 'scope>, frag: &mut Frag) {
-        fn put<'scope, const N: usize>(m: &Scope<'_, 'scope>, slots: &[GcSlot<'scope, Blob<N>>], slot: Option<usize>) {
+        fn put<'scope, const N: usize>(m: &Scope<'_, 'scope>, slots: &[Slot<'scope, Blob<N>>], slot: Option<usize>) {
             let blob = m.alloc(Blob { _data: [0; N] });
             if let Some(i) = slot {
                 slots[i].set(m, Some(blob));
@@ -61,7 +61,7 @@ struct Paragc {
 }
 
 impl Paragc {
-    fn tree<'scope>(m: &Scope<'_, 'scope>, depth: u32) -> Gc<'scope, Node<'scope>> {
+    fn tree<'scope>(m: &Scope<'_, 'scope>, depth: u32) -> ScopeLocal<'scope, Node<'scope>> {
         let (left, right) = if depth > 1 { (Some(Self::tree(m, depth - 1)), Some(Self::tree(m, depth - 1))) } else { (None, None) };
         m.alloc(Node { left, right, value: depth.into() })
     }

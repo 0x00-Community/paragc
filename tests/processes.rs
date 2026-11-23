@@ -585,7 +585,7 @@ brand!(CardB = for<'scope> Card);
 #[derive(Trace)]
 struct Bead<'scope> {
     value: u64,
-    next: Option<paragc::Gc<'scope, Bead<'scope>>>,
+    next: Option<paragc::ScopeLocal<'scope, Bead<'scope>>>,
 }
 
 brand!(BeadB = for<'scope> Bead<'scope>);
