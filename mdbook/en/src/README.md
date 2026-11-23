@@ -15,6 +15,7 @@ shared memory: other processes map them, read and write their objects, and find 
 
 | Part | What it covers |
 | --- | --- |
+| Garbage collection | What a garbage collector is and the concepts every collector is built from; the first collectors (1960 onwards); the JVM's collectors; cppgc, V8's C++ heap; and how paragc descends from them |
 | Getting started | What paragc is, a first program, the handle types and why they carry brands |
 | The private heap | The in-process heap: layout, allocation, marking, sweeping, concurrent work, evacuation, young collections, reference counting, weak references |
 | Between heaps | Direct references from one private heap into another, and collecting cycles that span them |

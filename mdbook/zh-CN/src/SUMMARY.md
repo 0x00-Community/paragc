@@ -2,6 +2,14 @@
 
 [前言](README.md)
 
+# 垃圾回收
+
+- [什么是垃圾收集器](gc.md)
+- [最早的垃圾收集器](history.md)
+- [JVM 的收集器](jvm.md)
+- [cppgc：V8 的 C++ 堆](cppgc.md)
+- [从它们到 paragc](lineage.md)
+
 # 入门
 
 - [paragc 是什么](intro.md)

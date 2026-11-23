@@ -2,6 +2,14 @@
 
 [Preface](README.md)
 
+# Garbage collection
+
+- [What a garbage collector is](gc.md)
+- [The first garbage collectors](history.md)
+- [The JVM's collectors](jvm.md)
+- [cppgc: V8's C++ heap](cppgc.md)
+- [From there to paragc](lineage.md)
+
 # Getting started
 
 - [What paragc is](intro.md)
