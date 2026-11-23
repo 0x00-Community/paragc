@@ -1,16 +1,16 @@
 [workspace]
 members = [".", "macros"]
-# 对比基准依赖 V8 等大库，自成 workspace
+# The comparison benchmarks depend on large libraries such as V8, so they are a workspace of their own
 exclude = ["benches"]
 
 [workspace.package]
-version = "0.5.2"
+version = "0.6.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/0x00-Community/paragc"
 
 [workspace.dependencies]
-paragc-macros = { version = "0.5.2", path = "macros" }
+paragc-macros = { version = "0.6.0", path = "macros" }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
@@ -20,7 +20,7 @@ doc_markdown = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
-# 块与对象头的对齐由布局保证（块按 32 KiB 对齐、对象按 8 字节粒度）
+# Block and header alignment is guaranteed by the layout (blocks aligned to 32 KiB, objects to the 8-byte granule)
 cast_ptr_alignment = "allow"
 
 [package]
@@ -33,6 +33,13 @@ categories = ["memory-management"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[features]
+# Cross-heap (public heaps on shared memory, sharing across processes): Linux only; on other platforms the feature compiles to nothing
+crossheap = []
+
+[package.metadata.docs.rs]
+features = ["crossheap"]
 
 [dependencies]
 paragc-macros.workspace = true

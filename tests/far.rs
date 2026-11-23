@@ -1,14 +1,14 @@
-//! 跨堆直接引用 [`Far`]。逐条跑：`cargo test --test far -- --exact <名字>`
+//! Direct references across heaps: [`Far`]. Run one at a time: `cargo test --test far -- --exact <name>`
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use paragc::{Far, Gc, Heap, Root, Slot, Trace, Tracer, YoungEvacuation, brand};
 
-/// 每个堆的回收线程数（Miri 下减少）
+/// Collector threads per heap (fewer under Miri)
 const THREADS: NonZeroUsize = NonZeroUsize::new(if cfg!(miri) { 2 } else { 4 }).unwrap();
 
-/// 析构时计数（没有 Gc，可以有 Drop）。
+/// Counts on drop (no Gc, so it may have Drop).
 struct Counted(Arc<AtomicUsize>);
 
 impl Drop for Counted {
@@ -17,13 +17,13 @@ impl Drop for Counted {
     }
 }
 
-// SAFETY: 没有 Gc
+// SAFETY: no Gc
 unsafe impl Trace for Counted {
     const NO_EDGES: bool = true;
     fn trace(&self, _: &mut Tracer<'_>) {}
 }
 
-/// 被别的堆指着的对象
+/// An object pointed to from another heap
 #[derive(Trace)]
 struct Item {
     value: u64,
@@ -32,7 +32,7 @@ struct Item {
 
 brand!(ItemB = for<'gc> Item);
 
-/// 持有方堆里的对象：直接指着另一个堆的 Item
+/// An object in the holder heap: points directly at an Item in another heap
 #[derive(Trace)]
 struct Holder<'gc> {
     value: u64,
@@ -41,7 +41,7 @@ struct Holder<'gc> {
 
 brand!(HolderB = for<'gc> Holder<'gc>);
 
-/// 环上的一环：`out` 指向本堆的 Hop，Hop 经 Far 指向下一个堆的 Link（Far 建好后不变，所以要先建 Link 再补 Hop）
+/// One ring of the cycle: `out` points to this heap's Hop, and the Hop points through a Far to the next heap's Link (a Far is fixed once made, so make the Link first and then the Hop)
 #[derive(Trace)]
 struct Link<'gc> {
     heap: usize,
@@ -60,24 +60,24 @@ fn heaps(n: usize) -> Vec<Heap> {
     (0..n).map(|_| Heap::new(THREADS)).collect()
 }
 
-/// 建一个 Item，返回它的根。
+/// Make an Item and return its root.
 fn item(heap: &Heap, value: u64, drops: &Arc<AtomicUsize>) -> Root<ItemB> {
     heap.mutate(|m| m.root(m.alloc(Item { value, _counted: Counted(drops.clone()) })))
 }
 
-/// 在 `holder` 堆建一个 Holder，直接指着 `target` 堆里 `root` 的对象。
+/// Make a Holder in heap `holder`, pointing directly at the object of `root` in heap `target`.
 fn hold(holder: &Heap, target: &Heap, root: &Root<ItemB>, value: u64) -> Root<HolderB> {
     holder.mutate(|ma| target.mutate(|mb| ma.root(ma.alloc(Holder { value, far: Far::new(ma, mb, mb.get(root)) }))))
 }
 
-/// 经 Holder 的 Far 读目标 Item 的值。
+/// Read the target Item's value through the Holder's Far.
 fn far_value(holder: &Heap, target: &Heap, root: &Root<HolderB>) -> u64 {
     holder.mutate(|ma| target.mutate(|mb| ma.get(root).far.get(mb).value))
 }
 
 #[test]
 fn far_targets_are_pinned_during_evacuation() {
-    // 前四分之一的 Item 被 A 直接指着（不能搬），其余只有根（可以搬）。每 KEEP 个留一个，其余死掉 ⇒ 块都很稀疏、都是疏散候选
+    // The first quarter of the Items is pointed to directly from A (cannot move); the rest have only roots (can move). Keep one in KEEP and let the rest die ⇒ every block is sparse and an evacuation candidate
     const ITEMS: u64 = if cfg!(miri) { 5_600 } else { 40_000 };
     const KEEP: u64 = 40;
     let mut a = Heap::new(THREADS);
@@ -94,19 +94,19 @@ fn far_targets_are_pinned_during_evacuation() {
         kept
     });
     let held: Vec<(u64, Root<HolderB>)> = roots.iter().filter(|(v, _)| *v < ITEMS / 4).map(|(v, r)| (*v, hold(&a, &b, r, *v))).collect();
-    // 第一次：清扫后记下每块的存活量；第二次：挑稀疏块疏散
+    // First pass: the sweep records each block's live bytes; second pass: evacuate the sparse blocks
     b.collect();
     b.collect();
-    assert!(b.stats().evacuated_blocks > 0, "只有根的那些块应该被疏散");
+    assert!(b.stats().evacuated_blocks > 0, "the blocks with only roots should be evacuated");
     a.collect();
     b.mutate(|mb| {
         a.mutate(|ma| {
             for (value, h) in &held {
                 let via_far = ma.get(h).far.get(mb);
                 assert_eq!(via_far.value, *value);
-                let root = &roots.iter().find(|(v, _)| v == value).expect("同一个值").1;
-                // 根会跟着搬走的对象改地址；被 Far 指着的必须原地不动，两条路径是同一个对象
-                assert!(Gc::ptr_eq(mb.get(root), via_far), "被 Far 指着的对象被搬走了");
+                let root = &roots.iter().find(|(v, _)| v == value).expect("same value").1;
+                // Roots follow the objects that move; those pointed to by a Far must stay put, and both paths reach the same object
+                assert!(Gc::ptr_eq(mb.get(root), via_far), "an object pointed to by a Far was moved");
             }
         });
     });
@@ -125,15 +125,15 @@ fn far_keeps_target_until_holder_dies() {
     let target = item(&b, 7, &drops);
     let holder = hold(&a, &b, &target, 1);
     drop(target);
-    // 目标的根没了，但 A 里的 Far 还指着它：B 单独回收（完整、年轻）都不能收
+    // The target's root is gone but the Far in A still points at it: collecting B alone (full or young) must not reclaim it
     b.collect();
     b.collect_young();
     assert_eq!(drops.load(Ordering::Relaxed), 0);
     assert_eq!(far_value(&a, &b, &holder), 7);
-    // 持有方死了：A 回收时析构 Holder、还掉入口；之后 B 回收才收掉目标
+    // The holder dies: A's collection finalizes the Holder and returns the entry; only then does B's collection reclaim the target
     drop(holder);
     b.collect();
-    assert_eq!(drops.load(Ordering::Relaxed), 0, "A 还没清扫到 Holder，入口还在");
+    assert_eq!(drops.load(Ordering::Relaxed), 0, "A has not swept the Holder yet, the entry is still there");
     a.collect();
     b.collect();
     assert_eq!(drops.load(Ordering::Relaxed), 1);
@@ -141,7 +141,7 @@ fn far_keeps_target_until_holder_dies() {
 
 #[test]
 fn far_survives_holder_heap_drop_order() {
-    // 目标堆先析构：Holder 之后析构时还槽，根表靠 Arc 还在
+    // The target heap is dropped first: the Holder returns its slot when it is finalized later; the root table lives on through its Arc
     let a = Heap::new(THREADS);
     let b = Heap::new(THREADS);
     let drops = Arc::new(AtomicUsize::new(0));
@@ -149,12 +149,12 @@ fn far_survives_holder_heap_drop_order() {
     let holder = hold(&a, &b, &target, 1);
     drop(target);
     drop(b);
-    assert_eq!(drops.load(Ordering::Relaxed), 1, "目标堆析构时全部对象析构");
+    assert_eq!(drops.load(Ordering::Relaxed), 1, "dropping the target heap finalizes all its objects");
     drop(holder);
     drop(a);
 }
 
-/// 建一个环：`heaps` 里依次每个堆一个 Link，第 i 个经 Hop 直接指向第 i+1 个，最后一个指回第一个。返回第一个 Link 的根。
+/// Make a cycle: one Link per heap in `heaps`, the i-th pointing through a Hop directly at the (i+1)-th, the last back to the first. Returns the root of the first Link.
 fn ring(heaps: &[Heap], drops: &Arc<AtomicUsize>) -> Root<LinkB> {
     let links: Vec<Root<LinkB>> = heaps.iter().enumerate().map(|(i, h)| h.mutate(|m| m.root(m.alloc(Link { heap: i, _counted: Counted(drops.clone()), out: Slot::default() })))).collect();
     for i in 0..heaps.len() {
@@ -166,10 +166,10 @@ fn ring(heaps: &[Heap], drops: &Arc<AtomicUsize>) -> Root<LinkB> {
             });
         });
     }
-    links.into_iter().next().expect("至少一个堆")
+    links.into_iter().next().expect("at least one heap")
 }
 
-/// 从第一个 Link 出发沿环走一圈，返回经过的堆号。
+/// Walk once around the cycle from the first Link and return the heap ids passed.
 fn walk(heaps: &[Heap], first: &Root<LinkB>) -> Vec<usize> {
     fn step<'a>(heaps: &[Heap], at: usize, link: Gc<'a, Link<'a>>, seen: &mut Vec<usize>) {
         seen.push(link.heap);
@@ -177,7 +177,7 @@ fn walk(heaps: &[Heap], first: &Root<LinkB>) -> Vec<usize> {
         if next == 0 {
             return;
         }
-        let hop = link.out.get().expect("环已连好");
+        let hop = link.out.get().expect("the cycle is linked");
         heaps[next].mutate(|mb| step(heaps, next, hop.far.get(mb), seen));
     }
     let mut seen = Vec::new();
@@ -192,7 +192,7 @@ fn cross_heap_cycle_needs_group_collection() {
     let first = ring(&hs, &drops);
     assert_eq!(walk(&hs, &first), [0, 1]);
     drop(first);
-    // 各自回收：彼此的入口都是根，收不掉
+    // Collected one by one: each other's entries are roots, nothing is reclaimed
     for _ in 0..2 {
         for h in &mut hs {
             h.collect();
@@ -202,7 +202,7 @@ fn cross_heap_cycle_needs_group_collection() {
     let mut group: Vec<&mut Heap> = hs.iter_mut().collect();
     Heap::collect_group(&mut group);
     assert_eq!(drops.load(Ordering::Relaxed), 2);
-    // 被清空的入口与之后析构的 Far 都不碰已回收的对象
+    // Cleared entries and Fars finalized later never touch reclaimed objects
     for h in &mut hs {
         h.collect();
     }
@@ -215,10 +215,10 @@ fn rings_over_eight_heaps() {
     let mut hs = heaps(8);
     let drops = Arc::new(AtomicUsize::new(0));
     let rings: Vec<Root<LinkB>> = (0..RINGS).map(|_| ring(&hs, &drops)).collect();
-    // 留一半
+    // Keep half
     let kept: Vec<Root<LinkB>> = rings.into_iter().step_by(2).collect();
     let dead = (RINGS - kept.len()) * hs.len();
-    // 只把前 4 个堆放进一组：环跨 8 个堆，组外持有的入口是根 ⇒ 一个都不收
+    // Put only the first 4 heaps in a group: the cycle spans 8 heaps and entries held from outside the group are roots ⇒ nothing is reclaimed
     {
         let mut group: Vec<&mut Heap> = hs.iter_mut().take(4).collect();
         Heap::collect_group(&mut group);
@@ -230,7 +230,7 @@ fn rings_over_eight_heaps() {
     for first in &kept {
         assert_eq!(walk(&hs, first), (0..8).collect::<Vec<_>>());
     }
-    // 留下的环在单独回收、年轻回收、再一起回收之后依然完整
+    // The kept cycles stay intact through single, young and further group collections
     for h in &mut hs {
         h.collect();
         h.collect_young();
@@ -246,7 +246,7 @@ fn rings_over_eight_heaps() {
     assert_eq!(drops.load(Ordering::Relaxed), RINGS * 8);
 }
 
-/// 每个堆一块板：一排槽，每个槽放一个 Holder（直接指着别的堆的 Item）
+/// One board per heap: a row of slots, each holding a Holder (pointing directly at an Item in another heap)
 #[derive(Trace)]
 struct Board<'gc> {
     cells: Vec<Slot<'gc, Holder<'gc>>>,
@@ -254,7 +254,7 @@ struct Board<'gc> {
 
 brand!(BoardB = for<'gc> Board<'gc>);
 
-/// 简单的线性同余随机数（测试可复现）
+/// A simple linear congruential generator (reproducible tests)
 struct Rng(u64);
 
 impl Rng {
@@ -284,7 +284,7 @@ fn eight_threads_relink_far_holders() {
                         let i = rng.below(HEAPS);
                         let j = (i + 1 + rng.below(HEAPS - 1)) % HEAPS;
                         let cell = rng.below(CELLS);
-                        // Holder 的值 = Item 的值：读回来对得上说明 Far 指着的还是原来那个对象
+                        // Holder value = Item value: reading it back proves the Far still points at the original object
                         let value = ((round * HEAPS + t) * STEPS + step) as u64;
                         hs[i].mutate(|ma| {
                             hs[j].mutate(|mb| {
@@ -294,18 +294,18 @@ fn eight_threads_relink_far_holders() {
                                 ma.get(&boards[i]).cells[cell].set(ma, Some(h));
                             });
                         });
-                        // 顺手读一个别处的格子
+                        // Read a cell somewhere else on the way
                         let (k, c) = (rng.below(HEAPS), rng.below(CELLS));
                         hs[k].mutate(|mk| {
                             if let Some(h) = mk.get(&boards[k]).cells[c].get() {
-                                let (_, target) = hs.iter().enumerate().find(|&(x, heap)| x != k && h.far.points_into(heap)).expect("Far 指着某个别的堆");
+                                let (_, target) = hs.iter().enumerate().find(|&(x, heap)| x != k && h.far.points_into(heap)).expect("the Far points at some other heap");
                                 target.mutate(|mt| assert_eq!(h.far.get(mt).value, h.value));
                             }
                         });
                     }
                 });
             }
-            // 并发标记与清扫和 mutator 一起跑（标记期间新建的 Far 也要保住目标）
+            // Concurrent marking and sweeping run alongside mutators (Fars made during marking must keep their targets too)
             s.spawn(|| {
                 for h in &hs {
                     h.mark_concurrently();
@@ -322,14 +322,14 @@ fn eight_threads_relink_far_holders() {
         }
     }
     drop(boards);
-    // 板没了：持有方先回收（析构 Holder、还入口），再一起回收一次收尾
+    // The boards are gone: the holders collect first (finalizing Holders and returning entries), then one group collection finishes up
     hs.iter_mut().for_each(Heap::collect);
     let mut group: Vec<&mut Heap> = hs.iter_mut().collect();
     Heap::collect_group(&mut group);
-    assert_eq!(drops.load(Ordering::Relaxed), made.load(Ordering::Relaxed), "所有 Item 都应该被回收（没有漏掉的入口）");
+    assert_eq!(drops.load(Ordering::Relaxed), made.load(Ordering::Relaxed), "every Item should be reclaimed (no entry leaked)");
 }
 
-/// 年轻疏散（`Full`）也不搬别的堆经 Far 直接指着的年轻对象；只有根的照常搬走。
+/// Young evacuation (`Full`) does not move young objects pointed to directly through a Far from another heap either; those with only roots move as usual.
 #[test]
 fn far_targets_are_pinned_during_young_evacuation() {
     const ITEMS: u64 = if cfg!(miri) { 400 } else { 4_000 };
@@ -344,10 +344,10 @@ fn far_targets_are_pinned_during_young_evacuation() {
     let after: Vec<usize> = b.mutate(|m| roots.iter().map(|(_, r)| m.get(r).as_ptr().addr()).collect());
     for ((value, _), (x, y)) in roots.iter().zip(before.iter().zip(&after)) {
         if value % 2 == 0 {
-            assert_eq!(x, y, "被 Far 指着的年轻对象被搬走了");
+            assert_eq!(x, y, "a young object pointed to by a Far was moved");
         }
     }
-    assert!(roots.iter().zip(before.iter().zip(&after)).any(|((v, _), (x, y))| v % 2 == 1 && x != y), "只有根的年轻对象应该被搬走");
+    assert!(roots.iter().zip(before.iter().zip(&after)).any(|((v, _), (x, y))| v % 2 == 1 && x != y), "young objects with only roots should move");
     for (value, h) in &held {
         assert_eq!(far_value(&a, &b, h), *value);
     }

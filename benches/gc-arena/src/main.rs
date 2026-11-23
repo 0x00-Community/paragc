@@ -1,4 +1,4 @@
-//! gc-arena：单线程、增量标记，只有串行；线程数参数必须是 1。
+//! gc-arena: single-threaded, incremental marking, serial only; the thread count argument must be 1.
 
 use bench_common::{Args, Bench, Clock, Took, GcBench, LONG_LIVED_DEPTH, PAUSE_DEPTH, STRETCH_DEPTH, Tree};
 use gc_arena::{Arena, Collect, Gc, Mutation, Rootable};
@@ -81,6 +81,6 @@ impl Bench for GcArena {
 
 fn main() {
     let args = Args::parse();
-    assert_eq!(args.threads.get(), 1, "gc-arena 只有串行");
+    assert_eq!(args.threads.get(), 1, "gc-arena is serial only");
     args.report(&GcArena);
 }

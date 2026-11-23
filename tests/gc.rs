@@ -1,4 +1,4 @@
-//! 逐条跑：`cargo test --test gc -- --exact <名字>`
+//! Run one at a time: `cargo test --test gc -- --exact <name>`
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,7 +13,7 @@ struct Node<'gc> {
 
 brand!(NodeB = for<'gc> Node<'gc>);
 
-/// 析构时计数（没有 Gc，可以有 Drop）。
+/// Counts on drop (no Gc, so it may have Drop).
 struct Counted(Arc<AtomicUsize>);
 
 impl Drop for Counted {
@@ -22,7 +22,7 @@ impl Drop for Counted {
     }
 }
 
-// SAFETY: 没有 Gc
+// SAFETY: no Gc
 unsafe impl Trace for Counted {
     const NO_EDGES: bool = true;
     fn trace(&self, _: &mut Tracer<'_>) {}
@@ -36,9 +36,9 @@ enum Tree<'gc> {
 
 brand!(TreeB = for<'gc> Tree<'gc>);
 
-/// 每个堆的回收线程数；Miri 下空闲工人的退避自旋很费解释时间，减到 2（仍有并行标记与线程池）
+/// Collector threads per heap; under Miri the idle workers' backoff spinning costs a lot of interpretation time, so 2 (still parallel marking and a thread pool)
 const THREADS: NonZeroUsize = NonZeroUsize::new(if cfg!(miri) { 2 } else { 4 }).unwrap();
-/// Miri 下缩小规模（单条仍要在 15 s 内）
+/// Smaller sizes under Miri (each test must still finish within 15 s)
 const LIST_LEN: u64 = if cfg!(miri) { 200 } else { 20_000 };
 
 fn build_list(heap: &Heap, len: u64) -> Root<NodeB> {
@@ -67,7 +67,7 @@ fn sum_list(heap: &Heap, root: &Root<NodeB>) -> u64 {
 fn rooted_list_survives() {
     let mut heap = Heap::new(THREADS);
     let root = build_list(&heap, LIST_LEN);
-    // 垃圾：不挂根
+    // Garbage: not rooted
     heap.mutate(|m| {
         for value in 0..LIST_LEN {
             m.alloc(Node { value, next: None });
@@ -131,11 +131,11 @@ fn blocks_are_reused() {
     for round in 0..ROUNDS {
         drop(build_list(&heap, LIST_LEN));
         heap.collect();
-        // 第二轮之后块数不再增长：死掉的列表腾出的行被复用
+        // From the second round on the block count stops growing: lines freed by dead lists are reused
         if round == 1 {
             peak = heap.stats().blocks;
         }
-        assert!(round <= 1 || heap.stats().blocks <= peak, "第 {round} 轮块数 {} > {peak}", heap.stats().blocks);
+        assert!(round <= 1 || heap.stats().blocks <= peak, "round {round}: {} blocks > {peak}", heap.stats().blocks);
     }
     assert_eq!(sum_list(&heap, &root), LIST_LEN * (LIST_LEN - 1) / 2);
 }
@@ -143,9 +143,9 @@ fn blocks_are_reused() {
 #[test]
 #[allow(clippy::large_stack_arrays)]
 fn large_objects() {
-    /// 单独 mmap 的那档（≥ 64 KiB）
+    /// The size class with its own mmap (≥ 64 KiB)
     const BIG: usize = 64 * 1024;
-    /// 走全局分配器的那档（半块到 64 KiB）
+    /// The size class using the global allocator (half a block up to 64 KiB)
     const MID: usize = 20 * 1024;
     let mut heap = Heap::new(THREADS);
     let root: Root<TreeB> = heap.mutate(|m| {
@@ -162,18 +162,18 @@ fn large_objects() {
     drop(root);
 }
 
-/// 交叉测试的链节点：带计数标签；链头挂着别的堆上一条链的根；隔几个挂一个大对象（回指本链，成环）。
+/// A chain node of the cross test: carries a counted tag; the chain head holds the root of a chain on another heap; every few nodes hold a large object (pointing back into the chain, forming a cycle).
 #[derive(Trace)]
 struct Item<'gc> {
     value: u64,
     next: Option<Gc<'gc, Item<'gc>>>,
-    /// (堆号, 根)：别的堆上的链，随本对象析构而释放
+    /// (heap id, root): a chain on another heap, released when this object is finalized
     guest: Option<(usize, Root<ItemB>)>,
     ballast: Option<Gc<'gc, Ballast<'gc>>>,
     tag: Counted,
 }
 
-/// 大对象（超过半块单独分配），回指挂着它的节点（成环）。
+/// A large object (above half a block, allocated on its own), pointing back at the node holding it (a cycle).
 #[derive(Trace)]
 struct Ballast<'gc> {
     words: [u64; BALLAST_WORDS],
@@ -183,16 +183,16 @@ struct Ballast<'gc> {
 brand!(ItemB = for<'gc> Item<'gc>);
 
 const BALLAST_WORDS: usize = 2100;
-/// Miri 下 8 × 8 超出单条 15 s，缩到 4 × 4
+/// Under Miri 8 × 8 takes more than 15 s per test, so 4 × 4
 const HEAPS: usize = if cfg!(miri) { 4 } else { 8 };
 const WORKERS: usize = HEAPS;
 const ITEMS: u64 = if cfg!(miri) { 6 } else { 4_000 };
-/// Miri 下也要保证每个堆每轮至少 16 个大对象（够开 2 个标记工人）
+/// Even under Miri, each heap gets at least 16 large objects per round (enough for 2 marking workers)
 const BALLAST_EVERY: u64 = if cfg!(miri) { 2 } else { 10 };
 const CROSS_ROUNDS: usize = if cfg!(miri) { 1 } else { 8 };
 const ITEMS_SUM: u64 = ITEMS * (ITEMS - 1) / 2;
 
-/// 造了几个标签、析构了几个。
+/// Tags made and tags finalized.
 #[derive(Default)]
 struct Ledger {
     made: AtomicUsize,
@@ -205,8 +205,8 @@ impl Ledger {
         Counted(self.dropped.clone())
     }
 
-    /// 在第 `h` 个堆上造一条链，链头带着 `guest`。
-    #[allow(clippy::large_stack_arrays, reason = "大对象就是要超过半块")]
+    /// Make a chain on heap `h` whose head carries `guest`.
+    #[allow(clippy::large_stack_arrays, reason = "a large object has to exceed half a block")]
     fn build(&self, heaps: &[Heap], h: usize, guest: Option<(usize, Root<ItemB>)>) -> Root<ItemB> {
         heaps[h].mutate(|m| {
             let mut guest = guest;
@@ -225,7 +225,7 @@ impl Ledger {
     }
 }
 
-/// 检查一条链完整；`depth > 0` 时连同链头挂着的别的堆上的链（每条链本身也都单独查，所以只往下一层）。
+/// Check that a chain is intact; with `depth > 0` also the chain on another heap held by the chain head (every chain is also checked on its own, so only one level down).
 fn check(heaps: &[Heap], h: usize, root: &Root<ItemB>, depth: usize) {
     heaps[h].mutate(|m| {
         let mut sum = 0;
@@ -233,8 +233,8 @@ fn check(heaps: &[Heap], h: usize, root: &Root<ItemB>, depth: usize) {
         while let Some(n) = cur {
             sum += n.value;
             if let Some(b) = n.ballast {
-                assert!(b.words[0] == n.value && b.words[BALLAST_WORDS - 1] == n.value, "大对象内容坏了");
-                assert!(b.owner.get().is_some_and(|o| Gc::ptr_eq(o, n)), "大对象回指坏了");
+                assert!(b.words[0] == n.value && b.words[BALLAST_WORDS - 1] == n.value, "the large object's contents are corrupted");
+                assert!(b.owner.get().is_some_and(|o| Gc::ptr_eq(o, n)), "the large object's back pointer is corrupted");
             }
             if let Some((g, guest)) = &n.guest
                 && depth > 0
@@ -243,15 +243,15 @@ fn check(heaps: &[Heap], h: usize, root: &Root<ItemB>, depth: usize) {
             }
             cur = n.next;
         }
-        assert_eq!(sum, ITEMS_SUM, "堆 {h} 上的链坏了");
+        assert_eq!(sum, ITEMS_SUM, "the chain on heap {h} is corrupted");
     });
 }
 
-/// 全部堆并行回收（每个堆一个线程），同时另一个线程释放 `dropping` 里的根。
+/// Collect all heaps in parallel (one thread per heap) while another thread releases the roots in `dropping`.
 fn collect_all<T: Send>(heaps: &mut [Heap], dropping: Vec<T>) {
     std::thread::scope(|s| {
         s.spawn(move || {
-            // 倒着、隔一个地释放，打乱次序
+            // Release every other one, backwards, to shuffle the order
             let (odd, even): (Vec<_>, Vec<_>) = dropping.into_iter().rev().enumerate().partition(|(i, _)| i % 2 == 1);
             drop(odd);
             drop(even);
@@ -262,15 +262,15 @@ fn collect_all<T: Send>(heaps: &mut [Heap], dropping: Vec<T>) {
     });
 }
 
-/// 8 线程 × 8 堆：每个线程轮流在每个堆上造链、链头挂着自己在上一个堆的链的根（跨堆持有）；
-/// 造好的根交给另一个线程检查，一半当场释放（跨线程释放），一半留到下一轮、在全部堆并行回收的同时由另一个线程释放。
+/// 8 threads × 8 heaps: each thread makes chains on every heap in turn, each chain head holding the root of its own chain on the previous heap (cross-heap holding);
+/// the finished roots go to another thread to check; half are released on the spot (released across threads), half kept until the next round and released by another thread while all heaps collect in parallel.
 #[test]
 fn eight_threads_eight_heaps_crossed() {
     let ledger = Ledger::default();
     let mut heaps: Vec<Heap> = (0..HEAPS).map(|_| Heap::new(THREADS)).collect();
     let mut kept_prev: Vec<(usize, Root<ItemB>)> = Vec::new();
     for round in 0..CROSS_ROUNDS {
-        // 造：线程 t 依次在堆 (t + k + round) % HEAPS 上造链
+        // Make: thread t makes chains on heap (t + k + round) % HEAPS in turn
         let made: Vec<Vec<(usize, Root<ItemB>)>> = std::thread::scope(|s| {
             let (heaps, ledger) = (&heaps, &ledger);
             let handles: Vec<_> = (0..WORKERS)
@@ -288,9 +288,9 @@ fn eight_threads_eight_heaps_crossed() {
                     })
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().expect("造链的线程 panic")).collect()
+            handles.into_iter().map(|h| h.join().expect("a chain-making thread panicked")).collect()
         });
-        // 查：线程 t 检查线程 t + 1 造的链，一半当场释放
+        // Check: thread t checks the chains made by thread t + 1 and releases half on the spot
         let kept_now: Vec<(usize, Root<ItemB>)> = std::thread::scope(|s| {
             let heaps = &heaps;
             let mut made = made;
@@ -310,16 +310,16 @@ fn eight_threads_eight_heaps_crossed() {
                     })
                 })
                 .collect();
-            handles.into_iter().flat_map(|h| h.join().expect("检查的线程 panic")).collect()
+            handles.into_iter().flat_map(|h| h.join().expect("a checking thread panicked")).collect()
         });
-        // 回收全部堆，同时释放上一轮留下的
+        // Collect all heaps while releasing what the previous round kept
         collect_all(&mut heaps, std::mem::take(&mut kept_prev));
         for (h, root) in &kept_now {
             check(&heaps, *h, root, 1);
         }
         kept_prev = kept_now;
     }
-    // 全部释放后反复回收：跨堆的根要等持有它的对象被回收才释放，最多传 HEAPS 层
+    // Collect repeatedly after releasing everything: a cross-heap root is released only when the object holding it is collected, at most HEAPS levels deep
     collect_all(&mut heaps, kept_prev);
     for _ in 0..=HEAPS {
         if ledger.dropped.load(Ordering::Relaxed) == ledger.made.load(Ordering::Relaxed) {
@@ -327,11 +327,11 @@ fn eight_threads_eight_heaps_crossed() {
         }
         collect_all(&mut heaps, Vec::<()>::new());
     }
-    assert_eq!(ledger.dropped.load(Ordering::Relaxed), ledger.made.load(Ordering::Relaxed), "有对象没被回收");
-    assert!(heaps.iter().all(|h| h.stats().live == 0 && h.stats().large == 0), "堆里还有存活对象");
+    assert_eq!(ledger.dropped.load(Ordering::Relaxed), ledger.made.load(Ordering::Relaxed), "some objects were not collected");
+    assert!(heaps.iter().all(|h| h.stats().live == 0 && h.stats().large == 0), "the heaps still hold live objects");
 }
 
-/// 深树测试的节点：两个可改的孩子，带析构计数。
+/// A node of the deep tree test: two mutable children, with a drop counter.
 #[derive(Trace)]
 struct Bin<'gc> {
     left: Slot<'gc, Bin<'gc>>,
@@ -342,7 +342,7 @@ struct Bin<'gc> {
 brand!(BinB = for<'gc> Bin<'gc>);
 
 impl Bin<'_> {
-    /// 从 `self` 出发可达的节点数（显式栈，不递归）。
+    /// Nodes reachable from `self` (explicit stack, no recursion).
     fn count(&self) -> usize {
         let mut stack = vec![self];
         let mut n = 0;
@@ -355,7 +355,7 @@ impl Bin<'_> {
     }
 }
 
-/// 满二叉树（`depth` 层，2^depth − 1 个节点），自底向上逐层造。
+/// A full binary tree (`depth` levels, 2^depth − 1 nodes), built bottom up level by level.
 fn build_tree(heap: &Heap, drops: &Arc<AtomicUsize>, depth: u32) -> Root<BinB> {
     heap.mutate(|m| {
         let tag = || Counted(drops.clone());
@@ -378,7 +378,7 @@ fn deep_binary_tree() {
     heap.collect();
     assert_eq!(drops.load(Ordering::Relaxed), 0);
     assert_eq!(heap.mutate(|m| m.get(&root).count()), ALL);
-    // 剪掉右子树：恰好 2^(DEPTH-1) − 1 个节点析构
+    // Prune the right subtree: exactly 2^(DEPTH-1) − 1 nodes are finalized
     heap.mutate(|m| m.get(&root).right.set(m, None));
     heap.collect();
     assert_eq!(drops.load(Ordering::Relaxed), HALF);
@@ -403,11 +403,11 @@ fn deep_chain() {
     });
     heap.collect();
     assert_eq!(heap.mutate(|m| m.get(&root).count()), LEN);
-    // 从中间剪断：后一半析构
+    // Cut in the middle: the second half is finalized
     heap.mutate(|m| {
         let mut cur = m.get(&root);
         for _ in 1..LEN / 2 {
-            cur = cur.left.get().expect("链够长");
+            cur = cur.left.get().expect("the chain is long enough");
         }
         cur.left.set(m, None);
     });
@@ -419,30 +419,30 @@ fn deep_chain() {
     assert_eq!(drops.load(Ordering::Relaxed), LEN);
 }
 
-/// 交叉深树的节点：树节点用两个孩子，链节点只用 left；树叶带着别的堆上深链中某个节点的根。
+/// A node of the cross deep tree: tree nodes use both children, chain nodes only left; tree leaves hold the root of a node in a deep chain on another heap.
 #[derive(Trace)]
 struct XNode<'gc> {
     left: Slot<'gc, XNode<'gc>>,
     right: Slot<'gc, XNode<'gc>>,
-    /// (堆号, 根)：别的堆上深链里的一个节点
+    /// (heap id, root): a node in a deep chain on another heap
     guest: Option<(usize, Root<XB>)>,
     tag: Counted,
 }
 
 brand!(XB = for<'gc> XNode<'gc>);
 
-/// 每个堆一棵满二叉树的层数
+/// Levels of the full binary tree on each heap
 const X_DEPTH: u32 = if cfg!(miri) { 4 } else { 15 };
 const X_LEAVES: usize = 1 << (X_DEPTH - 1);
 const X_TREE: usize = (1 << X_DEPTH) - 1;
-/// 树叶依次锚在深链的 X_OFFSET、X_OFFSET + X_STEP、… 处
+/// Leaves anchor at X_OFFSET, X_OFFSET + X_STEP, … in the deep chain
 const X_OFFSET: usize = if cfg!(miri) { 3 } else { 1000 };
 const X_STEP: usize = if cfg!(miri) { 1 } else { 4 };
-/// 每个堆一条深链的长度
+/// Length of the deep chain on each heap
 const X_CHAIN: usize = X_OFFSET + X_LEAVES * X_STEP;
 
 impl XNode<'_> {
-    /// 从这里可达的本堆节点数（不跨堆，显式栈）。
+    /// Nodes of this heap reachable from here (not crossing heaps, explicit stack).
     fn reach(&self) -> usize {
         let mut stack = vec![self];
         let mut n = 0;
@@ -456,7 +456,7 @@ impl XNode<'_> {
 }
 
 impl Ledger {
-    /// 第 `h` 个堆上一条 X_CHAIN 长的深链。
+    /// A deep chain of length X_CHAIN on heap `h`.
     fn x_chain(&self, heap: &Heap) -> Root<XB> {
         heap.mutate(|m| {
             let mut top: Option<Gc<'_, XNode<'_>>> = None;
@@ -467,7 +467,7 @@ impl Ledger {
         })
     }
 
-    /// 在 `heap` 上造满二叉树，第 i 片叶子带 `guests[i]`。
+    /// Build a full binary tree on `heap` whose i-th leaf carries `guests[i]`.
     fn x_tree(&self, heap: &Heap, guests: Vec<(usize, Root<XB>)>) -> Root<XB> {
         heap.mutate(|m| {
             let mut guests = guests.into_iter();
@@ -485,7 +485,7 @@ impl Ledger {
     }
 }
 
-/// 第 `h` 个堆深链上锚点的根（第 i 个在深度 X_OFFSET + i·X_STEP）。
+/// Roots of the anchors in the deep chain of heap `h` (the i-th at depth X_OFFSET + i·X_STEP).
 fn x_anchors(heap: &Heap, h: usize, chain: &Root<XB>) -> Vec<(usize, Root<XB>)> {
     heap.mutate(|m| {
         let mut out = Vec::with_capacity(X_LEAVES);
@@ -502,32 +502,32 @@ fn x_anchors(heap: &Heap, h: usize, chain: &Root<XB>) -> Vec<(usize, Root<XB>)> 
     })
 }
 
-/// 树 `h` 最左（或最右）那片叶子锚着的深链，从锚点往下还有多长；树和链在不同的堆，嵌套 mutate。
+/// How long the deep chain anchored by the leftmost (or rightmost) leaf of tree `h` is from the anchor down; tree and chain are on different heaps, so the mutates nest.
 fn x_edge_reach(heaps: &[Heap], h: usize, tree: &Root<XB>, leftmost: bool) -> usize {
     heaps[h].mutate(|m| {
         let mut cur = m.get(tree);
         while let Some(next) = if leftmost { cur.left.get().or(cur.right.get()) } else { cur.right.get().or(cur.left.get()) } {
             cur = next;
         }
-        let (g, root) = cur.guest.as_ref().expect("叶子都带锚");
+        let (g, root) = cur.guest.as_ref().expect("every leaf carries an anchor");
         heaps[*g].mutate(|gm| gm.get(root).reach())
     })
 }
 
-/// 8 线程 × 8 堆的交叉深树：每个堆一条深链 + 一棵满二叉树，树叶锚在下一个堆的深链上（跨堆持有）；
-/// 链根、剪枝、树根都由别的线程在别的时刻释放，全部堆并行回收；每一步核对析构数恰好等于理论值。
+/// Cross deep trees with 8 threads × 8 heaps: each heap has a deep chain + a full binary tree whose leaves anchor in the next heap's deep chain (cross-heap holding);
+/// chain roots, pruning and tree roots are released by other threads at other times while all heaps collect in parallel; every step checks that the finalized count is exactly as predicted.
 #[test]
 fn crossed_deep_trees() {
     let ledger = Ledger::default();
     let dropped = || ledger.dropped.load(Ordering::Relaxed);
     let mut heaps: Vec<Heap> = (0..HEAPS).map(|_| Heap::new(THREADS)).collect();
-    // 1. 每个线程在自己的堆上造深链
+    // 1. Each thread makes a deep chain on its own heap
     let chains: Vec<Root<XB>> = std::thread::scope(|s| {
         let (heaps, ledger) = (&heaps, &ledger);
         let hs: Vec<_> = (0..WORKERS).map(|t| s.spawn(move || ledger.x_chain(&heaps[t]))).collect();
-        hs.into_iter().map(|h| h.join().expect("造链 panic")).collect()
+        hs.into_iter().map(|h| h.join().expect("making a chain panicked")).collect()
     });
-    // 2. 线程 t 在下一个堆的深链上取锚点（那个堆同时正被它的线程造树），在自己的堆上造树
+    // 2. Thread t takes anchors in the next heap's deep chain (while that heap's thread builds its tree) and builds a tree on its own heap
     let trees: Vec<Root<XB>> = std::thread::scope(|s| {
         let (heaps, ledger, chains) = (&heaps, &ledger, &chains);
         let hs: Vec<_> = (0..WORKERS)
@@ -538,10 +538,10 @@ fn crossed_deep_trees() {
                 })
             })
             .collect();
-        hs.into_iter().map(|h| h.join().expect("造树 panic")).collect()
+        hs.into_iter().map(|h| h.join().expect("building a tree panicked")).collect()
     });
     assert_eq!(dropped(), 0);
-    // 3. 链根交给另一个线程释放，同时全部堆并行回收；链头到第一个锚点之前的 X_OFFSET 个节点死掉
+    // 3. Chain roots go to another thread to release while all heaps collect in parallel; the X_OFFSET nodes from the chain head to the first anchor die
     collect_all(&mut heaps, chains);
     collect_all(&mut heaps, Vec::<()>::new());
     assert_eq!(dropped(), HEAPS * X_OFFSET);
@@ -550,8 +550,8 @@ fn crossed_deep_trees() {
         assert_eq!(x_edge_reach(&heaps, h, tree, true), X_CHAIN - X_OFFSET);
         assert_eq!(x_edge_reach(&heaps, h, tree, false), X_CHAIN - X_OFFSET - (X_LEAVES - 1) * X_STEP);
     }
-    // 4. 线程 t 剪掉堆 (t + 2) 那棵树的左半边：左子树死掉，它的叶子带的锚随之释放，
-    //    下一个堆深链上前一半锚点之间的节点再下一轮死掉
+    // 4. Thread t prunes the left half of heap (t + 2)'s tree: the left subtree dies and the anchors its leaves carry are released with it,
+    //    so the nodes between the first half of the anchors in the next heap's deep chain die a round later
     std::thread::scope(|s| {
         let (heaps, trees) = (&heaps, &trees);
         for t in 0..WORKERS {
@@ -568,23 +568,23 @@ fn crossed_deep_trees() {
         assert_eq!(heaps[h].mutate(|m| m.get(tree).reach()), X_TREE - X_TREE / 2);
         assert_eq!(x_edge_reach(&heaps, h, tree, true), X_CHAIN - X_OFFSET - X_LEAVES / 2 * X_STEP);
     }
-    // 5. 树根交给另一个线程、在第一轮回收的同时释放：释放可能晚于那个堆的标记，树要到第二轮才死；
-    //    树死时锚才释放，链要到第三轮才死
+    // 5. Tree roots go to another thread and are released during the first round of collection: the release may come after that heap's marking, so the tree dies only in the second round;
+    //    the anchors are released only when the tree dies, so the chains die only in the third round
     collect_all(&mut heaps, trees);
     collect_all(&mut heaps, Vec::<()>::new());
     collect_all(&mut heaps, Vec::<()>::new());
     assert_eq!(dropped(), ledger.made.load(Ordering::Relaxed));
-    assert!(heaps.iter().all(|h| h.stats().live == 0), "堆里还有存活对象");
+    assert!(heaps.iter().all(|h| h.stats().live == 0), "the heaps still hold live objects");
 }
 
-/// 并发标记测试的节点：链上的下一个是可改的槽。
+/// A node of the concurrent marking test: the next one in the chain is a mutable slot.
 #[derive(Trace)]
 struct Link<'gc> {
     next: Slot<'gc, Link<'gc>>,
     tag: Counted,
 }
 
-/// 一排槽，每个槽挂一条链。
+/// A row of slots, each holding a chain.
 #[derive(Trace)]
 struct Board<'gc> {
     cells: Vec<Slot<'gc, Link<'gc>>>,
@@ -592,15 +592,15 @@ struct Board<'gc> {
 
 brand!(BoardB = for<'gc> Board<'gc>);
 
-/// 槽数是 MOVERS 的倍数（每个线程分到同样多的槽）
+/// The slot count is a multiple of MOVERS (every thread gets as many slots)
 const CELLS: usize = if cfg!(miri) { 4 } else { 16 };
 const MOVERS: usize = if cfg!(miri) { 2 } else { 4 };
-/// 每个 mutator 每轮做几次 mutate、每次做几步
+/// Mutates per mutator per round, and steps per mutate
 const MUTATES: usize = if cfg!(miri) { 6 } else { 400 };
 const STEPS: usize = if cfg!(miri) { 4 } else { 32 };
 const MARK_ROUNDS: usize = if cfg!(miri) { 2 } else { 6 };
 
-/// 每个线程自己的伪随机数（xorshift）。
+/// Each thread's own pseudo-random numbers (xorshift).
 struct Rng(u64);
 
 impl Rng {
@@ -608,24 +608,24 @@ impl Rng {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
-        usize::try_from(self.0 % u64::try_from(n).expect("n 不大")).expect("比 n 小")
+        usize::try_from(self.0 % u64::try_from(n).expect("n is small")).expect("less than n")
     }
 }
 
-/// 造了几个、扔了几个（扔 = 从链上摘下来不再挂回去）。
+/// Made and discarded (discarded = taken off a chain and never hung back).
 #[derive(Default)]
 struct Moves {
     ledger: Ledger,
     discarded: AtomicUsize,
-    /// 落在并发标记期间的 mutate 次数（确认真的和标记重叠了）
+    /// Mutates that fell within concurrent marking (confirming they really overlapped marking)
     overlapped: AtomicUsize,
-    /// 落在并发清扫期间的 mutate 次数
+    /// Mutates that fell within concurrent sweeping
     overlapped_sweep: AtomicUsize,
 }
 
 impl Moves {
-    /// 一步：随机地 挪（从自己的槽摘下链头、在栈上拿着、再挂到任意槽）/ 新建 / 扔。
-    /// 槽 i 只归线程 i % MOVERS 摘（多生产者单消费者的 Treiber 栈没有 ABA），挂谁都能挂。
+    /// One step, chosen at random: move (take a chain head off its own slot, hold it on the stack, hang it on any slot) / make / discard.
+    /// Slot i is taken from only by thread i % MOVERS (a multi-producer single-consumer Treiber stack has no ABA); anyone can hang onto it.
     fn step<'gc>(&self, m: &paragc::Mutator<'gc>, board: &Board<'gc>, me: usize, rng: &mut Rng) {
         let (a, b) = (rng.below(CELLS / MOVERS) * MOVERS + me, rng.below(CELLS));
         match rng.below(4) {
@@ -646,7 +646,7 @@ impl Moves {
         }
     }
 
-    /// 摘下链头（只有这个槽的主人摘；CAS 只和挂的线程抢）；摘下来的节点此后只在栈上。
+    /// Take off the chain head (only this slot's owner takes; the CAS races only with hangers); the node taken lives only on the stack afterwards.
     fn pop<'gc>(m: &paragc::Mutator<'gc>, cell: &Slot<'gc, Link<'gc>>) -> Option<Gc<'gc, Link<'gc>>> {
         loop {
             let x = cell.get()?;
@@ -656,7 +656,7 @@ impl Moves {
         }
     }
 
-    /// 挂到链头（CAS）。
+    /// Hang onto the chain head (CAS).
     fn push<'gc>(m: &paragc::Mutator<'gc>, cell: &Slot<'gc, Link<'gc>>, x: Gc<'gc, Link<'gc>>) {
         loop {
             let head = cell.get();
@@ -667,7 +667,7 @@ impl Moves {
         }
     }
 
-    /// 全部链上的节点数（显式栈）。
+    /// Nodes on all chains (explicit stack).
     fn reachable(heap: &Heap, board: &Root<BoardB>) -> usize {
         heap.mutate(|m| {
             let mut n = 0;
@@ -684,8 +684,8 @@ impl Moves {
 }
 
 impl Moves {
-    /// 一轮：MOVERS 个 mutator 不停地挪 / 新建 / 扔（每次 mutate 做 STEPS 步），做满 MUTATES 次后、并且直到
-    /// 后台的 `background` 做完才停；后台线程等 mutator 做了一阵才开始（保证二者重叠）。
+    /// One round: MOVERS mutators keep moving / making / discarding (STEPS steps per mutate), stopping after MUTATES mutates and only once
+    /// `background` has finished; the background thread starts after the mutators have run a while (so the two overlap).
     fn round(&self, heap: &Heap, board: &Root<BoardB>, round: usize, background: impl FnOnce(&Heap) + Send) {
         let started = std::sync::atomic::AtomicBool::new(false);
         let done = std::sync::atomic::AtomicBool::new(false);
@@ -693,7 +693,7 @@ impl Moves {
             let (started, done) = (&started, &done);
             for t in 0..MOVERS {
                 s.spawn(move || {
-                    let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ u64::try_from((round << 8) | t).expect("小"));
+                    let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ u64::try_from((round << 8) | t).expect("small"));
                     let mut tlab = paragc::Tlab::default();
                     let mut i = 0;
                     while i < MUTATES || !done.load(Ordering::Acquire) {
@@ -726,15 +726,15 @@ impl Moves {
         });
     }
 
-    /// 每轮之后：没析构还挂在链上的节点，链上节点数恰好 = 造的 − 扔的。
+    /// After each round: no node still on a chain was finalized, and the nodes on chains are exactly made − discarded.
     fn check(&self, heap: &Heap, board: &Root<BoardB>, round: usize) {
         let (dropped, discarded) = (self.ledger.dropped.load(Ordering::Relaxed), self.discarded.load(Ordering::Relaxed));
-        assert!(dropped <= discarded, "第 {round} 轮析构了还挂在链上的节点：析构 {dropped} > 扔掉 {discarded}");
+        assert!(dropped <= discarded, "round {round} finalized nodes still on a chain: {dropped} finalized > {discarded} discarded");
         let live = self.ledger.made.load(Ordering::Relaxed) - discarded;
-        assert_eq!(Self::reachable(heap, board), live, "第 {round} 轮链上丢了节点");
+        assert_eq!(Self::reachable(heap, board), live, "round {round} lost nodes from the chains");
     }
 
-    /// 收尾：再完整回收一次清掉浮动垃圾，析构数恰好 = 扔掉的；放掉板子后全部析构。
+    /// Finish: one more full collection clears floating garbage, the finalized count is exactly the discarded count; after dropping the board everything is finalized.
     fn finish(&self, mut heap: Heap, board: Root<BoardB>) {
         heap.collect();
         assert_eq!(self.ledger.dropped.load(Ordering::Relaxed), self.discarded.load(Ordering::Relaxed));
@@ -748,50 +748,50 @@ fn board(heap: &Heap) -> Root<BoardB> {
     heap.mutate(|m| m.root(m.alloc(Board { cells: (0..CELLS).map(|_| Slot::default()).collect() })))
 }
 
-/// 并发标记期间，多个 mutator 不停地把节点从一个槽摘下（只剩栈上引用）再挂到另一个槽、新建、扔掉；
-/// 另一个线程同时并发标记。每轮结束回收后：链上节点数 = 造的 − 扔的（初始快照没漏掉被挪动的节点）；
-/// 最后再完整回收一次：析构数恰好 = 扔掉的个数。
+/// During concurrent marking, several mutators keep taking nodes off one slot (leaving only a stack reference), hanging them on another slot, making and discarding;
+/// another thread marks concurrently. After each round's collection: nodes on chains = made − discarded (the snapshot missed no moved node);
+/// one final full collection: the finalized count is exactly the discarded count.
 #[test]
 fn concurrent_marking_while_relinking() {
     let moves = Moves::default();
     let mut heap = Heap::new(THREADS);
     let board = board(&heap);
     for round in 0..MARK_ROUNDS {
-        moves.round(&heap, &board, round, |h| assert!(h.mark_concurrently(), "这一轮还没有在标记"));
+        moves.round(&heap, &board, round, |h| assert!(h.mark_concurrently(), "this round is not marking yet"));
         heap.collect();
         moves.check(&heap, &board, round);
     }
-    assert!(moves.overlapped.load(Ordering::Relaxed) > 0, "mutate 一次也没落在并发标记期间");
+    assert!(moves.overlapped.load(Ordering::Relaxed) > 0, "no mutate fell within concurrent marking");
     moves.finish(heap, board);
 }
 
-/// 并发标记 → 标记收尾（停顿）→ 并发清扫：清扫期间 mutator 照常挪 / 新建 / 扔，要块时顺手扫（惰性清扫），
-/// 另一个线程同时 `sweep_concurrently`。每轮扫完后链上节点数恰好、没有析构还挂着的节点；最后析构数恰好。
+/// Concurrent marking → end of marking (pause) → concurrent sweeping: during sweeping mutators keep moving / making / discarding and sweep along when they need blocks (lazy sweeping),
+/// while another thread runs `sweep_concurrently`. After each round's sweep the nodes on chains are exact and no node still hanging was finalized; the final finalized count is exact.
 #[test]
 fn concurrent_sweeping_while_relinking() {
     let moves = Moves::default();
     let mut heap = Heap::new(THREADS);
     let board = board(&heap);
     for round in 0..MARK_ROUNDS {
-        moves.round(&heap, &board, round, |h| assert!(h.mark_concurrently(), "这一轮还没有在标记"));
+        moves.round(&heap, &board, round, |h| assert!(h.mark_concurrently(), "this round is not marking yet"));
         heap.finish_marking();
         moves.round(&heap, &board, round, Heap::sweep_concurrently);
         assert!(!heap.is_sweeping());
         moves.check(&heap, &board, round);
     }
-    assert!(moves.overlapped.load(Ordering::Relaxed) > 0, "mutate 一次也没落在并发标记期间");
-    assert!(moves.overlapped_sweep.load(Ordering::Relaxed) > 0, "mutate 一次也没落在并发清扫期间");
+    assert!(moves.overlapped.load(Ordering::Relaxed) > 0, "no mutate fell within concurrent marking");
+    assert!(moves.overlapped_sweep.load(Ordering::Relaxed) > 0, "no mutate fell within concurrent sweeping");
     moves.finish(heap, board);
 }
 
-/// 疏散测试的元素：只有值和析构计数（没有边）。
+/// An element of the evacuation test: only a value and a drop counter (no edges).
 #[derive(Trace)]
 struct Cell8 {
     value: u64,
     tag: Counted,
 }
 
-/// 根：留下来的元素。
+/// Root: the elements kept.
 #[derive(Trace)]
 struct Keep<'gc> {
     items: Vec<Gc<'gc, Cell8>>,
@@ -799,8 +799,8 @@ struct Keep<'gc> {
 
 brand!(KeepB = for<'gc> Keep<'gc>);
 
-/// 分配大量元素、只留 1/16：第一次回收后各块只剩 ~6% 存活（稀疏），第二次回收应把它们疏散走：
-/// 块数下降、留下的元素值不变且地址变了、析构数恰好等于扔掉的个数。
+/// Allocate many elements and keep only 1/16: after the first collection each block is only ~6% live (sparse), and the second collection should evacuate them:
+/// the block count drops, the kept elements keep their values but change address, and the finalized count is exactly the discarded count.
 #[test]
 fn evacuation_compacts_sparse_blocks() {
     const ITEMS: u64 = if cfg!(miri) { 4_000 } else { 64_000 };
@@ -818,26 +818,26 @@ fn evacuation_compacts_sparse_blocks() {
         m.root(m.alloc(Keep { items }))
     });
     let kept = ITEMS / KEEP_EVERY;
-    let discarded = usize::try_from(ITEMS - kept).expect("小");
+    let discarded = usize::try_from(ITEMS - kept).expect("small");
     heap.collect();
     assert_eq!(drops.load(Ordering::Relaxed), discarded);
     let before_blocks = heap.stats().blocks;
     let before: Vec<usize> = heap.mutate(|m| m.get(&keep).items.iter().map(|x| x.as_ptr().addr()).collect());
     heap.collect();
     let stats = heap.stats();
-    assert!(stats.evacuated_blocks > 0, "稀疏块没有被疏散：{stats:?}");
-    assert!(stats.blocks < before_blocks, "疏散后块数没降：{before_blocks} ⇒ {}", stats.blocks);
+    assert!(stats.evacuated_blocks > 0, "sparse blocks were not evacuated: {stats:?}");
+    assert!(stats.blocks < before_blocks, "the block count did not drop after evacuation: {before_blocks} ⇒ {}", stats.blocks);
     let after: Vec<(usize, u64)> = heap.mutate(|m| m.get(&keep).items.iter().map(|x| (x.as_ptr().addr(), x.value)).collect());
-    assert!(after.iter().enumerate().all(|(i, &(_, v))| v == u64::try_from(i).expect("小") * KEEP_EVERY), "搬过的元素值不对");
+    assert!(after.iter().enumerate().all(|(i, &(_, v))| v == u64::try_from(i).expect("small") * KEEP_EVERY), "moved elements have wrong values");
     let moved = before.iter().zip(&after).filter(|(b, (a, _))| *b != a).count();
-    assert!(moved > 0, "没有元素换地址");
-    assert_eq!(drops.load(Ordering::Relaxed), discarded, "搬走的旧副本被析构了");
+    assert!(moved > 0, "no element changed address");
+    assert_eq!(drops.load(Ordering::Relaxed), discarded, "a moved old copy was finalized");
     drop(keep);
     heap.collect();
-    assert_eq!(drops.load(Ordering::Relaxed), usize::try_from(ITEMS).expect("小"));
+    assert_eq!(drops.load(Ordering::Relaxed), usize::try_from(ITEMS).expect("small"));
 }
 
-/// 多父共享子节点：父节点各有两个指向共享子节点的槽。
+/// Children shared by many parents: each parent has two slots pointing at a shared child.
 #[derive(Trace)]
 struct Parent<'gc> {
     a: Slot<'gc, Cell8>,
@@ -852,8 +852,8 @@ struct Family<'gc> {
 
 brand!(FamilyB = for<'gc> Family<'gc>);
 
-/// 很多父节点指向同一小撮子节点（槽与普通字段各一条），父与子都在稀疏块里：疏散时多个回收线程会同时追到同一个子节点、
-/// 争着认领复制。之后每个父节点的两条边必须指向同一个（新）子节点，值不变，子节点只被复制一次（不重复析构、不丢）。
+/// Many parents point at the same few children (one slot and one plain field each), parents and children all in sparse blocks: during evacuation several collector threads reach the same child at once
+/// and race to claim and copy it. Afterwards both edges of each parent must point at the same (new) child with its value intact, and each child is copied once (never finalized twice, never lost).
 #[test]
 fn evacuation_with_shared_children() {
     const PARENTS: u64 = if cfg!(miri) { 1_500 } else { 40_000 };
@@ -865,10 +865,10 @@ fn evacuation_with_shared_children() {
         let children: Vec<_> = (0..CHILDREN).map(|value| m.alloc(Cell8 { value, tag: Counted(drops.clone()) })).collect();
         let mut parents = Vec::new();
         for i in 0..PARENTS {
-            // 留下来的父节点（i 是 KEEP_EVERY 的倍数）依次指向第 0、1、2 … 个子节点，全部子节点都被引用
-            let c = children[usize::try_from((i / KEEP_EVERY) % CHILDREN).expect("小")];
+            // The kept parents (i a multiple of KEEP_EVERY) point at children 0, 1, 2 … in turn, so every child is referenced
+            let c = children[usize::try_from((i / KEEP_EVERY) % CHILDREN).expect("small")];
             let p = m.alloc(Parent { a: c.into(), b: c, tag: Counted(drops.clone()) });
-            // 垃圾穿插在中间，让块变稀疏
+            // Garbage interleaved, making the blocks sparse
             m.alloc(Cell8 { value: u64::MAX, tag: Counted(drops.clone()) });
             if i.is_multiple_of(KEEP_EVERY) {
                 parents.push(p);
@@ -876,29 +876,29 @@ fn evacuation_with_shared_children() {
         }
         m.root(m.alloc(Family { parents }))
     });
-    // 留下的父节点：i = 0, KEEP_EVERY, 2·KEEP_EVERY … 共 ⌈PARENTS / KEEP_EVERY⌉ 个
-    let garbage = usize::try_from(PARENTS * 2 - PARENTS.div_ceil(KEEP_EVERY)).expect("小");
+    // Kept parents: i = 0, KEEP_EVERY, 2·KEEP_EVERY … ⌈PARENTS / KEEP_EVERY⌉ in all
+    let garbage = usize::try_from(PARENTS * 2 - PARENTS.div_ceil(KEEP_EVERY)).expect("small");
     heap.collect();
     assert_eq!(drops.load(Ordering::Relaxed), garbage);
     heap.collect();
-    assert!(heap.stats().evacuated_blocks > 0, "没有疏散：{:?}", heap.stats());
+    assert!(heap.stats().evacuated_blocks > 0, "no evacuation: {:?}", heap.stats());
     heap.mutate(|m| {
         for (i, p) in m.get(&family).parents.iter().enumerate() {
-            let a = p.a.get().expect("槽不空");
-            assert!(Gc::ptr_eq(a, p.b), "同一个子节点的两条边指向不同地址");
-            assert_eq!(a.value, u64::try_from(i).expect("小") % CHILDREN);
+            let a = p.a.get().expect("the slot is not empty");
+            assert!(Gc::ptr_eq(a, p.b), "the two edges to the same child point at different addresses");
+            assert_eq!(a.value, u64::try_from(i).expect("small") % CHILDREN);
         }
     });
-    assert_eq!(drops.load(Ordering::Relaxed), garbage, "疏散时多析构了");
+    assert_eq!(drops.load(Ordering::Relaxed), garbage, "evacuation finalized too much");
     drop(family);
     heap.collect();
-    assert_eq!(drops.load(Ordering::Relaxed), usize::try_from(PARENTS * 2 + CHILDREN).expect("小"));
+    assert_eq!(drops.load(Ordering::Relaxed), usize::try_from(PARENTS * 2 + CHILDREN).expect("small"));
 }
 
-/// 年轻回收的精确账目：老节点（经过一次完整回收）挂在板子的 0 号、2 号槽；然后新建年轻节点，三种方式挂上：
-/// 直接挂到老板子的 1 号槽（老对象的槽 ⇒ 记忆集）、挂到 0 号槽链头老节点的 next（老对象的槽）、挂到另一个年轻节点底下（年轻 → 年轻）；
-/// 其余年轻节点扔掉。再从 2 号槽摘掉一些老节点（老垃圾）。年轻回收应恰好析构扔掉的年轻节点（追踪），
-/// 以及扔掉的老节点（引用计数归零），链上节点一个不少；之后的完整回收不再多析构。
+/// Exact accounting for young collections: old nodes (through one full collection) hang on slots 0 and 2 of the board; then young nodes are made and hung three ways:
+/// directly on the old board's slot 1 (an old object's slot ⇒ remembered set), on the next of the old node heading slot 0 (an old object's slot), and under another young node (young → young);
+/// the other young nodes are discarded. Then some old nodes are taken off slot 2 (old garbage). The young collection must finalize exactly the discarded young nodes (by tracing)
+/// and the discarded old nodes (count reaching zero), with no node lost from the chains; the full collection afterwards finalizes nothing more.
 #[test]
 fn young_collection_frees_only_young_garbage() {
     const OLD: usize = if cfg!(miri) { 60 } else { 2_000 };
@@ -907,7 +907,7 @@ fn young_collection_frees_only_young_garbage() {
     let moves = Moves::default();
     let mut heap = Heap::new(THREADS);
     let board = board(&heap);
-    // 老节点：0 号、2 号槽各一条链，完整回收后都是老的
+    // Old nodes: one chain each on slots 0 and 2, all old after a full collection
     heap.mutate(|m| {
         let b = m.get(&board);
         for i in 0..OLD {
@@ -915,10 +915,10 @@ fn young_collection_frees_only_young_garbage() {
         }
     });
     heap.collect();
-    // 年轻节点：每 4 个里 1 个挂到 1 号槽、1 个插到 0 号槽链头老节点之后、1 个插到 1 号槽链头（年轻）之后，1 个扔掉
+    // Young nodes: of every 4, 1 hangs on slot 1, 1 goes after the old node heading slot 0, 1 goes after the (young) node heading slot 1, and 1 is discarded
     let young_garbage = heap.mutate(|m| {
         let b = m.get(&board);
-        let old_head = b.cells[0].get().expect("老链不空");
+        let old_head = b.cells[0].get().expect("the old chain is not empty");
         let mut garbage = 0;
         for i in 0..YOUNG {
             let x = m.alloc(Link { next: Slot::default(), tag: moves.ledger.tag() });
@@ -929,7 +929,7 @@ fn young_collection_frees_only_young_garbage() {
                     old_head.next.set(m, Some(x));
                 }
                 2 => {
-                    let host = b.cells[1].get().expect("刚挂过");
+                    let host = b.cells[1].get().expect("just hung");
                     x.next.set(m, host.next.get());
                     host.next.set(m, Some(x));
                 }
@@ -938,20 +938,20 @@ fn young_collection_frees_only_young_garbage() {
         }
         garbage
     });
-    // 老垃圾：从 2 号槽（全是老节点）摘掉 OLD_DISCARD 个
+    // Old garbage: take OLD_DISCARD off slot 2 (all old nodes)
     heap.mutate(|m| {
         let b = m.get(&board);
         for _ in 0..OLD_DISCARD {
-            Moves::pop(m, &b.cells[2]).expect("老链够长");
+            Moves::pop(m, &b.cells[2]).expect("the old chain is long enough");
             moves.discarded.fetch_add(1, Ordering::Relaxed);
         }
     });
     let before = moves.ledger.dropped.load(Ordering::Relaxed);
     heap.collect_young();
     assert_eq!(heap.stats().young_collections, 1);
-    assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed) - before, young_garbage + OLD_DISCARD, "年轻回收析构的不是恰好扔掉的年轻节点 + 老节点");
-    assert_eq!(Moves::reachable(&heap, &board), OLD - OLD_DISCARD + (YOUNG - young_garbage), "年轻回收后链上丢了节点");
-    // 完整回收没有剩下的垃圾
+    assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed) - before, young_garbage + OLD_DISCARD, "the young collection did not finalize exactly the discarded young nodes + old nodes");
+    assert_eq!(Moves::reachable(&heap, &board), OLD - OLD_DISCARD + (YOUNG - young_garbage), "nodes were lost from the chains after the young collection");
+    // The full collection finds no garbage left
     heap.collect();
     assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed) - before, young_garbage + OLD_DISCARD);
     assert_eq!(Moves::reachable(&heap, &board), OLD - OLD_DISCARD + (YOUNG - young_garbage));
@@ -959,8 +959,8 @@ fn young_collection_frees_only_young_garbage() {
     moves.finish(heap, board);
 }
 
-/// 多个 mutator 不停地挪 / 新建 / 扔（挪动会把年轻节点挂到老节点的槽上 ⇒ 记忆集），每轮之后回收：
-/// 轮流做年轻回收、并发标记后用年轻回收收尾（等于完整回收）、完整回收。每轮：没有析构还挂着的节点、链上节点数恰好。
+/// Several mutators keep moving / making / discarding (moves hang young nodes on old nodes' slots ⇒ remembered set), collecting after each round:
+/// alternating a young collection, concurrent marking finished by a young collection (equivalent to a full one), and a full collection. Each round: no node still hanging is finalized and the nodes on chains are exact.
 #[test]
 fn young_collections_while_relinking() {
     let moves = Moves::default();
@@ -987,7 +987,7 @@ fn young_collections_while_relinking() {
     moves.finish(heap, board);
 }
 
-/// 环测试：持有者链上每个持有者挂一个两节点的环。
+/// Cycle test: every holder on the holder chain holds a two-node cycle.
 #[derive(Trace)]
 struct Holder<'gc> {
     ring: Slot<'gc, Link<'gc>>,
@@ -1003,9 +1003,9 @@ struct Holders<'gc> {
 
 brand!(HoldersB = for<'gc> Holders<'gc>);
 
-/// 引用计数收不了环：PAIRS 个持有者各挂一个两节点环（a.next = c、c.next = a），另有 PAIRS 个普通节点；
-/// 完整回收后都是老的。然后把持有者链和普通链都摘掉：持有者和普通节点计数归零，年轻回收（引用计数）就收掉；
-/// 环内互相计数不为 0，年轻回收不析构它们，要等完整回收（追踪）。
+/// Reference counting cannot reclaim cycles: PAIRS holders each hold a two-node cycle (a.next = c, c.next = a), plus PAIRS plain nodes;
+/// all old after a full collection. Then both the holder chain and the plain chain are taken off: holders and plain nodes drop to zero and the young collection (reference counting) reclaims them;
+/// within a cycle the counts stay above 0, so the young collection does not finalize them; that waits for a full collection (tracing).
 #[test]
 fn reference_counting_leaves_cycles_to_tracing() {
     const PAIRS: usize = if cfg!(miri) { 20 } else { 500 };
@@ -1033,15 +1033,15 @@ fn reference_counting_leaves_cycles_to_tracing() {
         holders.plain.set(m, None);
     });
     heap.collect_young();
-    assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed) - before, PAIRS * 2, "引用计数应收掉持有者与普通节点，环留着");
+    assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed) - before, PAIRS * 2, "reference counting should reclaim holders and plain nodes and leave the cycles");
     heap.collect();
-    assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed) - before, PAIRS * 4, "完整回收应收掉环");
+    assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed) - before, PAIRS * 4, "the full collection should reclaim the cycles");
     drop(root);
 }
 
-/// 引用计数的减量移出停顿、在后台与 mutator 并发处理：
-/// 老链整体扔掉后 `finish_young`（停顿）返回时还一个都没析构；之后 mutator 照常挪 / 新建 / 扔，另一个线程同时
-/// `sweep_concurrently` 连锁释放——不析构还挂着的节点、链上计数恰好；下一次停顿重算行，空出的行被复用（块数不涨）。
+/// Reference count decrements move out of the pause and run in the background concurrently with mutators:
+/// after a whole old chain is discarded, nothing is finalized yet when `finish_young` (the pause) returns; then mutators keep moving / making / discarding while another thread
+/// runs `sweep_concurrently` and releases in cascade — nodes still hanging are not finalized and chain counts are exact; the next pause recomputes lines and the freed lines are reused (the block count does not grow).
 #[test]
 fn background_release_while_mutating() {
     const CHAIN: usize = if cfg!(miri) { 60 } else { 20_000 };
@@ -1049,7 +1049,7 @@ fn background_release_while_mutating() {
     let mut heap = Heap::new(THREADS);
     let board = board(&heap);
     let spare: Root<BoardB> = heap.mutate(|m| m.root(m.alloc(Board { cells: vec![Slot::default()] })));
-    // 一条长的老链挂在另一个板子上，完整回收后计数可信
+    // A long old chain hangs on another board, with trustworthy counts after a full collection
     heap.mutate(|m| {
         let cell = &m.get(&spare).cells[0];
         for _ in 0..CHAIN {
@@ -1057,17 +1057,17 @@ fn background_release_while_mutating() {
         }
     });
     heap.collect();
-    // 整条扔掉：只改了板子上的一个槽
+    // Discard it whole: only one slot on the board changes
     heap.mutate(|m| m.get(&spare).cells[0].set(m, None));
     moves.discarded.fetch_add(CHAIN, Ordering::Relaxed);
     let before = moves.ledger.dropped.load(Ordering::Relaxed);
     heap.finish_young();
-    assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed), before, "停顿里不该做减量");
-    // mutator 跑着，后台连锁释放
+    assert_eq!(moves.ledger.dropped.load(Ordering::Relaxed), before, "the pause must not process decrements");
+    // Mutators run while the background releases in cascade
     moves.round(&heap, &board, 0, Heap::sweep_concurrently);
-    assert!(moves.ledger.dropped.load(Ordering::Relaxed) - before >= CHAIN, "后台没把扔掉的链释放完");
+    assert!(moves.ledger.dropped.load(Ordering::Relaxed) - before >= CHAIN, "the background did not finish releasing the discarded chain");
     moves.check(&heap, &board, 0);
-    // 下一次停顿重算行；再分配同样多的节点，空出的行被复用（块数基本不涨）
+    // The next pause recomputes lines; allocating as many nodes again reuses the freed lines (the block count barely grows)
     heap.collect_young();
     let blocks_after_release = heap.stats().blocks;
     heap.mutate(|m| {
@@ -1078,21 +1078,21 @@ fn background_release_while_mutating() {
     });
     heap.collect_young();
     let slack = 16;
-    assert!(heap.stats().blocks <= blocks_after_release + slack, "释放的行没被复用：{} ⇒ {}", blocks_after_release, heap.stats().blocks);
+    assert!(heap.stats().blocks <= blocks_after_release + slack, "released lines were not reused: {} ⇒ {}", blocks_after_release, heap.stats().blocks);
     drop(spare);
     heap.collect();
     moves.discarded.fetch_add(CHAIN, Ordering::Relaxed);
     moves.finish(heap, board);
 }
 
-/// 并发标记顺带重新计数：一轮并发标记（期间 mutator 挪 / 新建 / 扔，黑分配的节点把别的节点挂到自己底下）收尾后，
-/// 引用计数立刻可信——整条扔掉的老链在下一次年轻回收就按计数释放，不用等停顿式完整回收；之后几轮年轻回收里按计数释放
-/// 也不碰还挂着的节点（漏算黑对象的边或标记期间被改写的槽，这里会析构活节点）。
+/// Concurrent marking recounts along the way: after a round of concurrent marking (with mutators moving / making / discarding, black-allocated nodes hanging others under themselves) finishes,
+/// reference counts are trustworthy right away — an old chain discarded whole is released by count at the next young collection without waiting for a stop-the-world full collection; and in the following young collections release by count
+/// never touches nodes still hanging (missing the edges of black objects or slots rewritten during marking would finalize live nodes here).
 #[test]
 fn concurrent_marking_recounts() {
     const CHAIN: usize = if cfg!(miri) { 40 } else { 10_000 };
     let moves = Moves::default();
-    // 老链单独记账（不在主板子上，不进 moves 的账）
+    // The old chain is accounted separately (not on the main board, not in moves' ledger)
     let chain = Ledger::default();
     let mut heap = Heap::new(THREADS);
     let board = board(&heap);
@@ -1103,16 +1103,16 @@ fn concurrent_marking_recounts() {
             Moves::push(m, cell, m.alloc(Link { next: Slot::default(), tag: chain.tag() }));
         }
     });
-    // 一轮并发标记（不经过停顿式完整回收），收尾
+    // One round of concurrent marking (no stop-the-world full collection), finished
     moves.round(&heap, &board, 0, |h| assert!(h.mark_concurrently()));
     heap.collect();
     moves.check(&heap, &board, 0);
     assert_eq!(chain.dropped.load(Ordering::Relaxed), 0);
-    // 计数应已可信：扔掉整条链，年轻回收按计数释放
+    // Counts should be trustworthy: discard the whole chain and the young collection releases it by count
     heap.mutate(|m| m.get(&spare).cells[0].set(m, None));
     heap.collect_young();
-    assert_eq!(chain.dropped.load(Ordering::Relaxed), CHAIN, "并发标记之后计数不可信：扔掉的链没在年轻回收里释放");
-    // 再几轮：mutator 挪动、年轻回收按计数释放，不碰还挂着的
+    assert_eq!(chain.dropped.load(Ordering::Relaxed), CHAIN, "counts untrustworthy after concurrent marking: the discarded chain was not released by the young collection");
+    // A few more rounds: mutators move and young collections release by count, never touching what still hangs
     for round in 1..=MARK_ROUNDS {
         moves.round(&heap, &board, round, |_| ());
         heap.collect_young();
@@ -1124,16 +1124,16 @@ fn concurrent_marking_recounts() {
 
 #[test]
 fn gc_from_raw_round_trip() {
-    // 布局：一个指针大小，Option 也是（repr(transparent) + NonNull）
+    // Layout: one pointer in size, and so is the Option (repr(transparent) + NonNull)
     assert_eq!(size_of::<Gc<'static, u64>>(), size_of::<*const u64>());
     assert_eq!(size_of::<Option<Gc<'static, u64>>>(), size_of::<*const u64>());
     let heap = Heap::new(THREADS);
     heap.mutate(|m| {
         let a = m.alloc(Node { value: 7, next: None });
         let b = m.alloc(Node { value: 8, next: Some(a) });
-        // 拆成裸地址再取回（同一次 mutate 里）
+        // Turn it into a raw address and back (within the same mutate)
         let raw = b.as_ptr();
-        // SAFETY: raw 是这次 mutate 里 b 的数据指针，b 活着
+        // SAFETY: raw is b's data pointer from this mutate, and b is alive
         let back: Gc<'_, Node<'_>> = unsafe { Gc::from_raw(raw) };
         assert!(Gc::ptr_eq(back, b));
         assert_eq!(back.value, 8);
@@ -1141,8 +1141,8 @@ fn gc_from_raw_round_trip() {
     });
 }
 
-/// 年轻对象里的槽写屏障不记（年轻回收从对象本身追到）；被年轻回收晋升后就要记：
-/// 第一次完整回收之前（引用计数还不可信，晋升不重算计数）晋升的持有者，之后写进去的年轻叶子在下一次年轻回收后还活着。
+/// The write barrier does not record slots in young objects (young collections reach them from the object); once promoted by a young collection they must be recorded:
+/// a holder promoted before the first full collection (counts still untrustworthy, promotion does not recount) keeps the young leaves written into it alive through the next young collection.
 #[test]
 fn promoted_slots_remember_young_values() {
     let heap = &mut Heap::new(THREADS);
@@ -1154,7 +1154,7 @@ fn promoted_slots_remember_young_values() {
         left.set(m, Some(m.alloc(Tree::Leaf(Counted(drops.clone())))));
     });
     heap.collect_young();
-    assert_eq!(drops.load(Ordering::Relaxed), 0, "晋升的持有者指着的年轻叶子被回收了");
+    assert_eq!(drops.load(Ordering::Relaxed), 0, "a young leaf held by a promoted holder was collected");
     heap.mutate(|m| {
         let Tree::Branch { left, .. } = &*m.get(&holder) else { unreachable!() };
         assert!(matches!(left.get().as_deref(), Some(Tree::Leaf(_))));
@@ -1164,7 +1164,7 @@ fn promoted_slots_remember_young_values() {
     assert_eq!(drops.load(Ordering::Relaxed), 1);
 }
 
-/// 析构时记下是不是在建堆的线程上（没有 Gc，可以有 Drop）。
+/// Records on drop whether it ran on the thread that created the heap (no Gc, so it may have Drop).
 struct Witness(Arc<(std::thread::ThreadId, AtomicUsize, AtomicUsize)>);
 
 impl Drop for Witness {
@@ -1177,7 +1177,7 @@ impl Drop for Witness {
     }
 }
 
-// SAFETY: 没有 Gc
+// SAFETY: no Gc
 unsafe impl Trace for Witness {
     const NO_EDGES: bool = true;
     fn trace(&self, _: &mut Tracer<'_>) {}
@@ -1192,7 +1192,7 @@ struct Twig<'gc> {
 
 brand!(TwigB = for<'gc> Twig<'gc>);
 
-/// 关掉并行析构：引用计数的后台释放、并行清扫（年轻 / 完整）、堆析构，死对象都只在调用方线程上析构，一个不少。
+/// With parallel finalization off: background release by reference counting, parallel sweeping (young / full) and dropping the heap all finalize dead objects on the caller's thread only, none missing.
 #[test]
 fn serial_drop_stays_on_the_caller() {
     const DEPTH: u32 = if cfg!(miri) { 6 } else { 15 };
@@ -1216,11 +1216,11 @@ fn serial_drop_stays_on_the_caller() {
     heap.collect();
     heap.collect();
     assert_eq!(ledger.1.load(Ordering::Relaxed), 0);
-    // 老树摘掉：引用计数归零，年轻回收后的后台释放析构
+    // The old tree is taken off: its count drops to zero and the background release after the young collection finalizes it
     heap.mutate(|m| m.get(&holder).left.set(m, None));
     heap.collect_young();
-    assert_eq!(ledger.1.load(Ordering::Relaxed), nodes, "引用计数应收掉整棵老树");
-    // 年轻垃圾：年轻清扫；再一棵变老后扔掉：完整回收的清扫
+    assert_eq!(ledger.1.load(Ordering::Relaxed), nodes, "reference counting should reclaim the whole old tree");
+    // Young garbage: the young sweep; another tree made old and then discarded: the full collection's sweep
     drop(tree(&heap));
     heap.collect_young();
     assert_eq!(ledger.1.load(Ordering::Relaxed), 2 * nodes);
@@ -1233,22 +1233,22 @@ fn serial_drop_stays_on_the_caller() {
     drop(holder);
     drop(heap);
     assert_eq!(ledger.1.load(Ordering::Relaxed), 3 * nodes + 1);
-    assert_eq!(ledger.2.load(Ordering::Relaxed), 0, "有对象在别的线程上析构");
+    assert_eq!(ledger.2.load(Ordering::Relaxed), 0, "some objects were finalized on another thread");
 }
 
-/// 一行大（232 字节数据 + 24 字节头 = 256）
+/// One line in size (232 data bytes + 24 header bytes = 256)
 #[derive(Trace)]
 struct Line {
     fill: [u64; 29],
 }
 
-/// 五个正好填满一行（48 字节）
+/// Five of them fill a line exactly (48 bytes)
 #[derive(Trace)]
 struct Small {
     _pad: [u64; 3],
 }
 
-/// 三行多一点（584 字节）
+/// A bit over three lines (584 bytes)
 #[derive(Trace)]
 struct Medium {
     _pad: [u64; 70],
@@ -1261,15 +1261,15 @@ struct Lines<'gc> {
 
 brand!(LinesB = for<'gc> Lines<'gc>);
 
-/// 溢出分配：块里只剩单行的空洞时，交替分配小对象与中对象（放不进单行空洞），小对象照样填进旧空洞，
-/// 中对象另开溢出块——新开的块数只够放中对象（中对象把主游标带走的话，旧空洞全部作废，小对象也要开新块）。
+/// Overflow allocation: when blocks have only single-line holes left, alternating small and medium objects (medium ones do not fit a single-line hole) keeps filling the old holes with small objects
+/// while medium objects get overflow blocks — only enough new blocks for the medium objects (if medium objects took the main cursor away, every old hole would be wasted and small objects would need new blocks too).
 #[test]
 fn medium_objects_overflow_without_wasting_holes() {
     const HOLES: usize = if cfg!(miri) { 300 } else { 6000 };
-    /// 块的大小（paragc::layout::BLOCK）
+    /// Block size (paragc::layout::BLOCK)
     const BLOCK: usize = 32 * 1024;
     let mut heap = Heap::new(THREADS);
-    // 连续分配一行大的对象，每三个扔一个：完整回收后每个死的都是单行空洞（块里存活 2/3，不会被疏散）
+    // Allocate line-sized objects back to back and discard one in three: after a full collection every dead one is a single-line hole (blocks 2/3 live, not evacuated)
     let lines: Root<LinesB> = heap.mutate(|m| {
         let all: Vec<_> = (0..3 * HOLES).map(|_| m.alloc(Line { fill: [0; 29] })).collect();
         m.root(m.alloc(Lines { kept: all.iter().enumerate().filter(|(i, _)| i % 3 != 2).map(|(_, &l)| Slot::from(Some(l))).collect() }))
@@ -1287,11 +1287,11 @@ fn medium_objects_overflow_without_wasting_holes() {
     });
     let grown = heap.stats().blocks - before;
     let medium_blocks = (HOLES * size_of::<Medium>()).div_ceil(BLOCK * 9 / 10);
-    assert!(grown <= medium_blocks + 2, "新开 {grown} 块，只该够放中对象（约 {medium_blocks} 块）：小对象没填进旧空洞");
+    assert!(grown <= medium_blocks + 2, "opened {grown} blocks, only enough for the medium objects was expected (about {medium_blocks}): small objects did not fill the old holes");
     drop(lines);
 }
 
-/// 持有者（会变老）与它挂着的年轻链。
+/// A holder (which becomes old) and the young chain it holds.
 #[derive(Trace)]
 struct Anchor<'gc> {
     head: Slot<'gc, Bead<'gc>>,
@@ -1308,7 +1308,7 @@ struct Bead<'gc> {
 
 brand!(BeadB = for<'gc> Bead<'gc>);
 
-/// 链上每个节点的（地址, 值）。
+/// (address, value) of every node on the chain.
 fn beads<'gc>(head: Option<Gc<'gc, Bead<'gc>>>) -> Vec<(usize, u64)> {
     let mut out = Vec::new();
     let mut cur = head;
@@ -1319,7 +1319,7 @@ fn beads<'gc>(head: Option<Gc<'gc, Bead<'gc>>>) -> Vec<(usize, u64)> {
     out
 }
 
-/// 造一条 `len` 个节点的链（值从 `from` 起），节点之间夹着垃圾（存活对象散在块里）。
+/// Make a chain of `len` nodes (values from `from` on) with garbage between the nodes (survivors scattered across blocks).
 fn chain<'gc>(m: &paragc::Mutator<'gc>, drops: &Arc<AtomicUsize>, from: u64, len: u64) -> Gc<'gc, Bead<'gc>> {
     let mut top = None;
     for value in from..from + len {
@@ -1329,14 +1329,14 @@ fn chain<'gc>(m: &paragc::Mutator<'gc>, drops: &Arc<AtomicUsize>, from: u64, len
     top.expect("len > 0")
 }
 
-/// 年轻疏散：老持有者的槽挂一条年轻链、根也挂一条，年轻回收后——
-/// `Full`：两条链都搬了（地址全变）、值不变、槽与根都指到新地址；
-/// `SkipRemembered`：槽直接指着的头原地不动，链上其余的搬了；
-/// `Off`：都不动。之后摘掉链，引用计数照样收掉（析构数恰好）。
+/// Young evacuation: an old holder's slot holds a young chain and a root holds another; after a young collection —
+/// `Full`: both chains moved (every address changed) with values intact, and the slot and root point at the new addresses;
+/// `SkipRemembered`: the head the slot points at directly stays put and the rest of that chain moves;
+/// `Off`: nothing moves. Taking the chains off afterwards, reference counting still reclaims them (exact finalized count).
 #[test]
 fn young_evacuation_moves_survivors() {
     const LEN: u64 = if cfg!(miri) { 50 } else { 5000 };
-    let n = usize::try_from(LEN).expect("链长");
+    let n = usize::try_from(LEN).expect("chain length");
     for mode in [YoungEvacuation::Full, YoungEvacuation::SkipRemembered, YoungEvacuation::Off] {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut heap = Heap::new(THREADS);
@@ -1351,34 +1351,34 @@ fn young_evacuation_moves_survivors() {
             (m.root(r), beads(a.head.get()), beads(Some(r)))
         });
         heap.collect_young();
-        assert_eq!(drops.load(Ordering::Relaxed), 2 * n, "{mode:?}: 夹着的垃圾应该都析构了");
+        assert_eq!(drops.load(Ordering::Relaxed), 2 * n, "{mode:?}: the garbage in between should all be finalized");
         let (after_slot, after_root) = heap.mutate(|m| (beads(m.get(&anchor).head.get()), beads(Some(m.get(&rooted)))));
         let values = |v: &[(usize, u64)]| v.iter().map(|&(_, x)| x).collect::<Vec<_>>();
-        assert_eq!(values(&after_slot), values(&before_slot), "{mode:?}: 槽挂的链值变了");
-        assert_eq!(values(&after_root), values(&before_root), "{mode:?}: 根挂的链值变了");
+        assert_eq!(values(&after_slot), values(&before_slot), "{mode:?}: the values of the chain on the slot changed");
+        assert_eq!(values(&after_root), values(&before_root), "{mode:?}: the values of the chain on the root changed");
         let moved = |a: &[(usize, u64)], b: &[(usize, u64)]| a.iter().zip(b).filter(|(x, y)| x.0 != y.0).count();
         let (slot_moved, root_moved) = (moved(&before_slot, &after_slot), moved(&before_root, &after_root));
         match mode {
             YoungEvacuation::Full => {
-                assert_eq!((slot_moved, root_moved), (n, n), "Full：全都该搬");
+                assert_eq!((slot_moved, root_moved), (n, n), "Full: everything should move");
             }
             YoungEvacuation::SkipRemembered => {
-                assert_eq!(after_slot[0].0, before_slot[0].0, "SkipRemembered：老对象直接指着的不该搬");
-                assert_eq!((slot_moved, root_moved), (n - 1, n), "SkipRemembered：其余的该搬");
+                assert_eq!(after_slot[0].0, before_slot[0].0, "SkipRemembered: what old objects point at directly should not move");
+                assert_eq!((slot_moved, root_moved), (n - 1, n), "SkipRemembered: the rest should move");
             }
-            YoungEvacuation::Off => assert_eq!((slot_moved, root_moved), (0, 0), "Off：不该搬"),
+            YoungEvacuation::Off => assert_eq!((slot_moved, root_moved), (0, 0), "Off: nothing should move"),
         }
-        // 摘掉两条链：引用计数（槽那条）与年轻 / 完整回收（根那条）收掉，析构数恰好
+        // Take both chains off: reference counting (the slot's chain) and young / full collections (the root's chain) reclaim them, with an exact finalized count
         heap.mutate(|m| m.get(&anchor).head.set(m, None));
         drop(rooted);
         heap.collect_young();
         heap.collect();
-        assert_eq!(drops.load(Ordering::Relaxed), 4 * n, "{mode:?}: 摘掉的链没收干净");
+        assert_eq!(drops.load(Ordering::Relaxed), 4 * n, "{mode:?}: the chains taken off were not fully reclaimed");
         drop(anchor);
     }
 }
 
-/// `shrink`：空行还给系统后对象完好，之后接着往那些空行里分配（重新缺页、内容是零）也对。
+/// `shrink`: objects stay intact after free lines go back to the system, and allocating into those lines again (faulting in zeroed pages) works too.
 #[test]
 fn shrink_keeps_objects_and_reuses_lines() {
     const HOLES: usize = if cfg!(miri) { 100 } else { 3000 };
@@ -1389,7 +1389,7 @@ fn shrink_keeps_objects_and_reuses_lines() {
     });
     heap.shrink();
     let check = |heap: &Heap| heap.mutate(|m| m.get(&lines).kept.iter().enumerate().all(|(k, s)| s.get().is_some_and(|l| l.fill.iter().all(|&x| x == 3 * k as u64))));
-    assert!(check(&heap), "shrink 之后存活对象的内容变了");
+    assert!(check(&heap), "live objects' contents changed after shrink");
     let drops = Arc::new(AtomicUsize::new(0));
     let fresh = build_tree(&heap, &drops, if cfg!(miri) { 8 } else { 14 });
     assert!(check(&heap));
@@ -1411,20 +1411,20 @@ fn list_addrs(heap: &Heap, root: &Root<NodeB>) -> Vec<usize> {
     })
 }
 
-/// 上一次年轻回收几乎全活下来时，这一次不搬年轻对象（原地晋升）；存活率低时照旧搬。
+/// When the last young collection kept nearly everything, this one does not move young objects (promotion in place); with low survival they move as usual.
 #[test]
 fn young_collection_promotes_in_place_when_most_survive() {
     let mut heap = Heap::new(THREADS);
     let first = build_list(&heap, LIST_LEN);
     heap.collect_young();
-    // 全活：下一次不搬
+    // All survived: the next one does not move
     let second = build_list(&heap, LIST_LEN);
     let before = list_addrs(&heap, &second);
     heap.collect_young();
-    assert_eq!(list_addrs(&heap, &second), before, "上一轮全活下来，这一轮还在搬");
+    assert_eq!(list_addrs(&heap, &second), before, "the last round all survived, yet this round still moves");
     assert_eq!(sum_list(&heap, &first), LIST_LEN * (LIST_LEN - 1) / 2);
     assert_eq!(sum_list(&heap, &second), LIST_LEN * (LIST_LEN - 1) / 2);
-    // 这一轮几乎全是垃圾：存活率低，再下一轮照旧搬
+    // This round is nearly all garbage: low survival, so the round after moves as usual
     heap.mutate(|m| {
         for value in 0..LIST_LEN * 8 {
             m.alloc(Node { value, next: None });
@@ -1434,6 +1434,6 @@ fn young_collection_promotes_in_place_when_most_survive() {
     let third = build_list(&heap, LIST_LEN / 8);
     let before = list_addrs(&heap, &third);
     heap.collect_young();
-    assert_ne!(list_addrs(&heap, &third), before, "上一轮几乎全是垃圾，这一轮却没搬");
+    assert_ne!(list_addrs(&heap, &third), before, "the last round was nearly all garbage, yet this round did not move");
     assert_eq!(sum_list(&heap, &third), (LIST_LEN / 8) * (LIST_LEN / 8 - 1) / 2);
 }

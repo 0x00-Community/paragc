@@ -1,6 +1,6 @@
-//! dumpster：引用计数 + 环检测。pause / gcbench 用单线程的 unsync（串行，线程数必须是 1）；
-//! alloc-mt 用线程安全的 sync，线程数是 mutator 线程数。
-//! 树里没有环，死对象在最后一个引用析构时就释放了，pause 量的是「扔掉垃圾树 + collect」。
+//! dumpster: reference counting + cycle detection. pause / gcbench use the single-threaded unsync flavor (serial; the thread count must be 1);
+//! alloc-mt uses the thread-safe sync flavor, with the thread count being mutator threads.
+//! The trees have no cycles, so dead objects are freed when their last reference is dropped; pause measures "dropping the garbage tree + collect".
 use std::num::NonZeroUsize;
 
 use bench_common::{Args, Bench, Clock, Took, GcBench, LONG_LIVED_DEPTH, MT_DEPTH, MT_ROUNDS, MT_TREES, PAUSE_DEPTH, STRETCH_DEPTH, Tree};

@@ -1,33 +1,33 @@
-//! 两种堆：私有堆 [`Heap`] / [`Mutator`]，公开堆 [`PublicHeap`] / [`PublicMutator`]（共享内存文件上、多进程），共用的分配缓冲 [`Tlab`]。
+//! Two kinds of heap: the private [`Heap`] / [`Mutator`] and the public [`CrossHeap`] / [`CrossHeapMutator`] (on a shared-memory file, multi-process), sharing the allocation buffer [`Tlab`].
 //!
-//! 堆：多个线程可以同时 [`Heap::mutate`]（各自碰撞分配）。
+//! A heap: several threads can [`Heap::mutate`] at once (each bump-allocating on its own).
 //!
-//! 回收两种走法：
-//! - [`Heap::collect`]（`&mut self`）：借用规则排除 mutator，标记 + 清扫全在这一次里
-//! - [`Heap::mark_concurrently`]（`&self`）：开头一次短握手（等 mutate 里的线程走空、照下根），之后 mutator 照常跑、
-//!   回收线程并发标记；mutator 那边写 `Slot` 走初始快照（SATB）写屏障、新对象直接标成本轮（黑分配）。
-//!   之后的 [`Heap::collect`] 只需清空写屏障攒下的灰对象再清扫
+//! Two ways to collect:
+//! - [`Heap::collect`] (`&mut self`): the borrow rules exclude mutators, and marking + sweeping happen in this one call
+//! - [`Heap::mark_concurrently`] (`&self`): one short handshake at the start (wait until no thread is inside mutate, snapshot the roots); afterwards mutators keep running while
+//!   collector threads mark concurrently; on the mutator side, `Slot` writes go through a snapshot-at-the-beginning (SATB) write barrier and new objects are marked with this round (black allocation).
+//!   The [`Heap::collect`] that follows only drains the grey objects gathered by the write barrier and then sweeps
 //!
-//! 握手字：最高位是「要开始标记」请求，低位是 mutate 里的线程数。请求挂着时新进 mutate 的线程等它清掉。
+//! The handshake word: the top bit is the "start marking" request, the low bits count threads inside mutate. While the request is set, threads entering mutate wait for it to clear.
 //!
-//! 公开堆：共享内存文件上的堆。堆的全部状态（超级块、类型表、入口表、块状态表、块）都在窗口里，进程这一侧只有缓存。
+//! Public heaps: heaps on a shared-memory file. All heap state (superblock, type table, entry table, block state table, blocks) lives in the window; the process side holds only caches.
 //!
-//! 第一期（单进程）：多个线程同时 mutate、碰撞分配；回收是暂停式的并行标记 + 并行清扫，不搬对象。握手字在超级块里，
-//! 所以同一个堆被映射两次（同一进程里两个地址区，或以后跨进程）也互相排斥。
-#[cfg(target_os = "linux")]
+//! Phase one (single process): several threads mutate and bump-allocate at once; collection is stop-the-world parallel marking + parallel sweeping without moving objects. The handshake word is in the superblock,
+//! so a heap mapped twice (two regions in one process, or across processes) is still mutually exclusive.
+#[cfg(crossheap)]
 use core::any::type_name;
 use core::cell::Cell;
 use core::marker::PhantomData;
 use core::num::{NonZeroU32, NonZeroUsize};
 use core::ptr::{NonNull, null_mut};
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use core::time::Duration;
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use std::io;
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use std::fs::File;
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -36,104 +36,110 @@ use crossbeam_utils::{Backoff, CachePadded};
 
 use crate::{Gc, Trace};
 use crate::handle::{GcInternal, Invariant, RawSlot, RootTable};
-#[cfg(target_os = "linux")]
-use crate::handle::{EdgeMap, Public, PublicBrand, PublicGc, PublicGcInternal, PublicInternal, Shared};
+#[cfg(crossheap)]
+use crate::handle::{EdgeMap, CrossHeapRoot, CrossHeapBrand, CrossHeapGc, CrossHeapGcInternal, CrossHeapRootInternal, STAMP_MASK, Shared, Signature, WeakWord};
 use crate::layout::{BLOCK, Block, Pages, WARM_CYCLES, YOUNG_COPY_DEN, YOUNG_COPY_NUM, LINE, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, HEADER, Header, LARGE, MAX_EPOCH, MIN_SPARE_BLOCKS, MIN_TRIGGER, OVERFLOW_TRIES, FRAG_NUM, FRAG_DEN, YOUNG_PER_FULL, YOUNG_PER_FULL_RC};
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use crate::layout::{Core, State};
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use crate::layout::{ATTACH_CAP, ATTACH_OFF, Attachment, BlockState, Entry, Kind, MAP_CAP, PAGE, PHEADER, PHeader, Segment, Super, TYPE_CAP, TypeEntry, WindowLayout};
 use crate::mark::Marking;
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use crate::mark::{Marker, Member};
-#[cfg(target_os = "linux")]
-use crate::shm::{Liveness, Process, Region, Registry, Space, WINDOW, WINDOWS};
+#[cfg(crossheap)]
+use crate::shm::{Liveness, Process, REGION, Region, Registry, Space, WINDOW, WINDOWS};
 use crate::sweep::{Large, Outcome, Releaser, Sink, Sweeper};
 use crate::sync::{Pool, SegVec};
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 use crate::sync::{FutexWord, Retry, Stack};
 
 pub struct Heap {
-    /// 回收最多用几个线程
+    /// Collect with at most this many threads
     threads: NonZeroUsize,
-    /// 回收线程池：第一次回收时才起线程
+    /// Collector thread pool: threads start at the first collection
     pool: OnceLock<Pool>,
-    /// 最后一次完成的标记的纪元（从 1 开始；行标记早于它的行是空行）
+    /// The epoch of the last completed marking (from 1; lines with older marks are free)
     epoch: u32,
-    /// 正在并发标记的纪元；0 = 没有
+    /// The epoch being marked concurrently; 0 = none
     marking: AtomicU32,
-    /// 握手字：[`REQUEST`] 位 + mutate 里的线程数
+    /// The handshake word: the [`REQUEST`] bit + threads inside mutate
     gate: CachePadded<AtomicU64>,
-    /// 灰队列：根与写屏障记下的旧值（并发标记跨越多次调用，所以放在堆里）
+    /// Grey queue: roots and old values recorded by the write barrier (concurrent marking spans several calls, so it lives in the heap)
     grey: Injector<usize>,
-    /// 记忆集：上次回收后被写进年轻对象的槽的地址（年轻回收从这些槽出发；任何回收后清空）
+    /// Remembered set: addresses of slots written with young objects since the last collection (young collections start from these slots; cleared after any collection)
     remembered: Injector<usize>,
-    /// 引用计数登记：本轮被写过的、计数中的槽（每个槽每轮一次）
+    /// Reference count log: counted slots written this round (each slot once per round)
     rc_log: Injector<usize>,
-    /// 待处理的减量（年轻回收的停顿放进来，sweep_concurrently 在后台做）
+    /// Pending decrements (queued by the young collection's pause and processed in the background by sweep_concurrently)
     decs: Injector<usize>,
-    /// 后台释放过对象的块（下一次停顿开头重算行）
+    /// Blocks in which objects were released in the background (lines recomputed at the start of the next pause)
     dirty: Injector<Block>,
-    /// 引用计数可信：停顿式完整回收重新计数后为真；并发标记开始后为假（黑分配的对象没计它们的边），直到下一次重新计数
+    /// Reference counts are trustworthy: true after a stop-the-world full collection recounts; false once concurrent marking starts (black-allocated objects did not count their edges) until the next recount
     rc_valid: AtomicBool,
-    /// 当前计数的奇偶（重新计数时翻转，旧计数一次作废；并发标记在握手时翻转）
+    /// Parity of the current count (flipped on recount, invalidating old counts at once; concurrent marking flips it at the handshake)
     rc_parity: AtomicBool,
-    /// 并发标记期间黑分配的对象（头地址）：它们不会被标记扫描，收尾时补算它们的边
+    /// Objects black-allocated during concurrent marking (header addresses): marking never scans them, so their edges are counted at the end
     black: Injector<usize>,
-    /// 上一轮计入的根（延迟到这一轮 −1）
+    /// Roots counted in the previous round (decremented in this round, deferred)
     rc_roots: Vec<usize>,
-    /// 上次完整回收后做了几次年轻回收
+    /// Young collections since the last full collection
     young_since_full: usize,
-    /// 一共做了几次年轻回收
+    /// Young collections in total
     young_collections: u64,
-    /// 回收了几次（分配缓冲据此判断自己是否过期）
+    /// Collections so far (allocation buffers use it to tell whether they are stale)
     collections: u64,
-    /// 全部块
+    /// All blocks
     blocks: SegVec<Block>,
-    /// 清扫好、有空行的块（含全空的），分配缓冲先从这里领
+    /// Swept blocks with free lines (including empty ones); allocation buffers take from here first
     available: Injector<Block>,
     large: SegVec<Large>,
-    /// 上一轮的清扫（与 mutator 并发进行）
+    /// The previous round's sweep (runs concurrently with mutators)
     sweeper: Sweeper,
-    /// 死对象的析构在全部回收线程上并行跑（假：只在调用回收 / 清扫的线程上跑），见 [`Heap::set_parallel_drop`]
+    /// Finalization of dead objects runs in parallel on all collector threads (false: only on the thread calling collect / sweep); see [`Heap::set_parallel_drop`]
     parallel_drop: AtomicBool,
-    /// 年轻回收怎么搬存活的年轻对象（[`YoungEvacuation`] 的值）
+    /// How young collections move surviving young objects (a [`YoungEvacuation`] value)
     young_evacuation: AtomicU8,
-    /// [`Heap::shrink`] 进行中：本轮清扫不留备用空块、空行还给系统
+    /// [`Heap::shrink`] in progress: this round's sweep keeps no spare empty blocks and gives free lines back to the system
     shrinking: AtomicBool,
-    /// 块的来源（析构时 Drop 里先把块都还回来，之后它才解除映射）
+    /// Where blocks come from (Drop gives every block back first, and only then is it unmapped)
     pages: Pages,
     roots: Arc<RootTable>,
-    /// 弱表：[`crate::Weak`] 的槽（不当根；每次回收标记完清空没标到的）
+    /// Weak table: slots of [`crate::Weak`] (not roots; every collection clears the unmarked ones after marking)
     weaks: Arc<RootTable>,
-    /// 上次回收后新领用的字节数（按块 / 大对象计）
+    /// Bytes newly taken since the last collection (counted by blocks / large objects)
     allocated: AtomicUsize,
-    /// 最近 [`WARM_CYCLES`] 轮各领用了多少块（定 [`Pages`] 热池的上限）
+    /// Blocks taken in each of the last [`WARM_CYCLES`] rounds (caps the warm pool of [`Pages`])
     recent: [usize; WARM_CYCLES],
-    /// 这一轮回收是 [`Heap::collect_if_needed`] 发起的（按分配量自动回收）：只有这种留 [`Pages`] 热池
+    /// This collection was started by [`Heap::collect_if_needed`] (automatic, by allocation volume): only these keep a warm pool of [`Pages`]
     automatic: bool,
-    /// 上一次回收是年轻回收时它之前领用的字节数（清扫完存活的年轻字节除以它就是存活率）；完整回收后为 0
+    /// Bytes taken before the last collection when it was a young collection (surviving young bytes after sweeping divided by it is the survival rate); 0 after a full collection
     young_allocated: usize,
-    /// 上次回收疏散的块数 / 字节数
+    /// Blocks / bytes evacuated by the last collection
     evacuated: (usize, usize),
-    /// 给 [`Heap::mutate`] 复用的分配缓冲
+    /// An allocation buffer reused by [`Heap::mutate`]
     spare: AtomicPtr<Tlab>,
+    /// The cross-heap used as the old generation ([`Heap::attach_cross_heap`])
+    #[cfg(crossheap)]
+    cross: Option<CrossHeap>,
+    /// A private object was written into a cross-heap object since the last young collection
+    #[cfg(crossheap)]
+    promotion_pending: AtomicBool,
 }
 
-/// 年轻回收要不要把存活的年轻对象搬进紧凑的块（[`Heap::set_young_evacuation`]）。
+/// Whether young collections move surviving young objects into compact blocks ([`Heap::set_young_evacuation`]).
 ///
-/// 年轻回收不扫描老对象：老对象指着年轻对象的边只有记忆集里的槽（[`crate::Slot`] 写入时记下的）。
+/// Young collections do not scan old objects: the only edges from old objects to young ones are the remembered slots (recorded when a [`crate::Slot`] is written).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum YoungEvacuation {
-    /// 不搬：存活的年轻对象原地晋升
+    /// Do not move: surviving young objects are promoted in place
     Off,
-    /// 缺省。老对象直接指着的（记忆集里的槽的目标）、别的堆经 [`crate::Far`] 指着的原地晋升，其余的搬走：
-    /// 搬走的对象只被年轻对象和根指着，它们都会被重定位（`Trace::relocate`），老对象一个字节都不改
+    /// Default. Objects pointed to directly by old objects (targets of remembered slots) or from other heaps through [`crate::Far`] are promoted in place, the rest move:
+    /// moved objects are referenced only by young objects and roots, which are all relocated (`Trace::relocate`), so not a byte of an old object changes
     #[default]
     SkipRemembered,
-    /// 记忆集里的槽也改成新地址，老对象直接指着的也搬。只有老对象里除了 `Slot` 没有别的地方存这个地址时才能用
-    /// （比如在 `Slot` 旁边另存一份地址的，那一份不会跟着改）
+    /// Remembered slots are rewritten to the new address as well, so objects pointed to directly by old objects also move. Usable only when old objects store the address nowhere but in a `Slot`
+    /// (for example, a copy of the address kept next to the `Slot` would not be updated)
     Full,
 }
 
@@ -147,19 +153,19 @@ impl From<u8> for YoungEvacuation {
     }
 }
 
-/// 堆的统计。
+/// Heap statistics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
-    /// 上次回收后存活的字节数（含头）
+    /// Live bytes after the last collection (including headers)
     pub live: usize,
-    /// 上次回收后新领用的字节数
+    /// Bytes newly taken since the last collection
     pub allocated: usize,
     pub blocks: usize,
     pub large: usize,
     pub collections: u64,
-    /// 其中年轻回收几次
+    /// How many of them were young collections
     pub young_collections: u64,
-    /// 上次回收疏散了几个块、搬了多少字节
+    /// Blocks evacuated and bytes moved by the last collection
     pub evacuated_blocks: usize,
     pub evacuated_bytes: usize,
 }
@@ -171,7 +177,7 @@ impl Default for Heap {
 }
 
 impl Heap {
-    /// 回收最多用 `threads` 个线程。
+    /// Collect with at most `threads` threads.
     pub fn new(threads: NonZeroUsize) -> Self {
         Self {
             threads,
@@ -207,34 +213,83 @@ impl Heap {
             automatic: false,
             evacuated: (0, 0),
             spare: AtomicPtr::new(null_mut()),
+            #[cfg(crossheap)]
+            cross: None,
+            #[cfg(crossheap)]
+            promotion_pending: AtomicBool::new(false),
         }
     }
 
-    /// 在堆上做事；可以在多个线程上同时调用。闭包里分配的对象只有挂到 [`crate::Root`] 上（直接或间接）才能活过下一次回收。
+    /// A private object was written into a cross-heap object since the last young collection: it is visible to other processes only after the next
+    /// young collection promotes it (call [`Heap::collect_young`] when a turn ends).
+    #[cfg(crossheap)]
+    pub fn promotion_pending(&self) -> bool {
+        self.promotion_pending.load(Ordering::Acquire)
+    }
+
+    /// Attach a cross-heap created by this process as the old generation: from then on, every young collection moves surviving shareable young objects (allocated with [`Mutator::alloc_shared`])
+    /// into `cross` and rewrites every place in the private heap that points at them; a full collection ([`Heap::collect`]) collects `cross` together with the private heap —
+    /// edges from the private heap are its roots. From now on `cross` is collected only by this private heap (its `collect` does nothing when called elsewhere).
+    ///
+    /// `cross` must be created in the fixed-address region ([`crate::CrossHeapSpace::reserve_fixed`]) so absolute addresses stored in objects are valid in every process.
+    /// Shareable objects may only point at shareable objects: promotion panics on an edge to a non-shareable object. Concurrent marking and `collect_group` are not supported once attached.
+    #[cfg(crossheap)]
+    pub fn attach_cross_heap(&mut self, cross: &CrossHeap) -> io::Result<()> {
+        let inner = &cross.0;
+        if !inner.space.is_fixed() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "a cross-heap used as the old generation must be created in the fixed-address region (CrossHeapSpace::reserve_fixed)"));
+        }
+        if inner.sup().owner_pid.load(Ordering::Acquire) != Process::current().pid {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "only a cross-heap created by this process can be attached"));
+        }
+        if self.cross.is_some() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "a cross-heap is already attached"));
+        }
+        inner.sup().owner_only.store(1, Ordering::Release);
+        self.cross = Some(CrossHeap(Arc::clone(inner)));
+        Ok(())
+    }
+
+    /// The owner collects the cross-heap too (private marking done, not yet swept): the roots are the cross-heap's own entries, the cross-heap edges traced by the private heap (`crossing`)
+    /// and private root-table slots pointing into the cross-heap; afterwards private weak-table slots pointing at dead cross-heap objects are cleared.
+    #[cfg(crossheap)]
+    fn collect_cross(&mut self, crossing: &Injector<usize>) {
+        let Some(cross) = &self.cross else { return };
+        let mut extra = Self::drain(crossing);
+        // SAFETY: &mut self ⇒ no mutators
+        unsafe { self.roots.crossing(|p| extra.push(p.addr())) };
+        extra.sort_unstable();
+        extra.dedup();
+        let epoch = cross.0.collect_owned(&extra, *self.shrinking.get_mut());
+        // SAFETY: no mutators
+        unsafe { self.weaks.clear_crossed(|p| Inner::survived(p, epoch)) };
+    }
+
+    /// Work on the heap; can be called on several threads at once. Objects allocated in the closure survive the next collection only if they hang from a [`crate::Root`] (directly or indirectly).
     pub fn mutate<R>(&self, f: impl for<'gc> FnOnce(&Mutator<'gc>) -> R) -> R {
         let spare = self.spare.swap(null_mut(), Ordering::AcqRel);
         let mut tlab = if spare.is_null() {
             Box::default()
         } else {
-            // SAFETY: spare 里只放过 Box::into_raw 的 Tlab，swap 后归我们独有
+            // SAFETY: spare only ever holds Tlabs from Box::into_raw, and after the swap it is ours alone
             unsafe { Box::from_raw(spare) }
         };
         let r = self.mutate_in(&mut tlab, f);
         let tlab = Box::into_raw(tlab);
         if self.spare.compare_exchange(null_mut(), tlab, Ordering::AcqRel, Ordering::Relaxed).is_err() {
-            // SAFETY: 没放进去，仍归我们独有
+            // SAFETY: it was not put back, so it is still ours alone
             drop(unsafe { Box::from_raw(tlab) });
         }
         r
     }
 
-    /// 同 [`Heap::mutate`]，但用调用方自己的分配缓冲（一个线程反复 mutate 时留着它，省得每次领新块）。
+    /// As [`Heap::mutate`], but with the caller's own allocation buffer (a thread that mutates repeatedly keeps it, saving a new block every time).
     pub fn mutate_in<R>(&self, tlab: &mut Tlab, f: impl for<'gc> FnOnce(&Mutator<'gc>) -> R) -> R {
         let _inside = Inside::enter(self);
         tlab.adopt((self.id(), self.collections));
-        // 并发标记只在没有 mutator 时开始、只在独占堆时结束，所以一次 mutate 里它不变
+        // Concurrent marking starts only with no mutators and ends only with the heap held exclusively, so it does not change within one mutate
         let marking = NonZeroU32::new(self.marking.load(Ordering::Acquire));
-        // 闭包 panic 也要把攒着的起点位写进去：漏了，下一次停顿重算行时会把活对象占的行当空行
+        // Even if the closure panics, the gathered start bits must be written: if they were missed, the next pause recomputing lines would take lines of live objects as free
         let tlab = FlushStarts(tlab);
         f(&Mutator { heap: self, tlab: tlab.0, marking, _brand: PhantomData })
     }
@@ -243,16 +298,18 @@ impl Heap {
         self.pool.get_or_init(|| Pool::new(self.threads))
     }
 
-    /// 并发标记：开头短暂握手（等 mutate 里的线程走空、照下根），之后其他线程照常 mutate，
-    /// 本线程借回收线程池把从根可达的对象标完（写屏障新攒下的留给下一次 [`Heap::collect`]）。
-    /// 已经有一轮在标记时什么都不做，返回 false。
+    /// Concurrent marking: a short handshake at the start (wait until no thread is inside mutate, snapshot the roots); afterwards other threads mutate as usual
+    /// while this thread, using the collector pool, marks everything reachable from the roots (what the write barrier gathers meanwhile is left to the next [`Heap::collect`]).
+    /// Does nothing and returns false when a round is already marking.
     ///
-    /// 不要在这个堆的 mutate 里调用（会一直等自己走空）。
+    /// Do not call it inside this heap's mutate (it would wait forever for itself to leave).
     pub fn mark_concurrently(&self) -> bool {
-        // 上一轮按「纪元 ≠ 本轮」判死，必须在新一轮标记把活对象标成更新的纪元之前扫完
+        #[cfg(crossheap)]
+        assert!(self.cross.is_none(), "concurrent marking is not supported with a cross-heap attached");
+        // The previous round judges death as "epoch ≠ this round", so it must be fully swept before the new round marks live objects with a newer epoch
         self.sweep_concurrently();
         let epoch = self.next_epoch();
-        // 请求位兼作互斥：谁先挂上谁来开始；已经在标记就撤掉请求返回
+        // The request bit doubles as a lock: whoever sets it first starts; if marking is already running, withdraw the request and return
         if self.gate.fetch_or(REQUEST, Ordering::AcqRel) & REQUEST != 0 {
             return false;
         }
@@ -264,17 +321,17 @@ impl Heap {
         while self.gate.load(Ordering::Acquire) & !REQUEST != 0 {
             backoff.snooze();
         }
-        // 纪元必须在 mutate 里走空之后才发布：否则先进门、看见「在标记」的 mutator 会黑分配，
-        // 而更早进门、没有写屏障的 mutator 还能往这个黑对象底下挂东西，快照之后黑对象不再追踪 ⇒ 漏标
+        // The epoch must be published only after mutate is empty: otherwise a mutator that entered first and sees "marking" allocates black,
+        // while an earlier mutator without the write barrier could still hang things under that black object, which is not traced again after the snapshot ⇒ missed marks
         self.marking.store(epoch, Ordering::Release);
-        // 引用计数顺带重新计数：翻转奇偶（旧计数作废），标记扫描时每条边 +1。到收尾补完（黑对象的边、标记期间
-        // 被改写的槽）之前计数不可信、不按计数释放
+        // Reference counts are recounted along the way: flip the parity (old counts are void) and increment every edge while scanning. Counts are untrustworthy, and nothing is released by count,
+        // until the end fills in the rest (edges of black objects, slots rewritten during marking)
         let parity = !self.rc_parity.fetch_xor(true, Ordering::AcqRel);
         self.rc_valid.store(false, Ordering::Release);
-        // 握手前的登记记的是旧奇偶下的「上次计入」：所在对象活着就会被扫描、改成计入当前值；死了的若留到收尾结算，
-        // 会拿旧值去减新一轮里别的边计上的数 ⇒ 丢掉（槽上残留的登记标志在扫描重新计入时清掉）
+        // Logs from before the handshake recorded "last counted" under the old parity: if the object is alive it gets scanned and switched to counting the current value; if it died, settling it at the end
+        // would subtract the old value from counts made by other edges in the new round ⇒ drop them (logged flags left on slots are cleared when scanning recounts them)
         drop(Self::drain(&self.rc_log));
-        // SAFETY: 请求挂着且 mutate 里没人 ⇒ 没有 mutator（根句柄的析构不受影响）
+        // SAFETY: the request is set and nobody is inside mutate ⇒ no mutators (dropping root handles is unaffected)
         let roots = unsafe { self.roots.settle() };
         Marking::seed(&self.grey, &roots, epoch);
         self.gate.fetch_and(!REQUEST, Ordering::AcqRel);
@@ -283,19 +340,19 @@ impl Heap {
         true
     }
 
-    /// 并发标记期间被改写过的槽：新值 +1、上次计入的值 −1（扫描可能在写之前或之后计过，两种情况结算后都对）。
-    /// 减量只留给本轮活着的对象（死的马上被清扫，碰不得），放进队列由后台处理。SAFETY 见调用处：独占堆。
+    /// Slots rewritten during concurrent marking: new value +1, last counted value −1 (the scan may have counted before or after the write; settling is right either way).
+    /// Decrements apply only to objects alive this round (dead ones are about to be swept and must not be touched) and go on the queue for the background. SAFETY: see the caller (heap held exclusively).
     fn settle_concurrent_log(&mut self, epoch: u32) {
         let parity = *self.rc_parity.get_mut();
         for addr in Self::drain(&self.rc_log) {
-            // SAFETY: 登记的槽在被写时所在对象可达；独占堆、清扫还没开始，内存都还在
+            // SAFETY: the logged slot's object was reachable when written; the heap is held exclusively and sweeping has not started, so the memory is there
             let slot = unsafe { &*core::ptr::with_exposed_provenance::<RawSlot>(addr) };
             let (cur, prev) = slot.recount();
             if let Some(cur) = cur {
-                // SAFETY: 槽当前指向的对象还在（清扫没开始）
+                // SAFETY: the object the slot points at now is still there (sweeping has not started)
                 unsafe { &*cur }.rc_inc(parity);
             }
-            // SAFETY: 同上
+            // SAFETY: as above
             if let Some(prev) = prev
                 && unsafe { &*prev }.is_marked(epoch)
             {
@@ -304,17 +361,17 @@ impl Heap {
         }
     }
 
-    /// 下一轮的纪元。
+    /// The next round's epoch.
     fn next_epoch(&self) -> u32 {
-        self.epoch.checked_add(1).filter(|&e| e <= MAX_EPOCH).expect("纪元用完了")
+        self.epoch.checked_add(1).filter(|&e| e <= MAX_EPOCH).expect("out of epochs")
     }
 
-    /// 从清扫后没再用过的可用块里挑疏散候选：存活不到 [`EVACUATE_LIVE`] 字节（且不是全空）的稀疏块，至多
-    /// [`EVACUATE_MAX`] 个；够 [`EVACUATE_MIN`] 个才疏散。其余块放进 `targets` 当搬入的目标。返回疏散的块数（0 = 不疏散）。
+    /// Pick evacuation candidates among the available blocks unused since sweeping: sparse blocks with less than [`EVACUATE_LIVE`] live bytes (and not empty), at most
+    /// [`EVACUATE_MAX`]; evacuate only with at least [`EVACUATE_MIN`]. The other blocks go to `targets` as destinations. Returns the number of blocks to evacuate (0 = none).
     fn pick_evacuation(available: &[Block], targets: &Injector<Block>) -> usize {
         let live = |b: &Block| b.live_since_sweep().filter(|&live| live > 0 && live < EVACUATE_LIVE);
         let mut sparse: Vec<(usize, Block)> = available.iter().filter_map(|b| live(b).map(|l| (l, *b))).collect();
-        // 最稀疏的先搬（搬得少、腾得多）；不够数就不疏散
+        // Move the sparsest first (least to move, most freed); not enough candidates means no evacuation
         sparse.sort_unstable_by_key(|&(l, _)| l);
         sparse.truncate(EVACUATE_MAX);
         if sparse.len() < EVACUATE_MIN {
@@ -331,10 +388,10 @@ impl Heap {
         sparse.len()
     }
 
-    /// 写屏障：并发标记中覆盖掉的旧值若还没标，就标上（连同它跨的行）并放进灰队列（保住初始快照）。
-    /// 灰队列里的对象都已标过，取出来只追踪它的边，所以这里必须先标。
+    /// Write barrier: an old value overwritten during concurrent marking is marked (with the lines it spans) and put on the grey queue if not yet marked (preserving the snapshot).
+    /// Objects on the grey queue are already marked and are only traced when taken out, so marking must happen here first.
     fn remember(&self, old: *const Header, epoch: u32) {
-        // SAFETY: old 来自本堆的槽（初始快照时活着）或弱表（上次停顿后活着、计数粘住），本轮不会被回收
+        // SAFETY: old comes from a slot of this heap (alive at the snapshot) or from the weak table (alive since the last pause, count stuck), so it is not collected this round
         let h = unsafe { &*old };
         if h.mark(epoch) {
             if !h.is_large() {
@@ -344,7 +401,7 @@ impl Heap {
         }
     }
 
-    /// 领一个块给分配缓冲：先拿清扫好的；没有就自己领一个没扫的当场扫（惰性清扫），能用就用；最后开新的。
+    /// Take a block for an allocation buffer: a swept one first; otherwise take an unswept one and sweep it on the spot (lazy sweeping), using it if possible; finally open a new one.
     fn acquire(&self) -> Block {
         self.allocated.fetch_add(BLOCK, Ordering::Relaxed);
         loop {
@@ -374,8 +431,8 @@ impl Heap {
         self.fresh()
     }
 
-    /// 溢出分配领块：从可用块里找有放得下 `bytes` 的空洞的（最多看 [`OVERFLOW_TRIES`] 个，放不下的退回可用队列留给小对象），
-    /// 找不到就开新块。
+    /// Take a block for overflow allocation: look among available blocks for one with a hole fitting `bytes` (at most [`OVERFLOW_TRIES`]; those that do not fit go back on the available queue for small objects),
+    /// otherwise open a new block.
     fn acquire_for(&self, bytes: usize) -> Block {
         self.allocated.fetch_add(BLOCK, Ordering::Relaxed);
         let mut rejected = Vec::new();
@@ -410,19 +467,19 @@ impl Heap {
         b
     }
 
-    /// 年轻回收怎么搬存活的年轻对象（缺省 [`YoungEvacuation::SkipRemembered`]）。搬走的对象地址会变：
-    /// 按地址建索引的结构要在 `Trace::relocate` 里更新，而且只要它指着年轻对象，它自己也得是年轻的
-    /// （年轻回收不扫描老对象；比如改动时挪进新分配的对象）。
+    /// How young collections move surviving young objects (default [`YoungEvacuation::SkipRemembered`]). Moved objects change address:
+    /// structures indexed by address must update in `Trace::relocate`, and as long as they point at young objects they must themselves be young
+    /// (young collections do not scan old objects; for example, move into a newly allocated object when changing).
     pub fn set_young_evacuation(&self, mode: YoungEvacuation) {
         self.young_evacuation.store(mode as u8, Ordering::Relaxed);
     }
 
-    /// 上一轮的清扫还没做完（mutator 要块时会顺手扫，或调 [`Heap::sweep_concurrently`]）。
-    /// 死对象的析构在哪跑：真（缺省）= 全部回收线程并行；假 = 只在调用 [`Heap::collect`] / [`Heap::collect_young`] /
-    /// [`Heap::sweep_concurrently`] 的线程上跑（标记、判死、清起点位、算行照旧并行；mutator 要块时顺手扫的照旧在它自己线程上析构）。
+    /// The previous round's sweep is not finished yet (mutators sweep along when they need blocks, or call [`Heap::sweep_concurrently`]).
+    /// Where dead objects are finalized: true (default) = in parallel on all collector threads; false = only on the thread calling [`Heap::collect`] / [`Heap::collect_young`] /
+    /// [`Heap::sweep_concurrently`] (marking, judging death, clearing start bits and computing lines stay parallel; blocks a mutator sweeps along are still finalized on its own thread).
     ///
-    /// 析构里要释放 mutator 线程分配的内存（`Box`、`String`……）时关掉它：跨线程释放会让分配器争用（glibc 的 arena 锁），
-    /// 往往比单线程析构还慢。
+    /// Turn it off when destructors free memory allocated on mutator threads (`Box`, `String`…): freeing across threads makes the allocator contend (glibc's arena locks),
+    /// often slower than finalizing on one thread.
     pub fn set_parallel_drop(&self, on: bool) {
         self.parallel_drop.store(on, Ordering::Relaxed);
     }
@@ -431,8 +488,8 @@ impl Heap {
         !self.sweeper.is_done()
     }
 
-    /// 并发清扫：借回收线程池先把引用计数的减量做完（连锁释放），再把上一轮还没扫的块与大对象扫完
-    /// （mutator 可以同时跑，也在顺手扫）；返回时上一轮的死对象都已析构。
+    /// Concurrent sweeping: on the collector pool, first finish the reference count decrements (cascading releases), then sweep the previous round's remaining blocks and large objects
+    /// (mutators may run meanwhile and also sweep along); on return all of the previous round's dead objects are finalized.
     pub fn sweep_concurrently(&self) {
         let pool = self.pool();
         if !self.decs.is_empty() {
@@ -442,7 +499,7 @@ impl Heap {
     }
 
     fn alloc_large(&self, bytes: usize) -> *mut u8 {
-        // SAFETY: Large::alloc 不返回空指针（失败走 handle_alloc_error）
+        // SAFETY: Large::alloc never returns null (failure goes to handle_alloc_error)
         let p = unsafe { NonNull::new_unchecked(Large::alloc(bytes)) };
         self.large.push(Large(p.cast()));
         self.allocated.fetch_add(bytes, Ordering::Relaxed);
@@ -462,15 +519,15 @@ impl Heap {
         }
     }
 
-    /// 上次回收后新领用的够多了就回收：平时做年轻回收（死掉的老对象由引用计数收），追踪式的完整回收只为收环、
-    /// 计数粘住的对象而少跑——计数可信时每 [`YOUNG_PER_FULL_RC`] 次年轻回收一次；计数不可信（并发标记之后）时
-    /// 每 [`YOUNG_PER_FULL`] 次一次，尽快重新计数。回收了返回 true。
+    /// Collect once enough was newly taken since the last collection: usually a young collection (dead old objects are reclaimed by reference counting); tracing full collections run rarely, only for cycles
+    /// and stuck counts — one per [`YOUNG_PER_FULL_RC`] young collections while counts are trustworthy; while they are not (after concurrent marking)
+    /// one per [`YOUNG_PER_FULL`], to recount soon. Returns true if it collected.
     pub fn collect_if_needed(&mut self) -> bool {
         let live = self.sweeper.live().max(MIN_TRIGGER);
         let due = *self.allocated.get_mut() >= live * GROWTH;
         if due {
             let every = if *self.rc_valid.get_mut() { YOUNG_PER_FULL_RC } else { YOUNG_PER_FULL };
-            // 碎了：块占的比「存活 + 这一轮允许新分配的」多出 FRAG_RATIO 倍 ⇒ 完整回收（带疏散），不等轮到
+            // Fragmented: blocks take FRAG_RATIO times more than "live + what this round may allocate" ⇒ a full collection (with evacuation) without waiting for its turn
             let fragmented = self.blocks.len() * BLOCK * FRAG_DEN > live * (1 + GROWTH) * FRAG_NUM;
             self.automatic = true;
             if self.young_since_full < every && !fragmented {
@@ -483,53 +540,63 @@ impl Heap {
         due
     }
 
-    /// 年轻回收：只追上次回收后分配的对象（标记纪元不是上次完成的那轮），从根与记忆集里的槽出发；碰到老对象就停。
-    /// 追到的年轻对象标成上次完成的纪元（晋升为老对象），然后只扫上次回收后被拿去分配过的块：没追到的年轻对象析构、
-    /// 行空出来。老对象一个不碰（死掉的老对象留给下一次完整回收）。返回时死掉的年轻对象都已析构。
+    /// Young collection: traces only objects allocated since the last collection (mark epoch not the last completed one), starting from the roots and remembered slots; it stops at old objects.
+    /// Young objects reached are marked with the last completed epoch (promoted to old), then only blocks taken for allocation since the last collection are swept: unreached young objects are finalized
+    /// and their lines freed. Old objects are not touched (dead old objects wait for the next full collection). On return all dead young objects are finalized.
     ///
-    /// 有并发标记在进行时，改为把它收尾（完整回收）。
+    /// When concurrent marking is in progress, finishes it instead (a full collection).
     pub fn collect_young(&mut self) {
         self.finish_young();
         self.sweep_concurrently();
     }
 
-    /// 年轻回收的停顿部分：标记、结算引用计数的增量；减量与清扫留给之后的 [`Heap::sweep_concurrently`]
-    /// （与 mutator 并发；mutator 要块时也会顺手扫）。
+    /// The pause of a young collection: mark and settle reference count increments; decrements and sweeping are left to a later [`Heap::sweep_concurrently`]
+    /// (concurrent with mutators; mutators also sweep along when they need blocks).
     pub fn finish_young(&mut self) {
         if *self.marking.get_mut() != 0 {
             self.finish_marking();
             return;
         }
         self.sweep_concurrently();
-        // 上一轮后台释放过对象的块：按还在的老对象重算行（年轻对象的行由下面的追踪标上，死掉的由清扫收）。
-        // 被拿去分配过的块里可能有还没扫的死年轻对象（起点位还在）：只重算行、不放回可用队列，交给年轻清扫分类
+        // Blocks in which objects were released in the background: recompute lines from the old objects still there (young objects' lines are marked by the trace below, dead ones reclaimed by sweeping).
+        // Blocks taken for allocation may hold unswept dead young objects (start bits still set): only recompute lines without putting them back on the available queue, and let the young sweep classify them
         let epoch = self.epoch;
         let mut dirty = Self::drain(&self.dirty);
         dirty.sort_unstable_by_key(|b| b.line(0).addr());
         dirty.dedup();
         for b in dirty {
-            // SAFETY: 独占；块里起点位标着的对象都还没析构
+            // SAFETY: exclusive; the objects marked in the start bitmap are not finalized yet
             if unsafe { b.recompute_lines(epoch) } && b.list() {
                 self.available.push(b);
             }
         }
         let epoch = self.epoch;
         let mode = self.young_mode();
+        // With a cross-heap attached: every shareable young object must move over (including ones pointed to directly by old objects, with remembered slots rewritten)
+        #[cfg(crossheap)]
+        let mode = if self.cross.is_some() { YoungEvacuation::Full } else { mode };
+        #[cfg(crossheap)]
+        let cross = self.cross.as_ref().map(|c| Arc::clone(&c.0));
+        // Stay inside the cross-heap's door while promoting (like the other threads of this process and the mutators of other processes)
+        #[cfg(crossheap)]
+        let _inside = cross.as_deref().map(Gate::enter);
         let remembered = Self::drain(&self.remembered);
+        #[cfg(crossheap)]
+        self.promotion_pending.store(false, Ordering::Release);
         let counting = *self.rc_valid.get_mut();
         let parity = *self.rc_parity.get_mut();
         let pool = self.pool.get_or_init(|| Pool::new(self.threads));
         let workers = pool.sized(self.blocks.len() + self.large.len());
-        // 晋升的对象被扫描时，它的每条边 +1（年轻对象的边从晋升起才计数）
+        // While a promoted object is scanned, each of its edges is incremented (young objects' edges are counted from promotion on)
         let mark = Marking::new(workers, epoch, &self.grey).counting(counting.then_some(parity));
         let moved = AtomicUsize::new(0);
         if mode == YoungEvacuation::Off {
-            // SAFETY: &mut self ⇒ 没有 mutator
+            // SAFETY: &mut self ⇒ no mutators
             Marking::seed(&self.grey, &unsafe { self.roots.settle() }, epoch);
             Marking::seed_slots(&self.grey, &remembered, epoch);
             mark.run(pool);
         } else {
-            // 上次回收后拿去分配过的块都疏散（里面的老对象不搬：本轮早就标过了）；搬入可用块与新块
+            // Every block taken for allocation since the last collection is evacuated (old objects in it do not move: they were marked long ago this round); objects move into available and new blocks
             let young: Vec<Block> = self.blocks.take();
             for &b in &young {
                 if b.live_since_sweep().is_none() {
@@ -537,26 +604,29 @@ impl Heap {
                 }
             }
             self.blocks.extend(young);
-            // 别的堆直接指着的年轻对象先原地标上（不搬）
+            // Young objects pointed to directly from other heaps are marked in place first (not moved)
             let mut pinned = Vec::new();
-            // SAFETY: 没有 mutator
+            // SAFETY: no mutators
             unsafe { self.roots.pinned(|h| pinned.push(h)) };
             Marking::seed(&self.grey, &pinned, epoch);
             let slots: &[usize] = if mode == YoungEvacuation::Full { &remembered } else {
-                // 老对象直接指着的也原地标上
+                // Objects pointed to directly by old objects are marked in place too
                 Marking::seed_slots(&self.grey, &remembered, epoch);
                 &[]
             };
-            mark.evacuating(&self.roots, &self.available, &self.blocks, &self.pages, &moved, epoch).relocating_slots(slots).run(pool);
+            let mark = mark.evacuating(&self.roots, &self.available, &self.blocks, &self.pages, &moved, epoch).relocating_slots(slots);
+            #[cfg(crossheap)]
+            let mark = mark.promoting(cross.as_deref());
+            mark.run(pool);
         }
-        // 引用计数（可信时）在标记之后结算（对象可能搬了，用搬后的地址）：当前的根 +1、登记过的槽按「新值 +1、
-        // 上次计入的值 −1」结算，上一轮的根延迟到现在 −1
-        // SAFETY: &mut self ⇒ 没有 mutator
+        // Reference counts (when trustworthy) are settled after marking (objects may have moved, so the new addresses are used): current roots +1, logged slots settle "new value +1,
+        // last counted value −1", and the previous round's roots are decremented now (deferred)
+        // SAFETY: &mut self ⇒ no mutators
         let roots = unsafe { self.roots.settle() };
         let mut decs = Vec::new();
         if counting {
             for &root in &roots {
-                // SAFETY: 根指向活对象
+                // SAFETY: roots point at live objects
                 unsafe { &*root }.rc_inc(parity);
             }
             decs.append(&mut self.rc_roots);
@@ -564,12 +634,12 @@ impl Heap {
             self.rc_roots.clear();
         }
         for addr in Self::drain(&self.rc_log) {
-            // SAFETY: 登记的槽在被写时所在对象可达，到这次回收前不会被释放
+            // SAFETY: the logged slot's object was reachable when written and is not freed before this collection
             let slot = unsafe { &*core::ptr::with_exposed_provenance::<RawSlot>(addr) };
             if counting {
                 let (cur, prev) = slot.recount();
                 if let Some(cur) = cur {
-                    // SAFETY: 槽当前指向活对象
+                    // SAFETY: the slot currently points at a live object
                     unsafe { &*cur }.rc_inc(parity);
                 }
                 decs.extend(prev.map(<*const Header>::expose_provenance));
@@ -579,14 +649,14 @@ impl Heap {
         }
         if counting {
             self.rc_roots = roots.iter().map(|r| r.expose_provenance()).collect();
-            // 增量都已加完；减量交给后台（sweep_concurrently）
+            // All increments are done; decrements go to the background (sweep_concurrently)
             for addr in decs {
                 self.decs.push(addr);
             }
         }
-        // SAFETY: 没有 mutator；标记（含年轻疏散）做完了、还没清扫
+        // SAFETY: no mutators; marking (including young evacuation) is done and sweeping has not started
         unsafe { self.weaks.clear_unreached(epoch, parity) };
-        // 只扫上次回收后拿去分配过的块（年轻对象只可能在这些块里）；没动过的老块原样放回
+        // Sweep only blocks taken for allocation since the last collection (young objects can only be there); untouched old blocks go back as they are
         let (young, old): (Vec<Block>, Vec<Block>) = self.blocks.take().into_iter().partition(|b| b.live_since_sweep().is_none());
         self.blocks.extend(old);
         let large = self.large.take();
@@ -601,16 +671,16 @@ impl Heap {
         self.young_since_full += 1;
     }
 
-    /// 这一轮年轻回收怎么搬：按设定，但上一次年轻回收几乎全活下来（年轻对象多半要活一阵子，比如一批批建了又整批丢掉
-    /// 的对象）时原地晋升——搬它们只是把刚分配的又复制一遍，块也不碎（活的挤在一起）；碎片留给完整回收疏散。
-    /// 要在上一轮清扫完之后调（存活字节数才全）。
+    /// How this young collection moves objects: as configured, except that when the last young collection kept nearly everything (young objects that tend to live a while, such as batches built and then
+    /// dropped whole), they are promoted in place — moving them would only copy what was just allocated, and the blocks are not fragmented (survivors are packed); fragmentation is left to full-collection evacuation.
+    /// Call after the previous round is swept (so the live byte count is complete).
     fn young_mode(&mut self) -> YoungEvacuation {
         let allocated = core::mem::take(&mut self.young_allocated);
         let mode = YoungEvacuation::from(*self.young_evacuation.get_mut());
         if allocated > 0 && self.sweeper.live() * YOUNG_COPY_DEN > allocated * YOUNG_COPY_NUM { YoungEvacuation::Off } else { mode }
     }
 
-    /// 取空一个队列。
+    /// Empty a queue.
     fn drain<T>(queue: &Injector<T>) -> Vec<T> {
         let mut out = Vec::new();
         loop {
@@ -622,16 +692,21 @@ impl Heap {
         }
     }
 
-    /// 完整回收：[`Heap::finish_marking`] 后立刻把清扫做完（返回时死对象都已析构）。
+    /// Full collection: [`Heap::finish_marking`], then finish sweeping right away (on return dead objects are finalized).
     pub fn collect(&mut self) {
+        // With a cross-heap attached: first run a young collection to promote shareable young objects (a full collection would mark them old, and they would never be promoted after that)
+        #[cfg(crossheap)]
+        if self.cross.is_some() {
+            self.collect_young();
+        }
         self.finish_marking();
         self.sweep_concurrently();
     }
 
-    /// 清扫前定 [`Pages`] 热池的上限。清扫留作备用的全空块按这一轮的领用算；领用在涨的负载（存活的多了，触发线跟着
-    /// 抬高）下一轮要得更多，多出来的块一还一领就是 `madvise` 再整块缺页。所以备用的加上热池的，合起来留到最近
-    /// [`WARM_CYCLES`] 轮里领用最多的那一轮那么多；负载降下来，几轮之后多的就还给系统。只有自动回收
-    /// （[`Heap::collect_if_needed`]）这样留；直接调的回收（[`Heap::collect`] 等）和 `shrinking` 热池一块不留。
+    /// Set the cap of the [`Pages`] warm pool before sweeping. The spare empty blocks kept by sweeping follow this round's take; under a growing load (more live data, a higher trigger)
+    /// the next round needs more, and the excess blocks given back and taken again cost `madvise` plus faulting in whole blocks. So spares plus the warm pool together keep as many as the most
+    /// taken in any of the last [`WARM_CYCLES`] rounds; once the load drops the excess goes back to the system within a few rounds. Only automatic collections
+    /// ([`Heap::collect_if_needed`]) keep these; direct collections ([`Heap::collect`] and others) and `shrinking` keep no warm pool.
     fn warm_for_next_cycle(&mut self, shrinking: bool) {
         self.recent.rotate_right(1);
         self.recent[0] = *self.allocated.get_mut() / BLOCK;
@@ -640,53 +715,57 @@ impl Heap {
         self.pages.set_warm_cap(cap);
     }
 
-    /// 尽量把内存还给系统（像 cppgc 的减内存回收）：完整回收（带疏散），全空的块一个不留，
-    /// 有空行的块把凑满整页的空行 `madvise` 掉（之后再分配进去要重新缺页，所以平时的回收不做）。
-    /// 适合空闲时、或者进程收到内存压力时调用。
+    /// Give as much memory as possible back to the system (like cppgc's memory-reducing GC): a full collection (with evacuation) that keeps no empty blocks
+    /// and `madvise`s whole pages of free lines in partially used blocks (allocating there later faults pages in again, so ordinary collections do not do it).
+    /// Suited to idle times or when the process is under memory pressure.
     pub fn shrink(&mut self) {
         *self.shrinking.get_mut() = true;
         self.collect();
         *self.shrinking.get_mut() = false;
     }
 
-    /// 标记收尾：有并发标记在进行就清空写屏障攒下的灰对象把它标完，否则从全部 [`crate::Root`] 出发并行标记；
-    /// 然后把全部块交给清扫器就返回——清扫在之后与 mutator 并发进行（mutator 要块时顺手扫，
-    /// 或者某个线程调 [`Heap::sweep_concurrently`]）。停顿只有标记的收尾。
+    /// Finish marking: if concurrent marking is in progress, drain the grey objects gathered by the write barrier to complete it; otherwise mark in parallel from every [`crate::Root`];
+    /// then hand every block to the sweeper and return — sweeping then proceeds concurrently with mutators (mutators sweep along when they need blocks,
+    /// or some thread calls [`Heap::sweep_concurrently`]). The pause is only the end of marking.
     pub fn finish_marking(&mut self) {
         self.sweep_concurrently();
-        // 引用计数顺带重新计数（旧计数作废，扫描时每条边 +1、槽改成计入当前值）：停顿式在这里翻转奇偶；
-        // 并发标记已在握手时翻转，扫描已经计了一部分，下面补黑对象的边、结算标记期间被改写的槽
+        // Reference counts are recounted along the way (old counts void; every edge scanned +1 and slots switch to counting the current value): stop-the-world flips the parity here;
+        // concurrent marking flipped it at the handshake and its scan already counted part; below, black objects' edges are added and slots rewritten during marking are settled
         let concurrent = *self.marking.get_mut() != 0;
         self.begin_full(concurrent);
         let count = Some(*self.rc_parity.get_mut());
-        // SAFETY: &mut self ⇒ 没有 mutator
+        // SAFETY: &mut self ⇒ no mutators
         let roots = unsafe { self.roots.settle() };
         let marking = *self.marking.get_mut();
         let epoch = if marking == 0 { self.next_epoch() } else { marking };
         let pool = self.pool.get_or_init(|| Pool::new(self.threads));
         let workers = pool.sized(self.blocks.len() + self.large.len());
-        // 清扫好、没再用过的可用块：不并发标记时从里面挑稀疏的疏散，其余当搬入的目标
+        // Swept available blocks unused since: without concurrent marking, the sparse ones are picked for evacuation and the rest become destinations
         let available = self.take_available();
         let targets = Injector::new();
         let mut evacuate = if marking == 0 { Self::pick_evacuation(&available, &targets) } else { 0 };
         if evacuate > 0 {
-            // 别的堆直接指着的对象不能搬：它们所在的块撤掉疏散、改当搬入目标。必须在标记开始前撤，
-            // 否则别的工人可能先经堆内的边追到它、把它搬走
+            // Objects pointed to directly from other heaps must not move: their blocks are taken off evacuation and become destinations. This must happen before marking starts,
+            // otherwise another worker might reach the object through an edge inside the heap first and move it
             let pin = |h: *const Header| {
-                // SAFETY: 入口指着本堆的活对象
+                // SAFETY: entries point at live objects of this heap
                 if !unsafe { &*h }.is_large() && Block::containing(h.cast()).pin() {
                     evacuate -= 1;
                     targets.push(Block::containing(h.cast()));
                 }
             };
-            // SAFETY: 没有 mutator
+            // SAFETY: no mutators
             unsafe { self.roots.pinned(pin) };
         }
-        // 并发标记的黑对象：已标过、没扫描过，放进灰队列让收尾的标记扫描一遍（只为计数）
+        // Black objects from concurrent marking: marked but never scanned, so they go on the grey queue for the final marking to scan once (only for counting)
         for addr in Self::drain(&self.black) {
             self.grey.push(addr);
         }
+        #[cfg(crossheap)]
+        let crossing = Injector::new();
         let mark = Marking::new(workers, epoch, &self.grey).counting(count);
+        #[cfg(crossheap)]
+        let mark = mark.crossing(self.cross.is_some().then_some(&crossing));
         let moved = AtomicUsize::new(0);
         if evacuate > 0 {
             mark.evacuating(&self.roots, &targets, &self.blocks, &self.pages, &moved, self.epoch).run(pool);
@@ -699,13 +778,15 @@ impl Heap {
         if concurrent {
             self.settle_concurrent_log(epoch);
         }
-        // SAFETY: 没有 mutator；标记（含疏散）做完了、还没清扫
+        // SAFETY: no mutators; marking (including evacuation) is done and sweeping has not started
         unsafe { self.weaks.clear_unreached(epoch, *self.rc_parity.get_mut()) };
+        #[cfg(crossheap)]
+        self.collect_cross(&crossing);
         self.end_full(epoch, (evacuate, moved.into_inner()));
     }
 
-    /// 完整回收开头的簿记（独占）：完整标记重新标行、找到全部活对象，脏块、记忆集不再需要；
-    /// 停顿式的在这里翻转计数奇偶（标记前登记的槽：所在对象活着就会被扫描、计入当前值，死了不用管）。
+    /// Bookkeeping at the start of a full collection (exclusive): full marking re-marks lines and finds every live object, so dirty blocks and the remembered set are no longer needed;
+    /// a stop-the-world one flips the count parity here (slots logged before marking: if their object is alive it is scanned and switched to the current value; if dead, nothing to do).
     fn begin_full(&mut self, concurrent: bool) {
         drop(Self::drain(&self.dirty));
         drop(Self::drain(&self.remembered));
@@ -718,7 +799,7 @@ impl Heap {
         self.rc_roots.clear();
     }
 
-    /// 取出全部可用块（完整回收后清扫器会重新分类、放回）。
+    /// Take every available block out (after a full collection the sweeper reclassifies them and puts them back).
     fn take_available(&self) -> Vec<Block> {
         let available = Self::drain(&self.available);
         for b in &available {
@@ -727,15 +808,15 @@ impl Heap {
         available
     }
 
-    /// 完整回收收尾（独占）：计数可信了；全部块交给清扫器（疏散时新开的块也已登记），清扫好的可用块之后再一个个放回
-    /// available（它们本来就都在 blocks 里）。`evacuated`：疏散的块数与字节数。
+    /// End of a full collection (exclusive): counts are trustworthy; every block goes to the sweeper (blocks opened during evacuation are registered too), and the swept available blocks return
+    /// to available one by one later (they are all in blocks anyway). `evacuated`: blocks and bytes evacuated.
     fn end_full(&mut self, epoch: u32, evacuated: (usize, usize)) {
         self.young_allocated = 0;
         *self.rc_valid.get_mut() = true;
         let blocks = self.blocks.take();
         let large = self.large.take();
-        // 留作备用的全空块：上一轮领用了多少块，下一轮大概还要这么多；多的还给系统。
-        // 留少了每轮都要新开块（清零 + 缺页），比如临时对象多的负载每轮几乎全空
+        // Spare empty blocks: the next round probably takes about as many blocks as the last one did; the rest go back to the system.
+        // Keeping too few means opening new blocks every round (zeroing + page faults), e.g. a load with many temporaries is nearly all empty every round
         let shrinking = *self.shrinking.get_mut();
         let spare = if shrinking { 0 } else { (*self.allocated.get_mut() / BLOCK).max(MIN_SPARE_BLOCKS) };
         self.warm_for_next_cycle(shrinking);
@@ -747,11 +828,11 @@ impl Heap {
         self.collections += 1;
     }
 
-    /// 几个堆一起完整回收，收掉跨堆的环（A 的对象经 [`crate::Far`] 指向 B、B 的又指回 A，单独回收时彼此的入口都是根）。
+    /// Fully collect several heaps together, reclaiming cycles across heaps (A's object points to B through a [`crate::Far`] and B's points back; in single collections each other's entries are roots).
     ///
-    /// 组内堆持有的 Far 不算根：各堆从自己的 [`crate::Root`]（和组外持有的 Far）出发标记，追踪到 Far 就把目标交给目标堆
-    /// 接着标，直到不再有新的；没被标到的入口说明持有它的 Far 已经死了，清空。不疏散。返回时死对象都已析构。
-    /// 有并发标记在进行的堆先单独收尾。
+    /// Fars held by heaps of the group are not roots: each heap marks from its own [`crate::Root`]s (and Fars held from outside the group), and a traced Far hands its target to the target heap
+    /// to continue marking until nothing new appears; an unmarked entry means the Far holding it is dead, so it is cleared. No evacuation. On return dead objects are finalized.
+    /// Heaps with concurrent marking in progress finish it on their own first.
     pub fn collect_group(heaps: &mut [&mut Heap]) {
         for h in heaps.iter_mut() {
             if *h.marking.get_mut() != 0 {
@@ -766,7 +847,7 @@ impl Heap {
             h.begin_full(false);
             drop(h.take_available());
             let epoch = h.next_epoch();
-            // SAFETY: &mut ⇒ 没有 mutator
+            // SAFETY: &mut ⇒ no mutators
             let roots = unsafe { h.roots.settle_outside(inside) };
             Marking::seed(&h.grey, &roots, epoch);
             epochs.push(epoch);
@@ -782,7 +863,7 @@ impl Heap {
                 Marking::new(workers, epoch, &h.grey).counting(Some(h.rc_parity.load(Ordering::Acquire))).grouping(&found).run(pool);
             }
             for (table, header) in Self::drain(&found) {
-                // 组外的堆不在这次回收里，它的入口是自己的根，不用管
+                // Heaps outside the group are not part of this collection; their entries are their own roots, nothing to do
                 if let Some(j) = ids.iter().position(|&id| id == table) {
                     Marking::seed(&heaps[j].grey, &[core::ptr::with_exposed_provenance(header)], epochs[j]);
                 }
@@ -792,9 +873,9 @@ impl Heap {
             }
         }
         for (h, &epoch) in heaps.iter_mut().zip(&epochs) {
-            // SAFETY: 没有 mutator；还没开始清扫
+            // SAFETY: no mutators; sweeping has not started
             unsafe { h.roots.clear_dead(inside, epoch) };
-            // SAFETY: 同上
+            // SAFETY: as above
             unsafe { h.weaks.clear_unreached(epoch, *h.rc_parity.get_mut()) };
             h.end_full(epoch, (0, 0));
         }
@@ -804,13 +885,13 @@ impl Heap {
     }
 }
 
-/// 只给本 crate 用的操作：trait 在私有模块里、不导出，crate 外拿不到。
+/// Operations for this crate only: the trait lives in a private module and is not exported, so it is unreachable outside the crate.
 pub trait HeapInternal {
     fn roots(&self) -> &Arc<RootTable>;
 
     fn weaks(&self) -> &Arc<RootTable>;
 
-    /// 堆的身份：根表的地址（堆本身可能被移动）；不会是 [`crate::handle::NO_HOLDER`]。
+    /// The heap's identity: the address of its root table (the heap itself may move); never [`crate::handle::NO_HOLDER`].
     fn id(&self) -> usize;
 }
 
@@ -829,7 +910,7 @@ impl HeapInternal for Heap {
 }
 
 
-/// 清扫器扫完一项交回堆：块进全部块表，可用的再放进 available；活着的大对象回到大对象表。
+/// The sweeper hands a swept item back to the heap: blocks go into the block table and usable ones onto available; live large objects return to the large object table.
 impl Sink for Heap {
     fn block(&self, outcome: Outcome) {
         match outcome {
@@ -842,7 +923,7 @@ impl Sink for Heap {
             Outcome::Full(b) => {
                 self.blocks.push(b);
             }
-            // SAFETY: 全空的块（死对象已析构），来自本堆的 pages，之后不再使用
+            // SAFETY: an empty block (dead objects finalized) from this heap's pages, never used again
             Outcome::Release(b) => unsafe { b.release(&self.pages) },
         }
     }
@@ -854,12 +935,12 @@ impl Sink for Heap {
 
 impl Drop for Heap {
     fn drop(&mut self) {
-        // 从没回收过就不为析构专门起线程
+        // A heap that never collected does not start threads just to finalize
         let pool = self.pool.take().unwrap_or_else(|| Pool::new(NonZeroUsize::MIN));
         let parallel_drop = *self.parallel_drop.get_mut();
-        // 块随后整段解除映射：还回来的不必先 madvise
+        // The blocks are unmapped as a whole right after, so returned ones need no madvise first
         self.pages.set_warm_cap(usize::MAX);
-        // 先把上一轮扫完，再用一个比谁都新的纪元（并发标记中的也算死）不标记直接扫一轮：全部析构，全空块不留备用全部还回去
+        // Finish the previous round, then sweep once without marking using an epoch newer than any (even objects under concurrent marking count as dead): everything is finalized and every empty block goes back, none kept as spare
         self.sweeper.finish(&pool, self, parallel_drop);
         let epoch = self.epoch.max(*self.marking.get_mut()).wrapping_add(1);
         let blocks = self.blocks.take();
@@ -870,13 +951,13 @@ impl Drop for Heap {
         debug_assert!(self.blocks.is_empty() && self.large.is_empty());
         let spare = *self.spare.get_mut();
         if !spare.is_null() {
-            // SAFETY: Box::into_raw 来的
+            // SAFETY: from Box::into_raw
             drop(unsafe { Box::from_raw(spare) });
         }
     }
 }
 
-/// mutate 结束（含 panic）时把分配缓冲攒着的起点位写进块里。
+/// When a mutate ends (including by panic), write the start bits gathered by the allocation buffer into the blocks.
 struct FlushStarts<'a>(&'a Tlab);
 
 impl Drop for FlushStarts<'_> {
@@ -885,18 +966,18 @@ impl Drop for FlushStarts<'_> {
     }
 }
 
-/// 线程的分配缓冲：主游标与溢出游标（各自的块、找到哪一行、当前空洞的游标与界）。块在两次回收之间只归它。
+/// A thread's allocation buffer: a main cursor and an overflow cursor (each with its block, the line to search from, and the current hole's cursor and limit). Between two collections the blocks belong to it alone.
 pub struct Tlab {
-    /// (所属堆, 那时的回收次数)；对不上就作废
+    /// (owning heap, collection count at the time); stale when it does not match
     owner: Cell<(usize, u64)>,
     main: Bump,
-    /// 溢出分配（中对象：比一行大、主空洞又放不下）：单独的块 / 空洞，主空洞留给小对象（Immix 的溢出分配）
+    /// Overflow allocation (medium objects: larger than a line and not fitting the main hole): a separate block / hole, leaving the main hole to small objects (Immix's overflow allocation)
     overflow: Bump,
-    /// 公开堆：上一次分配的（类型名的地址, 类型号）
+    /// Public heaps: the last allocation's (address of the type name, type number)
     last: Cell<Option<(usize, u32)>>,
-    /// 还没写进块里的起点位：(起点位图里的一个字, 要置上的位)。连着分配的对象多半落在同一个字里，攒着换字时一次写进去，
-    /// 不必每个对象一次原子 RMW。块在两次回收之间只归这个缓冲；起点位只在停顿里读（那时 mutate 都已结束、写进去了），
-    /// 并发的引用计数释放只清别的（老对象的）位，所以晚写不碍事
+    /// Start bits not yet written into the block: (a word of the start bitmap, bits to set). Consecutive objects mostly fall in the same word, so they are gathered and written at once when the word changes,
+    /// instead of one atomic RMW per object. Between two collections the block belongs to this buffer only; start bits are read only during pauses (when every mutate has ended and written them),
+    /// and concurrent release by reference counting only clears other (old objects') bits, so writing late does no harm
     starts: Cell<(*const AtomicU64, u64)>,
 }
 
@@ -906,11 +987,11 @@ impl Default for Tlab {
     }
 }
 
-// SAFETY: 指针指向它独占的块；移到别的线程后由那个线程独占使用
+// SAFETY: the pointers refer to blocks it owns exclusively; after moving to another thread that thread owns them
 unsafe impl Send for Tlab {}
 
 impl Tlab {
-    /// 换了堆或堆回收过（`owner` = (堆, 回收次数)）：之前的块已经被清扫重新分类，丢掉；同一个堆的类型号缓存留着。
+    /// The heap changed or collected (`owner` = (heap, collection count)): the old blocks were swept and reclassified, so drop them; the type number cache of the same heap stays.
     fn adopt(&mut self, owner: (usize, u64)) {
         self.flush_starts();
         if self.owner.get() != owner {
@@ -919,7 +1000,7 @@ impl Tlab {
         }
     }
 
-    /// 记下 `p` 处有一个对象（见 [`Tlab::starts`]）。
+    /// Record that an object starts at `p` (see [`Tlab::starts`]).
     #[inline]
     fn note_start(&self, p: *const u8) {
         let (word, bit) = Block::containing(p).start_bit(p);
@@ -932,17 +1013,17 @@ impl Tlab {
         }
     }
 
-    /// 攒着的起点位写进块里。
+    /// Write the gathered start bits into the block.
     fn flush_starts(&self) {
         let (word, bits) = self.starts.replace((core::ptr::null(), 0));
         if bits != 0 {
-            // SAFETY: 字在本缓冲独占的块里，块在回收之前不会还回去（回收前 mutate 结束时已经写过）
+            // SAFETY: the word lies in a block owned by this buffer, which is not given back before a collection (and the bits were written when the mutate before it ended)
             unsafe { &*word }.fetch_or(bits, Ordering::Relaxed);
         }
     }
 
-    /// 碰撞分配 `bytes` 字节（行标记早于 `epoch` 的是空行，没有空洞了用 `acquire` 领块）。
-    /// 比一行大、主空洞放不下的走溢出游标（块用 `roomy(bytes)` 领：要有放得下它的空洞），不丢掉主空洞剩下的部分。
+    /// Bump-allocate `bytes` bytes (lines with marks older than `epoch` are free; take a block with `acquire` when no hole is left).
+    /// Objects larger than a line that do not fit the main hole use the overflow cursor (its blocks come from `roomy(bytes)`: they must have a hole that fits), without discarding the rest of the main hole.
     fn bump(&self, bytes: usize, epoch: u32, acquire: impl Fn() -> Block, roomy: impl Fn(usize) -> Block) -> *mut u8 {
         if let Some(p) = self.main.fit(bytes) {
             return p;
@@ -954,7 +1035,7 @@ impl Tlab {
     }
 }
 
-/// 一个碰撞分配游标：当前块、下一次找空洞从哪一行开始、当前空洞的游标与界。
+/// A bump-allocation cursor: the current block, the line to search for holes from next, and the current hole's cursor and limit.
 struct Bump {
     block: Cell<Option<Block>>,
     line: Cell<usize>,
@@ -969,7 +1050,7 @@ impl Default for Bump {
 }
 
 impl Bump {
-    /// 当前空洞放得下就切出来。
+    /// Cut it from the current hole if it fits.
     fn fit(&self, bytes: usize) -> Option<*mut u8> {
         let cursor = self.cursor.get();
         (self.limit.get().addr() - cursor.addr() >= bytes).then(|| {
@@ -978,7 +1059,7 @@ impl Bump {
         })
     }
 
-    /// 当前空洞放不下就找当前块的下一个空洞（放不下的跳过），没有了就用 `acquire` 领新块。
+    /// If the current hole is too small, find the next hole in the current block (skipping those too small), or take a new block with `acquire` when none is left.
     fn take(&self, bytes: usize, epoch: u32, acquire: &impl Fn() -> Block) -> *mut u8 {
         loop {
             if let Some(p) = self.fit(bytes) {
@@ -1000,13 +1081,13 @@ impl Bump {
     }
 }
 
-/// 新对象的标记：不等于任何纪元（纪元从 1 开始）⇒ 年轻
+/// A new object's mark: equals no epoch (epochs start at 1) ⇒ young
 const YOUNG: u32 = 0;
 
-/// 握手字的最高位：要开始并发标记，新的 mutate 先等
+/// Top bit of the handshake word: concurrent marking is about to start, new mutates wait first
 const REQUEST: u64 = 1 << 63;
 
-/// 在 mutate 里：进门计数加一（有开始标记的请求就先等），出门减一（panic 也减）。
+/// Inside mutate: increment the entry count on the way in (waiting first if a marking request is pending) and decrement on the way out (also on panic).
 struct Inside<'h>(&'h Heap);
 
 impl<'h> Inside<'h> {
@@ -1033,41 +1114,52 @@ impl Drop for Inside<'_> {
     }
 }
 
-/// 一次 mutate 里的分配器与品牌；只在调用线程上用。
+/// The allocator and brand of one mutate; used only on the calling thread.
 pub struct Mutator<'gc> {
     heap: &'gc Heap,
     tlab: &'gc Tlab,
-    /// 进 mutate 时正在并发标记的纪元：写屏障与黑分配用
+    /// The epoch being marked concurrently when the mutate began: for the write barrier and black allocation
     marking: Option<NonZeroU32>,
     _brand: Invariant<'gc>,
 }
 
 impl<'gc> Mutator<'gc> {
 
-    /// 这次 mutate 是否落在并发标记期间（写屏障与黑分配生效）。
+    /// Whether this mutate falls within concurrent marking (write barrier and black allocation in effect).
     pub fn is_marking(&self) -> bool {
         self.marking.is_some()
     }
 
-    /// 分配一个对象。
+    /// Allocate an object.
     pub fn alloc<T: Trace + 'gc>(&self, value: T) -> Gc<'gc, T> {
-        const { assert!(align_of::<T>() <= GRANULE, "对象数据的对齐不能超过 8 字节") };
+        self.alloc_with(value, Header::new::<T>)
+    }
+
+    /// Allocate a shareable object (its type is also [`Shared`], with no destructor): when a cross-heap is attached ([`Heap::attach_cross_heap`]),
+    /// it is promoted into the cross-heap once it survives a young collection, and other processes can find it by signature or weak reference. Its edges may only point at shareable objects.
+    #[cfg(crossheap)]
+    pub fn alloc_shared<T: Trace + Shared + 'gc>(&self, value: T) -> Gc<'gc, T> {
+        self.alloc_with(value, Header::new_shared::<T>)
+    }
+
+    fn alloc_with<T: Trace + 'gc>(&self, value: T, header: fn(usize, bool, u32) -> Header) -> Gc<'gc, T> {
+        const { assert!(align_of::<T>() <= GRANULE, "object data alignment must not exceed 8 bytes") };
         let bytes = (HEADER + size_of::<T>()).next_multiple_of(GRANULE);
         let large = bytes > LARGE;
         let p = if large { self.heap.alloc_large(bytes) } else { self.alloc_small(bytes) };
-        // 平时：年轻（标记 0 ≠ 上次完成的纪元；在交出去前就扫过的块或新块里，进行中的清扫碰不到它）。
-        // 并发标记中：黑分配（直接标成本轮，连同它占的行）
+        // Normally: young (mark 0 ≠ the last completed epoch; it lives in a block swept before being handed out, or a new one, so the sweep in progress never touches it).
+        // During concurrent marking: black allocation (marked with this round right away, together with its lines)
         let mark = self.marking.map_or(YOUNG, NonZeroU32::get);
         if self.marking.is_some() {
             if !large {
                 Block::containing(p).mark_lines(p, bytes, mark);
             }
-            // 黑对象不会被标记扫描：记下来，收尾时补算它的边（引用计数）
+            // Marking never scans black objects: record them so their edges are counted at the end (reference counting)
             self.heap.black.push(p.expose_provenance());
         }
-        // SAFETY: p 是 bytes 字节、按粒度对齐的新内存，归这次分配独有
+        // SAFETY: p is new memory of bytes bytes, granule aligned, owned by this allocation
         unsafe {
-            p.cast::<Header>().write(Header::new::<T>(bytes, large, mark));
+            p.cast::<Header>().write(header(bytes, large, mark));
             let data = Header::data(p.cast()).cast::<T>();
             data.write(value);
             Gc::from_data(data)
@@ -1081,18 +1173,18 @@ impl<'gc> Mutator<'gc> {
     }
 }
 
-/// 只给本 crate 用的操作：trait 在私有模块里、不导出，crate 外拿不到。
+/// Operations for this crate only: the trait lives in a private module and is not exported, so it is unreachable outside the crate.
 pub trait MutatorInternal<'gc> {
     fn heap(&self) -> &'gc Heap;
 
-    /// 写屏障。并发标记中：被覆盖的旧值若还没标就标上、进灰队列（初始快照）。
-    /// 平时：老对象里的槽（[`RawSlot::is_young`] 为假）写进去的是年轻对象（标记纪元不是上次完成的那轮）就记下槽的地址——
-    /// 老对象指向年轻对象的边只能这样产生，年轻回收从这些槽出发；年轻对象里的槽不用记，年轻回收从对象本身追到。（并发标记期间新对象都是黑的、收尾后全是老对象，不用记。）
+    /// Write barrier. During concurrent marking: the overwritten old value is marked and greyed if not yet marked (snapshot at the beginning).
+    /// Normally: when a young object (mark epoch not the last completed one) is written into a slot of an old object ([`RawSlot::is_young`] false), record the slot's address —
+    /// that is the only way edges from old to young objects arise, and young collections start from these slots; slots in young objects need no record, as young collections reach them from the object. (During concurrent marking new objects are black and all old afterwards, so no record.)
     ///
-    /// 计数中的槽（老对象里的；年轻对象的槽不计数）本轮第一次被写还要登记，回收时结算。
+    /// A counted slot (in an old object; young objects' slots are uncounted) written for the first time this round is also logged and settled at collection.
     fn written(&self, slot: &RawSlot, old: Option<*const Header>, new: Option<*const Header>);
 
-    /// 读屏障（只在并发标记中）：mutator 从弱引用取到了 `h`，若还没标就标上、进灰队列。
+    /// Read barrier (only during concurrent marking): a mutator got `h` from a weak reference; mark and grey it if not yet marked.
     fn reached(&self, h: *const Header);
 }
 
@@ -1103,18 +1195,29 @@ impl<'gc> MutatorInternal<'gc> for Mutator<'gc> {
 
     fn written(&self, slot: &RawSlot, old: Option<*const Header>, new: Option<*const Header>) {
         let addr = (&raw const *slot).expose_provenance();
+        // A slot inside a cross-heap object: no counting. A private object written into it stays a private address (other processes read it as empty) until the next young collection
+        // promotes it and rewrites the slot through the remembered set
+        #[cfg(crossheap)]
+        if Region::holds_fixed(addr) {
+            if new.is_some() {
+                assert!(self.heap.cross.is_some(), "writing a private object into a cross-heap object needs a cross-heap attached (Heap::attach_cross_heap)");
+                self.heap.remembered.push(addr);
+                self.heap.promotion_pending.store(true, Ordering::Release);
+            }
+            return;
+        }
         if let Some(epoch) = self.marking {
             if let Some(old) = old {
                 self.heap.remember(old, epoch.get());
             }
         } else if !slot.is_young()
             && let Some(new) = new
-            // SAFETY: new 是刚写进槽的、活着的对象
+            // SAFETY: new is the live object just written into the slot
             && !unsafe { &*new }.is_marked(self.heap.epoch)
         {
             self.heap.remembered.push(addr);
         }
-        // 引用计数登记：平时与并发标记期间都要（标记期间被改写的槽在收尾时结算）
+        // Reference count logging: both normally and during concurrent marking (slots rewritten during marking are settled at the end)
         if slot.log() {
             self.heap.rc_log.push(addr);
         }
@@ -1127,61 +1230,80 @@ impl<'gc> MutatorInternal<'gc> for Mutator<'gc> {
     }
 }
 
-/// 等别人（回收方、mutate 里的线程）时每隔多久醒来查一次对方进程还在不在
-#[cfg(target_os = "linux")]
+/// When waiting for others (the collector, threads inside mutate), wake up this often to check whether their process is still alive
+#[cfg(crossheap)]
 const POLL: Duration = Duration::from_millis(10);
-/// [`Attachment::pid`]：有人正在收拾这个死掉的挂接（防两个回收方重复还它的入口）
-#[cfg(target_os = "linux")]
+/// [`Attachment::pid`]: someone is cleaning up this dead attachment (keeps two collectors from returning its entries twice)
+#[cfg(crossheap)]
 const REAPING: u32 = u32::MAX;
-/// 回收方抢回收权前，等挡在门口的 mutator 进门最多等这么多轮（每轮 [`POLL`]）
-#[cfg(target_os = "linux")]
+/// Before claiming a collection, wait at most this many rounds (each [`POLL`]) for mutators held at the door to get in
+#[cfg(crossheap)]
 const YIELD_ROUNDS: usize = 10;
-/// 回收方等 mutate 走空最多等这么久，等不到就先放开请求、过一会儿重来：一个线程在 A 的 mutate 里又去进 B 时，
-/// 两个回收方（或一起回收）分别挡着 A、B 会互相等死，放开请求就解开了
-#[cfg(target_os = "linux")]
+/// The longest a collector waits for mutate to empty; if it does not, give up the request and try again later: when a thread inside A's mutate enters B,
+/// two collectors (or a group collection) holding A and B would wait on each other forever, and giving up the request breaks that
+#[cfg(crossheap)]
 const PATIENCE: Duration = Duration::from_millis(50);
-/// [`Entry::holder`] 的最高位：持有方是另一个公开堆（低位是它的堆号，[`Entry::holder_incarnation`] 是它的身份），不是某个挂接（槽号 + 1）
-#[cfg(target_os = "linux")]
+/// Top bit of [`Entry::holder`]: the holder is another public heap (the low bits are its heap number and [`Entry::holder_incarnation`] its identity), not an attachment (slot + 1)
+#[cfg(crossheap)]
 pub const HEAP_HOLDER: u32 = 1 << 31;
-/// [`Entry::holder`]：持有方堆和这个堆在同一个目录（同一份堆号登记），可以按目录判它死活、死了就还掉它的登记
-#[cfg(target_os = "linux")]
+/// [`Entry::holder`]: the holder heap is in the same directory as this heap (the same heap-number registry), so its liveness can be judged by directory and its registrations returned once it dies
+#[cfg(crossheap)]
 pub const SAME_DIR: u32 = 1 << 30;
-/// [`Entry::holder`] 里堆号那几位
-#[cfg(target_os = "linux")]
+/// The heap number bits of [`Entry::holder`]
+#[cfg(crossheap)]
 const HOLDER_INDEX: u32 = SAME_DIR - 1;
-/// `try_mutate` 隔多久才重新查一次主人还在不在（读 /proc）
-#[cfg(target_os = "linux")]
+/// How often `try_mutate` checks again that the owner is still there (reading /proc)
+#[cfg(crossheap)]
 const ALIVE_RECHECK: Duration = Duration::from_millis(10);
-/// 清扫时每次领多少块
-#[cfg(target_os = "linux")]
+/// Blocks taken at once while sweeping
+#[cfg(crossheap)]
 const SWEEP_BATCH: usize = 16;
-/// 窗口背后是什么。
-#[cfg(target_os = "linux")]
+/// SplitMix64 mixes the birth stamp: the golden-ratio constant the epoch is multiplied by
+#[cfg(crossheap)]
+const SPLITMIX_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
+/// Right shifts of SplitMix64's final three steps
+#[cfg(crossheap)]
+const SPLITMIX_SHIFTS: [u32; 3] = [30, 27, 31];
+/// Multipliers of SplitMix64's final two steps
+#[cfg(crossheap)]
+const SPLITMIX_MULS: [u64; 2] = [0xbf58_476d_1ce4_e5b9, 0x94d0_49bb_1331_11eb];
+/// What backs a window.
+#[cfg(crossheap)]
 pub enum Backing {
-    /// 共享内存文件系统上的文件；`owner` = 本句柄建的（本进程是主人），析构时堆跟着死、删文件与标记（除非 persist）
-    File { file: File, path: PathBuf, owner: bool },
-    /// 匿名共享内存（只在本进程）
+    /// A file on a shared-memory file system; `owner` = created by this handle (this process is the owner): on drop the heap dies and the file and marker are deleted (unless persisted).
+    /// Heaps opened from a descriptor passed by someone else have no path ([`crate::CrossHeapSpace::open_fd`])
+    File { file: File, path: Option<PathBuf>, owner: bool },
+    /// Shared anonymous memory (this process only)
     Anonymous,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl Backing {
-    /// 让窗口的 `[offset, offset + len)` 有内存可用（文件：延长；匿名：本来就有）。
+    /// Make `[offset, offset + len)` of the window usable (a file is extended; anonymous memory already is).
     fn commit(&self, offset: usize, len: usize) {
         if let Self::File { file, .. } = self {
-            Region::commit(file, offset, len).expect("公开堆所在的文件系统满了");
+            Region::commit(file, offset, len).expect("the file system holding the public heap is full");
+        }
+    }
+
+    /// Give `[offset, offset + len)` of the window (counted from `window`) back to the system: a hole punched in a file (the length stays and it reads as zeros), `MADV_REMOVE` for anonymous memory.
+    /// Best effort: left alone when the file system does not support it (such as hugetlbfs without huge page alignment).
+    fn punch(&self, window: *mut u8, offset: usize, len: usize) {
+        match self {
+            Self::File { file, .. } => Region::punch(file, offset, len),
+            Self::Anonymous => Region::remove(window.wrapping_add(offset), len),
         }
     }
 }
 
-/// 类型键用的 64 位 FNV-1a。
-#[cfg(target_os = "linux")]
+/// 64-bit FNV-1a for type keys.
+#[cfg(crossheap)]
 struct Fnv(u64);
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl Fnv {
     const PRIME: u64 = 0x0000_0100_0000_01b3;
-    /// 两个不同的起点，合成 128 位
+    /// Two different starting points, combined into 128 bits
     const SEEDS: [u64; 2] = [0xcbf2_9ce4_8422_2325, 0x6c62_272e_07bb_0142];
 
     fn write(&mut self, bytes: &[u8]) {
@@ -1190,7 +1312,7 @@ impl Fnv {
         }
     }
 
-    /// 类型 `T` 的指针图与类型键。
+    /// The pointer map and type key of type `T`.
     fn of<T: Shared>() -> (EdgeMap, [u64; 2]) {
         let mut map = EdgeMap::default();
         T::edges(&mut map, 0);
@@ -1198,7 +1320,7 @@ impl Fnv {
         (map, key)
     }
 
-    /// 类型名 + 大小 + 指针图。
+    /// Type name + size + pointer map.
     fn key(name: &str, size: usize, edges: &[u32]) -> [u64; 2] {
         Self::SEEDS.map(|seed| {
             let mut h = Self(seed);
@@ -1212,10 +1334,10 @@ impl Fnv {
     }
 }
 
-/// 进程这一侧的公开堆：窗口在哪、怎么延长文件、回收线程池、类型号缓存。
-#[cfg(target_os = "linux")]
+/// This process's side of a public heap: where the window is, how to extend the file, the collector thread pool, the type number cache.
+#[cfg(crossheap)]
 pub struct Inner {
-    /// 地址区：窗口在它里面，Arc 让它比堆活得久
+    /// The region: the window lies inside it, and the Arc makes it outlive the heap
     space: Arc<Space>,
     index: usize,
     window: NonNull<u8>,
@@ -1223,45 +1345,45 @@ pub struct Inner {
     backing: Backing,
     threads: NonZeroUsize,
     pool: OnceLock<Pool>,
-    /// 本进程见过的类型：（类型名的地址, 类型号）
+    /// Types seen by this process: (address of the type name, type number)
     types: SegVec<(usize, u32)>,
-    /// 给 mutate 复用的分配缓冲
+    /// An allocation buffer reused by mutate
     spare: AtomicPtr<Tlab>,
-    /// 本句柄在挂接表里的槽号
+    /// This handle's slot in the attachment table
     slot: usize,
-    /// 句柄建立的时刻：`checked` 从这里算
+    /// When the handle was created: `checked` counts from here
     born: std::time::Instant,
-    /// 上次确认主人还在的时刻（距 `born` 的纳秒数）
+    /// When the owner was last confirmed alive (nanoseconds since `born`)
     checked: AtomicU64,
 }
 
-// SAFETY: 窗口里的状态都是原子量或由握手保护；其余是线程安全的
-#[cfg(target_os = "linux")]
+// SAFETY: the state in the window is all atomics or protected by the handshake; the rest is thread safe
+#[cfg(crossheap)]
 unsafe impl Send for Inner {}
-// SAFETY: 同上
-#[cfg(target_os = "linux")]
+// SAFETY: as above
+#[cfg(crossheap)]
 unsafe impl Sync for Inner {}
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl Inner {
-    /// 窗口 `index` 已经映射上 `backing`；`fresh` 时写新的超级块，否则核对。出错时析构负责还窗口。
+    /// Window `index` is already mapped onto `backing`; with `fresh` write a new superblock, otherwise check it. On error, drop gives the window back.
     pub fn new(space: Arc<Space>, index: usize, backing: Backing, threads: NonZeroUsize, fresh: bool) -> io::Result<Self> {
-        let window = NonNull::new(space.region().window(index)).expect("窗口地址非空");
+        let window = NonNull::new(space.region().window(index)).expect("the window address is non-null");
         let mut me = Self { space, index, window, layout: WindowLayout::new(), backing, threads, pool: OnceLock::new(), types: SegVec::default(), spare: AtomicPtr::new(null_mut()), slot: ATTACH_CAP, born: std::time::Instant::now(), checked: AtomicU64::new(0) };
         if fresh {
             me.backing.commit(0, PAGE);
-            // SAFETY: 新堆，窗口开头一页刚有内存，还没人读
+            // SAFETY: a new heap; the first page of the window just got memory and nobody reads it yet
             let incarnation = std::hash::BuildHasher::hash_one(&std::collections::hash_map::RandomState::new(), (index, Process::current().pid));
-            // SAFETY: 同上
+            // SAFETY: as above
             unsafe { me.window.as_ptr().cast::<Super>().write(Super::new(index as u64, incarnation, Process::current())) };
         } else if me.sup().heap.load(Ordering::Acquire) != index as u64 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "超级块里的堆号与窗口不符"));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "the heap number in the superblock does not match the window"));
         }
-        me.slot = me.attach().ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "这个公开堆的挂接表满了"))?;
+        me.slot = me.attach().ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "this public heap's attachment table is full"))?;
         Ok(me)
     }
 
-    /// 在挂接表里领一个槽登记本进程；满了先收拾死掉的挂接再试一次。
+    /// Take a slot in the attachment table to register this process; when full, clean up dead attachments and try again.
     fn attach(&self) -> Option<usize> {
         let me = Process::current();
         let claim = || (0..ATTACH_CAP).find(|&i| self.attachment(i).pid.compare_exchange(0, me.pid, Ordering::AcqRel, Ordering::Relaxed).is_ok());
@@ -1277,20 +1399,20 @@ impl Inner {
     }
 
     fn attachment(&self, i: usize) -> &Attachment {
-        // SAFETY: 挂接表在超级块那一页里（建堆时就有内存），i < ATTACH_CAP；表项全是原子量
+        // SAFETY: the attachment table is in the superblock page (with memory since creation), i < ATTACH_CAP; its entries are all atomics
         unsafe { &*self.at::<Attachment>(ATTACH_OFF).add(i) }
     }
 
-    /// 挂接槽 `i` 的进程还活着（空槽、正在被收拾的都算不活）。
+    /// The process of attachment slot `i` is alive (free slots and ones being cleaned up count as not alive).
     fn alive(&self, i: usize) -> bool {
         let a = self.attachment(i);
         let pid = a.pid.load(Ordering::Acquire);
         pid != 0 && pid != REAPING && Process { pid, start: a.start.load(Ordering::Acquire) }.alive()
     }
 
-    /// 收拾所有死掉的挂接。
+    /// Clean up every dead attachment.
     ///
-    /// 正挂着回收请求的那个不收拾：它的槽要是被新进程领走，大家会以为回收方还活着，一直等下去；它由接手的回收方换下来后再收拾。
+    /// The one holding the collection request is left alone: if its slot went to a new process everyone would think the collector is alive and wait forever; it is cleaned up after the collector taking over replaces it.
     fn reap_dead(&self) {
         let owner = self.sup().request.load(Ordering::SeqCst) as usize;
         for i in 0..ATTACH_CAP {
@@ -1301,14 +1423,14 @@ impl Inner {
         }
     }
 
-    /// 收拾死掉的挂接 `i`（进程号 `pid`）：还掉它持有的入口、清掉它的 mutate 计数，空出槽。先把进程号换成 [`REAPING`]，只有换成功的那个来做。
+    /// Clean up dead attachment `i` (pid `pid`): return the entries it holds, clear its mutate count and free the slot. The pid is first swapped for [`REAPING`]; only the one that succeeds does the work.
     fn reap(&self, i: usize, pid: u32) {
         let a = self.attachment(i);
         if a.pid.compare_exchange(pid, REAPING, Ordering::AcqRel, Ordering::Relaxed).is_err() {
             return;
         }
-        let holder = u32::try_from(i + 1).expect("挂接槽号");
-        // 持有方是它的入口都还掉（含领到一半、指针还没写的）
+        let holder = u32::try_from(i + 1).expect("attachment slot");
+        // Return every entry it holds (including ones half claimed, with the pointer not yet written)
         for j in 0..self.sup().entries.load(Ordering::Acquire) {
             if self.entry(j).holder.load(Ordering::Acquire) == holder {
                 self.release_entry(j);
@@ -1320,8 +1442,8 @@ impl Inner {
         a.pid.store(0, Ordering::Release);
     }
 
-    /// 抢回收权之前：上一次回收挡在门口的 mutator 先进门（醒过来要时间，不让一让就会被接连的回收饿死）。
-    /// 死掉的挂接不等；最多等 [`YIELD_ROUNDS`] 轮。
+    /// Before claiming a collection: let mutators held at the door by the previous collection in first (waking takes time, and without giving way they would starve under back-to-back collections).
+    /// Dead attachments are not waited for; at most [`YIELD_ROUNDS`] rounds.
     fn yield_to_waiting(&self) {
         for _ in 0..YIELD_ROUNDS {
             let Some(i) = (0..ATTACH_CAP).find(|&i| self.attachment(i).waiting.load(Ordering::SeqCst) != 0 && self.alive(i)) else {
@@ -1332,11 +1454,11 @@ impl Inner {
         }
     }
 
-    /// 拿回收权：没人在回收就占下；别人在回收、它还活着就等；它死了（回收到一半被杀）就接手。
-    /// `done_by_other`：等到别人做完时直接返回 false（单独回收用：别人刚回收过就不必再收）；否则一直等到拿到为止。
+    /// Claim the collection: take it if nobody is collecting; wait while someone alive is collecting; take over if they died (killed in the middle of collecting).
+    /// `done_by_other`: return false right away once someone else finished (for single collections: no need to collect again right after someone did); otherwise wait until it is ours.
     fn claim_collection(&self, done_by_other: bool) -> bool {
         let sup = self.sup();
-        let me = u32::try_from(self.slot + 1).expect("挂接槽号");
+        let me = u32::try_from(self.slot + 1).expect("attachment slot");
         loop {
             let owner = sup.request.load(Ordering::SeqCst);
             if owner == 0 {
@@ -1356,7 +1478,7 @@ impl Inner {
         }
     }
 
-    /// 等每个挂接的 mutate 走空（死了的不等），最多 [`PATIENCE`]；走空了返回 true。
+    /// Wait until every attachment's mutate is empty (not waiting for dead ones), at most [`PATIENCE`]; true once empty.
     fn drain(&self) -> bool {
         let start = std::time::Instant::now();
         for i in 0..ATTACH_CAP {
@@ -1375,16 +1497,41 @@ impl Inner {
         true
     }
 
-    /// 放开回收权，叫醒门口等着的。
+    /// Give up the collection claim and wake those waiting at the door.
     fn release(&self) {
         let sup = self.sup();
         sup.request.store(0, Ordering::SeqCst);
         sup.request.wake_all();
     }
 
-    /// 暂停式回收：拿回收权（别人刚回收完就返回）、等 mutate 走空（等不到就放开重来）、收拾死掉的挂接、标记 + 清扫。
-    /// 标记只写新纪元、纪元到最后才发布，清扫只在标记做完后才开始，所以被杀了由别人从头重做是安全的。
+    /// Stop-the-world collection: claim it (returning if someone just collected), wait for mutate to empty (giving up and retrying if it does not), clean up dead attachments, mark + sweep.
+    /// Marking writes only a new epoch and the epoch is published last, and sweeping starts only after marking is done, so redoing it from scratch after the collector is killed is safe.
     fn collect(&self) {
+        self.collect_with(false);
+    }
+
+    /// As [`Inner::collect`]; with `shrink`, every empty block found by sweeping goes back to the system, none kept.
+    /// For heaps collected only by their owner ([`crate::Heap::attach_cross_heap`]) this does nothing while the owner lives: the roots in the owner's private heap are not visible here.
+    fn collect_with(&self, shrink: bool) {
+        if self.sup().owner_only.load(Ordering::Acquire) != 0 && self.is_alive() {
+            return;
+        }
+        self.collect_rooted(&[], shrink);
+    }
+
+    /// Collection by the owner (the private heap it is attached to): `extra` holds data addresses of this heap's objects traced from the private heap, also roots. Returns this round's epoch.
+    pub fn collect_owned(&self, extra: &[usize], shrink: bool) -> u32 {
+        self.collect_rooted(extra, shrink);
+        self.sup().epoch.load(Ordering::Acquire)
+    }
+
+    /// `data` (the data address of an object of this heap) survived the collection of epoch `epoch`.
+    pub fn survived(data: *mut u8, epoch: u32) -> bool {
+        // SAFETY: an object of this heap not yet overwritten by a new allocation (the caller asks right after the collection, with no mutators)
+        unsafe { &*PHeader::of(data) }.core.is_marked(epoch)
+    }
+
+    fn collect_rooted(&self, extra: &[usize], shrink: bool) {
         let mut retry = Retry::new();
         loop {
             if !self.claim_collection(true) {
@@ -1397,15 +1544,15 @@ impl Inner {
             retry.pause();
         }
         self.reap_dead();
-        Self::collect_members(&[self]);
+        Self::collect_members(&[self], extra, shrink);
         self.release();
     }
 
-    /// 几个堆一起回收：按堆号从小到大拿每个堆的回收权，全部走空才动手，有一个等不到就全放开重来（不会和别的一起回收互相等死）。
+    /// Collect several heaps together: claim each heap's collection in increasing heap number and start only when all are empty; if one cannot be waited for, give everything up and retry (so group collections never deadlock each other).
     ///
-    /// 一个一个来：拿到第 k 个堆的请求、等它走空，再去拿第 k+1 个。这样 mutator 只要按堆号从小到大嵌套进入
-    /// （[`PublicHeap::mutate_with`]），在小号堆里等着进大号堆的线程不会卡住它：那时大号堆还没被挡。逆序嵌套才会互等，
-    /// 等不到就全部放开、退让后重来。
+    /// One at a time: claim heap k's request and wait for it to empty before claiming heap k+1. So as long as mutators nest by increasing heap number
+    /// ([`CrossHeap::mutate_with`]), a thread in a lower heap waiting to enter a higher one does not block it: the higher heap is not held yet. Only reverse nesting waits on each other,
+    /// and then everything is given up and retried after backing off.
     fn collect_group(members: &[&Self]) {
         let mut retry = Retry::new();
         'retry: loop {
@@ -1424,7 +1571,7 @@ impl Inner {
         for m in members {
             m.reap_dead();
         }
-        Self::collect_members(members);
+        Self::collect_members(members, &[], false);
         for m in members.iter().rev() {
             m.release();
         }
@@ -1434,47 +1581,51 @@ impl Inner {
         self.index
     }
 
-    /// 公开偏移落在哪个堆（窗口）里。
+    /// Which heap (window) a public offset falls in.
     pub fn heap_of(off: u64) -> Option<usize> {
         usize::try_from(off).ok().map(|o| o / WINDOW).filter(|&k| k < WINDOWS)
     }
 
-    /// 堆身份（见 [`Super::incarnation`]）。
+    /// Heap identity (see [`Super::incarnation`]).
     pub fn incarnation(&self) -> u64 {
         self.sup().incarnation.load(Ordering::Acquire)
     }
 
-    /// 堆文件的路径（匿名堆没有）。
+    /// The heap file's path (anonymous heaps have none).
     fn path(&self) -> Option<&std::path::Path> {
         match &self.backing {
-            Backing::File { path, .. } => Some(path),
+            Backing::File { path, .. } => path.as_deref(),
             Backing::Anonymous => None,
         }
     }
 
-    /// 本堆作为持有方、在 `target` 里登记时用的持有方字：同一个目录时带 [`SAME_DIR`]。
+    /// The holder word this heap uses when registering in `target` as the holder: with [`SAME_DIR`] when in the same directory.
     pub fn holder_word(&self, target: &Self) -> u32 {
         let same_dir = self.path().zip(target.path()).is_some_and(|(a, b)| Registry::of(a).dir() == Registry::of(b).dir());
-        HEAP_HOLDER | if same_dir { SAME_DIR } else { 0 } | u32::try_from(self.index).expect("堆号")
+        HEAP_HOLDER | if same_dir { SAME_DIR } else { 0 } | u32::try_from(self.index).expect("heap number")
     }
 
-    /// 堆还活着：没标过死，并且主人还在（或 persist、或是匿名堆）。发现主人不在了就标死、删掉堆文件与标记。
+    /// The heap is alive: never marked dead, and the owner is still there (or it is persisted, or anonymous). On finding the owner gone, mark it dead and delete the heap file and marker.
     pub fn is_alive(&self) -> bool {
         let sup = self.sup();
         if sup.dead.load(Ordering::Acquire) != 0 {
             return false;
         }
-        let Some(path) = self.path() else { return true };
+        if matches!(self.backing, Backing::Anonymous) {
+            return true;
+        }
         let owner = Process { pid: sup.owner_pid.load(Ordering::Acquire), start: sup.owner_start.load(Ordering::Acquire) };
         if sup.persist.load(Ordering::Acquire) != 0 || owner.alive() {
             return true;
         }
         sup.dead.store(1, Ordering::Release);
-        Registry::of(path).bury(path, self.index, self.incarnation());
+        if let Some(path) = self.path() {
+            Registry::of(path).bury(path, self.index, self.incarnation());
+        }
         false
     }
 
-    /// 同 [`Inner::is_alive`]，但距上次确认不到 [`ALIVE_RECHECK`] 时只看「已死」标志（读 /proc 不便宜）。
+    /// As [`Inner::is_alive`], but within [`ALIVE_RECHECK`] of the last confirmation only the "dead" flag is checked (reading /proc is not cheap).
     fn alive_cached(&self) -> bool {
         if self.sup().dead.load(Ordering::Acquire) != 0 {
             return false;
@@ -1491,12 +1642,12 @@ impl Inner {
         alive
     }
 
-    /// 持有方字 + 身份是不是组里的某个堆（是组里的堆持有的登记，一起回收时由追踪决定）。
+    /// Whether the holder word + identity is one of the heaps in the group (registrations held by heaps of the group are decided by tracing in a group collection).
     fn held_by(members: &[&Self], holder: u32, incarnation: u64) -> bool {
         holder & HEAP_HOLDER != 0 && members.iter().any(|m| m.index == (holder & HOLDER_INDEX) as usize && m.incarnation() == incarnation)
     }
 
-    /// 回收前：持有方是同目录里另一个堆、而那个堆已经死了（或号已经换了主）的登记，还掉。查不准的留着。
+    /// Before collecting: return registrations whose holder is another heap in the same directory that has died (or whose number changed owner). Uncertain ones stay.
     fn release_dead_holders(&self) {
         let Some(path) = self.path() else { return };
         let registry = Registry::of(path);
@@ -1522,7 +1673,7 @@ impl Inner {
     }
 
     pub fn sup(&self) -> &Super {
-        // SAFETY: 窗口开头一页在建堆时就有了，里面是超级块（全是原子量）
+        // SAFETY: the first page of the window exists since creation and holds the superblock (all atomics)
         unsafe { &*self.window.as_ptr().cast() }
     }
 
@@ -1530,12 +1681,18 @@ impl Inner {
         self.window.as_ptr().wrapping_add(offset).cast()
     }
 
-    /// 公开偏移在本进程里的地址。
+    /// The address of a public offset in this process.
     pub fn ptr(&self, off: u64) -> *mut u8 {
-        self.space.region().base().as_ptr().wrapping_add(usize::try_from(off).expect("公开偏移"))
+        self.space.region().base().as_ptr().wrapping_add(usize::try_from(off).expect("public offset"))
     }
 
-    /// 公开偏移落在这个堆的窗口里。
+    /// The public offset of an absolute address in this process, when it lies in the public region.
+    pub fn offset_of(&self, addr: usize) -> Option<u64> {
+        let base = self.space.region().base().as_ptr().addr();
+        addr.checked_sub(base).filter(|&o| o < REGION && o != 0).map(|o| o as u64)
+    }
+
+    /// The public offset falls within this heap's window.
     pub fn owns(&self, off: u64) -> bool {
         usize::try_from(off).is_ok_and(|o| o / WINDOW == self.index)
     }
@@ -1544,17 +1701,17 @@ impl Inner {
         self.pool.get_or_init(|| Pool::new(self.threads))
     }
 
-    /// 让某一段至少覆盖到窗口偏移 `end`。
+    /// Make a part cover at least up to window offset `end`.
     fn commit(&self, segment: Segment, end: usize) {
         let committed = &self.sup().committed[segment.index()];
-        let have = usize::try_from(committed.load(Ordering::Acquire)).expect("窗口内偏移");
+        let have = usize::try_from(committed.load(Ordering::Acquire)).expect("offset within the window");
         if have >= end {
             return;
         }
         let (start, limit) = self.layout.segment(segment);
         let to = end.next_multiple_of(PAGE).min(limit);
         let from = have.max(start);
-        // 这一段还一项都没用（比如没有入口时回收）：没有要延长的（fallocate 不收 0 长度）
+        // Nothing used in this part yet (for example a collection with no entries): nothing to extend (fallocate rejects length 0)
         if to <= from {
             return;
         }
@@ -1563,15 +1720,15 @@ impl Inner {
     }
 
     fn type_entry(&self, ty: u32) -> &TypeEntry {
-        // SAFETY: 序号来自类型表游标，那一项所在的页已经延长过；表项全是原子量
+        // SAFETY: the index comes from the type table cursor, and its page was extended; entries are all atomics
         unsafe { &*self.at::<TypeEntry>(self.layout.types).add(ty as usize) }
     }
 
-    /// 类型 `ty` 的指针图。
+    /// The pointer map of type `ty`.
     pub fn edges(&self, ty: u32) -> &[u32] {
         let e = self.type_entry(ty);
         let (map, n) = (e.map.load(Ordering::Relaxed) as usize, e.edges.load(Ordering::Relaxed) as usize);
-        // SAFETY: 写完指针图才置 ready，读的一侧（分配过这个类型的对象之后的回收）在它之后
+        // SAFETY: ready is set only after the pointer map is written, and readers (collections after objects of this type were allocated) come after it
         unsafe { core::slice::from_raw_parts(self.at::<u32>(self.layout.map).add(map), n) }
     }
 
@@ -1579,8 +1736,8 @@ impl Inner {
         self.type_entry(ty).edges.load(Ordering::Relaxed) != 0
     }
 
-    /// 类型号：先看缓冲里上一次的，再看本进程的缓存，最后去类型表里找或登记。
-    fn type_of<T: Shared>(&self, tlab: &Tlab) -> u32 {
+    /// The type number: the last one in the buffer first, then this process's cache, finally look it up in (or register it in) the type table.
+    pub fn type_of<T: Shared>(&self, tlab: &Tlab) -> u32 {
         let tag = type_name::<T>().as_ptr().addr();
         if let Some((t, ty)) = tlab.last.get()
             && t == tag
@@ -1599,29 +1756,29 @@ impl Inner {
         ty
     }
 
-    /// 在类型表里找这个类型（别的线程 / 进程可能登记过），没有就登记：指针图写进指针图区，表项最后置 ready。
-    /// 两个线程同时登记同一个类型会得到两个号，指针图一样，无害。
+    /// Look the type up in the type table (another thread / process may have registered it), registering it if missing: the pointer map goes into the pointer map area and the entry is marked ready last.
+    /// Two threads registering the same type at once get two numbers with identical pointer maps, which is harmless.
     fn register<T: Shared>(&self) -> u32 {
         let (map, key) = Fnv::of::<T>();
         let sup = self.sup();
         let known = (sup.types.load(Ordering::Acquire) as usize).min(TYPE_CAP);
-        if let Some(ty) = (0..u32::try_from(known).expect("类型表容量")).find(|&ty| self.type_entry(ty).has_key(key)) {
+        if let Some(ty) = (0..u32::try_from(known).expect("type table capacity")).find(|&ty| self.type_entry(ty).has_key(key)) {
             return ty;
         }
         let ty = sup.types.fetch_add(1, Ordering::AcqRel);
-        assert!((ty as usize) < TYPE_CAP, "公开堆的类型表满了");
+        assert!((ty as usize) < TYPE_CAP, "the public heap's type table is full");
         let edges = map.as_slice();
-        let n = u32::try_from(edges.len()).expect("指针槽个数");
+        let n = u32::try_from(edges.len()).expect("pointer slot count");
         let start = sup.map.fetch_add(n, Ordering::AcqRel);
-        assert!((start + n) as usize <= MAP_CAP, "公开堆的指针图满了");
+        assert!((start + n) as usize <= MAP_CAP, "the public heap's pointer maps are full");
         self.commit(Segment::Types, self.layout.types + (ty as usize + 1) * size_of::<TypeEntry>());
         self.commit(Segment::Map, self.layout.map + (start + n) as usize * size_of::<u32>());
-        // SAFETY: [start, start + n) 是本线程刚领的、已经有内存的指针图区
+        // SAFETY: [start, start + n) is the part of the pointer map area this thread just took, with memory
         unsafe { self.at::<u32>(self.layout.map).add(start as usize).copy_from_nonoverlapping(edges.as_ptr(), edges.len()) };
         let e = self.type_entry(ty);
         e.edges.store(n, Ordering::Relaxed);
         e.map.store(start, Ordering::Relaxed);
-        e.size.store(u32::try_from(size_of::<T>()).expect("对象不超过 4 GiB"), Ordering::Relaxed);
+        e.size.store(u32::try_from(size_of::<T>()).expect("objects are at most 4 GiB"), Ordering::Relaxed);
         for (k, v) in e.key.iter().zip(key) {
             k.store(v, Ordering::Relaxed);
         }
@@ -1629,28 +1786,28 @@ impl Inner {
         ty
     }
 
-    /// 类型表里的 `ty` 是不是 `T`（比类型键：类型名 + 大小 + 指针图）。
+    /// Whether `ty` in the type table is `T` (comparing type keys: type name + size + pointer map).
     fn same_type<T: Shared>(&self, ty: u32) -> bool {
         let (_, key) = Fnv::of::<T>();
         self.type_entry(ty).has_key(key)
     }
 
     fn entry(&self, i: u32) -> &Entry {
-        // SAFETY: 序号来自入口表游标（或还回来的栈），那一项所在的页已经延长过；表项全是原子量
+        // SAFETY: the index comes from the entry table cursor (or the returned stack), and its page was extended; entries are all atomics
         unsafe { &*self.at::<Entry>(self.layout.entries).add(i as usize) }
     }
 
-    /// 领一个入口放公开偏移 `off`，持有方是本挂接（只在这个堆的 mutate 里调用）。
+    /// Take an entry for public offset `off`, held by this attachment (only inside this heap's mutate).
     pub fn claim_entry(&self, off: u64) -> u32 {
-        self.claim_entry_for(off, u32::try_from(self.slot + 1).expect("挂接槽号"), 0)
+        self.claim_entry_for(off, u32::try_from(self.slot + 1).expect("attachment slot"), 0)
     }
 
-    /// 同 [`Inner::claim_entry`]，持有方是 `holder`（另一个公开堆：[`Inner::holder_word`]，`incarnation` 是它的身份）。
+    /// As [`Inner::claim_entry`], held by `holder` (another public heap: [`Inner::holder_word`], with `incarnation` its identity).
     pub fn claim_entry_for(&self, off: u64, holder: u32, incarnation: u64) -> u32 {
         let sup = self.sup();
         let i = Stack::on(&sup.free_entries).pop(|i| &self.entry(i).next).unwrap_or_else(|| {
             let i = sup.entries.fetch_add(1, Ordering::AcqRel);
-            assert!((i as usize) < self.layout.entry_cap, "公开堆的入口表满了");
+            assert!((i as usize) < self.layout.entry_cap, "the public heap's entry table is full");
             self.commit(Segment::Entries, self.layout.entries + (i as usize + 1) * size_of::<Entry>());
             i
         });
@@ -1661,41 +1818,41 @@ impl Inner {
         i
     }
 
-    /// 入口改成不归任何人（持有方 0）：收拾死进程、一起回收重建登记都不碰它。
+    /// The entry is owned by nobody (holder 0): cleaning up dead processes and rebuilding registrations in group collections leave it alone.
     pub fn disown_entry(&self, i: u32) {
         self.entry(i).holder.store(0, Ordering::Release);
     }
 
-    /// 句柄析构：清空入口、还回栈里（任何时候、任何线程）。
+    /// A handle is dropped: clear the entry and put it back on the stack (at any time, on any thread).
     pub fn release_entry(&self, i: u32) {
         let e = self.entry(i);
-        // 先清持有方：收拾死进程时按持有方认它没还的入口，还过的不能再还一次
+        // Clear the holder first: cleanup of dead processes finds unreturned entries by holder, and an entry already returned must not be returned twice
         e.holder.store(0, Ordering::Release);
         e.ptr.store(0, Ordering::Release);
         Stack::on(&self.sup().free_entries).push(i, &e.next);
     }
 
     fn state(&self, i: u32) -> &BlockState {
-        // SAFETY: 序号来自块游标，那一项所在的页已经延长过；表项全是原子量
+        // SAFETY: the index comes from the block cursor, and its page was extended; entries are all atomics
         unsafe { &*self.at::<BlockState>(self.layout.states).add(i as usize) }
     }
 
     fn block(&self, i: u32) -> Block {
-        // SAFETY: 块区里第 i 块，开过（有内存），按块大小对齐（窗口按窗口大小对齐、块区起点按块对齐）
+        // SAFETY: block i of the block area, opened (with memory), block aligned (the window is window aligned and the block area starts block aligned)
         unsafe { Block::at(self.at(self.layout.blocks + i as usize * BLOCK)) }
     }
 
-    /// 从块游标开 `n` 个连续的新块（延长文件），返回第一个的序号。
+    /// Open `n` consecutive new blocks at the block cursor (extending the file) and return the first index.
     fn open_blocks(&self, n: usize) -> u32 {
-        let count = u32::try_from(n).expect("块数");
+        let count = u32::try_from(n).expect("block count");
         let i = self.sup().blocks.fetch_add(count, Ordering::AcqRel);
-        assert!(i as usize + n <= self.layout.max_blocks, "公开堆的窗口用完了");
+        assert!(i as usize + n <= self.layout.max_blocks, "the public heap's window is used up");
         self.commit(Segment::States, self.layout.states + (i as usize + n) * size_of::<BlockState>());
         self.backing.commit(self.layout.blocks + i as usize * BLOCK, n * BLOCK);
         i
     }
 
-    /// 领一个块给分配缓冲：先拿可用栈里清扫好的，没有就开新块。
+    /// Take a block for an allocation buffer: a swept one from the available stack first, otherwise open a new block.
     fn acquire(&self) -> Block {
         let sup = self.sup();
         sup.allocated.fetch_add(BLOCK as u64, Ordering::Relaxed);
@@ -1709,17 +1866,17 @@ impl Inner {
         b
     }
 
-    /// 大对象：开一串连续的新块，对象头在第一块开头。
-    /// 大对象：开一串连续的新块，对象头在第一块开头；返回（地址, 第一块序号, 块数）。块的种类等对象写完再登记
-    /// （[`Inner::publish_large`]）：进程死在中间，这些块停在「还没开过」，清扫不会去读没写完的头。
+    /// Large objects: open a run of new blocks, with the object header at the start of the first one.
+    /// Large objects: open a run of new blocks, with the object header at the start of the first one; returns (address, first block index, block count). The blocks' kind is registered once the object is written
+    /// ([`Inner::publish_large`]): if the process dies in between, the blocks stay "never opened" and sweeping does not read a half-written header.
     fn alloc_large(&self, bytes: usize) -> (*mut u8, u32, u32) {
         let n = bytes.div_ceil(BLOCK);
         let i = self.open_blocks(n);
         self.sup().allocated.fetch_add((n * BLOCK) as u64, Ordering::Relaxed);
-        (self.block(i).line(0), i, u32::try_from(n).expect("块数"))
+        (self.block(i).line(0), i, u32::try_from(n).expect("block count"))
     }
 
-    /// 大对象写完了：登记块的种类，先尾后头（清扫从头认出大对象）。
+    /// The large object is written: register the blocks' kind, tail first and head last (sweeping recognizes a large object from its head).
     fn publish_large(&self, first: u32, n: u32) {
         for j in first + 1..first + n {
             self.state(j).kind.store(Kind::LargeTail as u32, Ordering::Release);
@@ -1727,14 +1884,15 @@ impl Inner {
         self.state(first).kind.store(Kind::LargeHead as u32, Ordering::Release);
     }
 
-    /// 回收（握手已经把 `members` 里每个堆的 mutator 都挡在外面）：从入口表出发并行标记，再逐个堆并行清扫。
+    /// Collect (the handshake already holds back the mutators of every heap in `members`): mark in parallel from the entry tables, then sweep each heap in parallel.
     ///
-    /// 纪元取「上次完成的」与「上次开始的」里大的那个 + 1：上一次回收做到一半被杀时，它标过的对象不能算作这次标过。
-    /// 别的进程可能死在开块 / 领入口的中途（游标加了、文件还没延长）：先把这两张表延长到游标处，扫的时候才不会碰到没有内存的页。
+    /// The epoch is the larger of "last completed" and "last started" + 1: if the previous collection was killed half way, objects it marked must not count as marked this time.
+    /// Other processes may die in the middle of opening blocks / taking entries (cursor advanced, file not yet extended): first extend those two tables up to their cursors so scanning never touches pages without memory.
     ///
-    /// 几个堆一起时：持有方是组里某个堆的入口不当根（由追踪决定死活），标完后按追踪到的跨堆边重建这些登记——先登记新的、
-    /// 再还旧的，中间被杀也只多不少（接手的单独回收照样把它们当根）。
-    fn collect_members(members: &[&Self]) {
+    /// For several heaps together: entries whose holder is a heap of the group are not roots (tracing decides), and after marking these registrations are rebuilt from the cross-heap edges traced — new ones registered first,
+    /// old ones returned after, so being killed in between leaves only extras (a single collection taking over still treats them as roots).
+    /// `extra`: additional roots for a single collection (data addresses of objects in the first heap, traced by the owner's private heap).
+    fn collect_members(members: &[&Self], extra: &[usize], shrink: bool) {
         let in_group = |e: &Entry| members.len() > 1 && Self::held_by(members, e.holder.load(Ordering::Acquire), e.holder_incarnation.load(Ordering::Acquire));
         let mut epochs = Vec::with_capacity(members.len());
         let mut roots = Vec::new();
@@ -1742,7 +1900,7 @@ impl Inner {
         for (m, heap) in members.iter().enumerate() {
             let sup = heap.sup();
             let last = sup.epoch.load(Ordering::Acquire).max(sup.marking.load(Ordering::Acquire));
-            let epoch = last.checked_add(1).filter(|&e| e <= MAX_EPOCH).expect("纪元用完了");
+            let epoch = last.checked_add(1).filter(|&e| e <= MAX_EPOCH).expect("out of epochs");
             sup.marking.store(epoch, Ordering::Release);
             epochs.push(epoch);
             let n = sup.blocks.load(Ordering::Acquire) as usize;
@@ -1758,6 +1916,7 @@ impl Inner {
                 }
             }
         }
+        roots.extend(extra.iter().map(|&data| (0, PHeader::of(core::ptr::with_exposed_provenance(data)).expose_provenance())));
         let marked: Vec<Member<'_>> = members.iter().zip(&epochs).map(|(&heap, &epoch)| Member { heap, epoch }).collect();
         let found = Injector::new();
         let pool = members[0].pool();
@@ -1767,11 +1926,11 @@ impl Inner {
             Self::reregister(members, &found);
         }
         for (heap, epoch) in members.iter().zip(epochs) {
-            heap.sweep_all(epoch);
+            heap.sweep_all(epoch, shrink);
         }
     }
 
-    /// 一起回收标完之后：组内跨堆登记换成这次追踪到的（每对「来源堆, 目标」一项）。先登记新的、再还旧的。
+    /// After a group collection marks: the cross-heap registrations inside the group are replaced by the ones traced this time (one per (source heap, target) pair). New ones first, old ones returned after.
     fn reregister(members: &[&Self], found: &Injector<(usize, u64)>) {
         let old: Vec<Vec<u32>> = members
             .iter()
@@ -1795,7 +1954,7 @@ impl Inner {
         edges.sort_unstable();
         edges.dedup();
         for (source, off) in edges {
-            let target = members.iter().find(|m| m.owns(off)).expect("找到的边都指向组里的堆");
+            let target = members.iter().find(|m| m.owns(off)).expect("every edge found points into a heap of the group");
             target.claim_entry_for(off, members[source].holder_word(target), members[source].incarnation());
         }
         for (heap, old) in members.iter().zip(old) {
@@ -1805,51 +1964,58 @@ impl Inner {
         }
     }
 
-    /// 清扫（标记已经用 `epoch` 做完）：可用栈清空、各块重新分类，发布纪元。
-    fn sweep_all(&self, epoch: u32) {
+    /// Sweep (marking with `epoch` is done): empty the available stack, reclassify every block and publish the epoch.
+    fn sweep_all(&self, epoch: u32, shrink: bool) {
         let sup = self.sup();
+        let spare = if shrink { 0 } else { (usize::try_from(sup.allocated.load(Ordering::Relaxed)).unwrap_or(usize::MAX) / BLOCK).max(MIN_SPARE_BLOCKS) };
         let blocks = sup.blocks.load(Ordering::Acquire) as usize;
         let pool = self.pool();
         let workers = pool.sized(blocks);
-        // 可用栈清空，清扫时有空行的块重新压进去
+        // Empty the available stack; blocks with free lines are pushed again by sweeping
         sup.available.store(0, Ordering::Release);
         let cursor = AtomicUsize::new(0);
         let swept = pool.run(workers, |_| self.sweep_some(&cursor, blocks, epoch));
-        let mut live = 0;
-        for (bytes, dead) in swept {
+        let (mut live, mut empty) = (0, Vec::new());
+        for (bytes, dead, emptied) in swept {
             live += bytes;
-            // 死掉的大对象等全部块扫完再拆：拆开的块会变成小对象块，正在扫的工人不能把它们当小块再扫一遍
+            empty.extend(emptied);
+            // Dead large objects are taken apart only after every block is swept: their blocks become small-object blocks, and workers still sweeping must not sweep them again as small blocks
             for head in dead {
-                self.free_large(head);
+                self.free_large(head, &mut empty);
             }
         }
+        empty.sort_unstable();
+        self.punch_blocks(empty.get(spare..).unwrap_or_default());
         sup.live.store(live as u64, Ordering::Relaxed);
         sup.allocated.store(0, Ordering::Relaxed);
         sup.collections.fetch_add(1, Ordering::AcqRel);
         sup.epoch.store(epoch, Ordering::Release);
     }
 
-    /// 清扫一批批领到的块；返回存活字节数与死掉的大对象（第一块的序号）。
-    fn sweep_some(&self, cursor: &AtomicUsize, blocks: usize, epoch: u32) -> (usize, Vec<u32>) {
-        let (mut live, mut dead) = (0, Vec::new());
+    /// Sweep batches of blocks taken in turn; returns live bytes, dead large objects (first block index) and small-object blocks swept empty.
+    fn sweep_some(&self, cursor: &AtomicUsize, blocks: usize, epoch: u32) -> (usize, Vec<u32>, Vec<u32>) {
+        let (mut live, mut dead, mut empty) = (0, Vec::new(), Vec::new());
         loop {
             let start = cursor.fetch_add(SWEEP_BATCH, Ordering::AcqRel);
             if start >= blocks {
-                return (live, dead);
+                return (live, dead, empty);
             }
             for i in start..(start + SWEEP_BATCH).min(blocks) {
-                let i = u32::try_from(i).expect("块序号");
+                let i = u32::try_from(i).expect("block index");
                 match Kind::from(self.state(i).kind.load(Ordering::Acquire)) {
                     Kind::Small => {
-                        // SAFETY: 标记做完了，没有 mutator；块里是公开堆的对象
+                        // SAFETY: marking is done and there are no mutators; the block holds public heap objects
                         let (state, bytes) = unsafe { self.block(i).sweep::<PHeader>(epoch, None) };
                         live += bytes;
+                        if matches!(state, State::Empty) {
+                            empty.push(i);
+                        }
                         if !matches!(state, State::Full) {
                             Stack::on(&self.sup().available).push(i, &self.state(i).next);
                         }
                     }
                     Kind::LargeHead => {
-                        // SAFETY: 大对象的头在第一块开头
+                        // SAFETY: a large object's header is at the start of its first block
                         let h = unsafe { &*self.block(i).line(0).cast::<Core>() };
                         if h.is_marked(epoch) {
                             live += h.bytes();
@@ -1863,181 +2029,278 @@ impl Inner {
         }
     }
 
-    /// 拆掉一个死掉的大对象：它占的块元数据清零、改成小对象块，压进可用栈。先拆后面的块、最后拆头：
-    /// 拆到一半进程被杀，头还在，下一次回收再拆一遍，已经拆过的（不再是 LargeTail）跳过，不会重复进栈。
-    fn free_large(&self, head: u32) {
-        // SAFETY: 大对象的头在第一块开头，还没拆
+    /// Take apart a dead large object: zero the metadata of its blocks, turn them into small-object blocks and push them on the available stack. Tail blocks first, the head last:
+    /// if the process is killed half way the head remains, and the next collection takes it apart again, skipping blocks already done (no longer LargeTail), so nothing is pushed twice.
+    fn free_large(&self, head: u32, empty: &mut Vec<u32>) {
+        // SAFETY: a large object's header is at the start of its first block, not yet taken apart
         let n = unsafe { &*self.block(head).line(0).cast::<Core>() }.bytes().div_ceil(BLOCK);
-        let tails = head + 1..head + u32::try_from(n).expect("块数");
+        let tails = head + 1..head + u32::try_from(n).expect("block count");
         for j in tails.filter(|&j| Kind::from(self.state(j).kind.load(Ordering::Acquire)) == Kind::LargeTail).chain([head]) {
             let b = self.block(j);
-            // SAFETY: 对象已死（没有析构），块里没有别的对象
+            // SAFETY: the object is dead (no destructor) and the block holds no other objects
             unsafe { b.reset() };
             b.reused();
             self.state(j).kind.store(Kind::Small as u32, Ordering::Release);
             Stack::on(&self.sup().available).push(j, &self.state(j).next);
+            empty.push(j);
         }
+    }
+
+    /// Give empty blocks (indexes sorted) back to the system: one hole per run of adjacent blocks. The block metadata is zeroed too, and all zeros is exactly a valid empty block (as [`Block::reset`]);
+    /// the block state table is not inside the blocks and is unaffected, so they stay on the available stack and fault in zero pages when taken again.
+    fn punch_blocks(&self, sorted: &[u32]) {
+        for run in sorted.chunk_by(|a, b| a + 1 == *b) {
+            let (first, n) = (run[0] as usize, run.len());
+            self.backing.punch(self.window.as_ptr(), self.layout.blocks + first * BLOCK, n * BLOCK);
+        }
+    }
+
+    /// The birth stamp of objects this heap allocates in epoch `epoch`: the heap identity and the epoch mixed together. Two objects occupying the same place one after the other were allocated in different epochs
+    /// (a place frees up only after a sweep, and the epoch always grows after a sweep), and a reused heap number has a different identity, so stamps collide only with probability about 2^-[`STAMP_BITS`].
+    pub fn stamp(&self, epoch: u32) -> u32 {
+        let mut z = self.incarnation() ^ u64::from(epoch).wrapping_mul(SPLITMIX_GAMMA);
+        z = (z ^ (z >> SPLITMIX_SHIFTS[0])).wrapping_mul(SPLITMIX_MULS[0]);
+        z = (z ^ (z >> SPLITMIX_SHIFTS[1])).wrapping_mul(SPLITMIX_MULS[1]);
+        u32::try_from((z ^ (z >> SPLITMIX_SHIFTS[2])) >> u32::BITS).expect("the high 32 bits")
+    }
+
+    /// When a weak reference word points at a live object of this heap (an object header at that place and a matching birth stamp), give its data address. Safe even for words sent by other processes:
+    /// it reads only table entries and blocks that have memory, and out-of-range offsets, unopened blocks, the middle of an object and the following blocks of a large object are all None.
+    /// Call only inside this heap's mutate (collections wait for mutators to leave, so the object cannot be collected between the check and its use).
+    pub fn locate(&self, word: WeakWord) -> Option<*mut u8> {
+        let off = word.offset();
+        if off == 0 || !self.owns(off) {
+            return None;
+        }
+        let local = usize::try_from(off).ok()? - self.index * WINDOW;
+        let rel = local.checked_sub(self.layout.blocks)?;
+        let i = rel / BLOCK;
+        let sup = self.sup();
+        if i >= sup.blocks.load(Ordering::Acquire) as usize {
+            return None;
+        }
+        let states = usize::try_from(sup.committed[Segment::States.index()].load(Ordering::Acquire)).ok()?;
+        if self.layout.states + (i + 1) * size_of::<BlockState>() > states {
+            return None;
+        }
+        let i = u32::try_from(i).ok()?;
+        let b = self.block(i);
+        let data = self.at::<u8>(local);
+        let header = data.wrapping_sub(PHEADER);
+        let at_object = match Kind::from(self.state(i).kind.load(Ordering::Acquire)) {
+            Kind::Small if header.addr() >= b.line(Block::FIRST_LINE).addr() => {
+                let (word, bit) = b.start_bit(header);
+                // SAFETY: the start bitmap is in the block's metadata, and the block was opened (it has memory)
+                unsafe { &*word }.load(Ordering::Acquire) & bit != 0
+            }
+            Kind::LargeHead => core::ptr::eq(header, b.line(0)),
+            _ => false,
+        };
+        // SAFETY: checked above that header is a fully written object header
+        (at_object && unsafe { (*header.cast::<PHeader>()).stamp } & STAMP_MASK == word.stamp()).then_some(data)
+    }
+
+    /// The type of the object at `data` (checked by [`Inner::locate`]) is `T`: first look at this process's cached type number, then compare type keys if it does not match.
+    pub fn is_type<T: Shared>(&self, data: *const u8) -> bool {
+        // SAFETY: see above
+        let ty = unsafe { (*PHeader::of(data)).ty };
+        let tag = type_name::<T>().as_ptr().addr();
+        self.types.iter().any(|&(t, k)| t == tag && k == ty) || self.same_type::<T>(ty)
+    }
+
+    /// The type key of the object at `data`.
+    fn key_of(&self, data: *const u8) -> [u64; 2] {
+        // SAFETY: data is a live object of this heap, and its type number comes from a registered type
+        let ty = unsafe { (*PHeader::of(data)).ty };
+        self.type_entry(ty).key.each_ref().map(|k| k.load(Ordering::Relaxed))
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl Drop for Inner {
     fn drop(&mut self) {
-        // 句柄都已析构（入口都还了），没有 mutator：空出挂接槽
+        // Every handle is dropped (entries returned) and there are no mutators: free the attachment slot
         if self.slot < ATTACH_CAP {
             let a = self.attachment(self.slot);
             a.start.store(0, Ordering::Relaxed);
             a.pid.store(0, Ordering::Release);
         }
-        // 建堆的句柄（主人）放手、又没有 persist：堆跟着死——标死（还映射着它的进程就知道了），删掉文件与标记。
-        // 要在拆映射之前读写超级块
-        if let Backing::File { path, owner: true, .. } = &self.backing
+        // The creating handle (the owner) lets go without persist: the heap dies with it — mark it dead (processes still mapping it notice) and delete the file and marker.
+        // The superblock must be read and written before unmapping
+        if let Backing::File { path: Some(path), owner: true, .. } = &self.backing
             && self.sup().persist.load(Ordering::Acquire) == 0
         {
             self.sup().dead.store(1, Ordering::Release);
             Registry::of(path).bury(path, self.index, self.incarnation());
         }
-        // SAFETY: 最后一个引用：没有 mutator、句柄都已析构
+        // SAFETY: the last reference: no mutators, every handle dropped
         unsafe { self.space.region().unmap(self.index) };
         self.space.release(self.index);
         let spare = *self.spare.get_mut();
         if !spare.is_null() {
-            // SAFETY: Box::into_raw 来的
+            // SAFETY: from Box::into_raw
             drop(unsafe { Box::from_raw(spare) });
         }
     }
 }
 
-/// 公开堆。多个线程可以同时 [`PublicHeap::mutate`]；同一个堆在别处（另一个地址区、以后另一个进程）也映射着时，握手照样互相排斥。
-#[cfg(target_os = "linux")]
-pub struct PublicHeap(Arc<Inner>);
+/// A public heap. Several threads can [`CrossHeap::mutate`] at once; when the same heap is also mapped elsewhere (another region, another process), the handshake still excludes them mutually.
+#[cfg(crossheap)]
+pub struct CrossHeap(Arc<Inner>);
 
-#[cfg(target_os = "linux")]
-impl From<Inner> for PublicHeap {
+#[cfg(crossheap)]
+impl From<Inner> for CrossHeap {
     fn from(inner: Inner) -> Self {
         Self(Arc::new(inner))
     }
 }
 
-/// 堆已经死了（主人不在了）。
+/// The heap is dead (its owner is gone).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 pub struct HeapDead;
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl core::fmt::Display for HeapDead {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("公开堆已经死了（建它的进程不在了）")
+        f.write_str("the public heap is dead (the process that created it is gone)")
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl std::error::Error for HeapDead {}
 
-/// 公开堆的统计。
+/// Public heap statistics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[cfg(target_os = "linux")]
-pub struct PublicStats {
-    /// 上次回收后存活的字节数（含头）
+#[cfg(crossheap)]
+pub struct CrossHeapStats {
+    /// Live bytes after the last collection (including headers)
     pub live: usize,
-    /// 上次回收后新领用的字节数
+    /// Bytes newly taken since the last collection
     pub allocated: usize,
-    /// 开过的块数
+    /// Blocks opened
     pub blocks: usize,
     pub collections: u64,
-    /// 回收方被杀（回收做到一半）、由别人接手重做的次数
+    /// Times a collector was killed (half way through) and someone else took over
     pub takeovers: u64,
 }
 
-#[cfg(target_os = "linux")]
-impl PublicHeap {
-    /// 堆号（= 窗口号）。
+#[cfg(crossheap)]
+impl CrossHeap {
+    /// Heap number (= window number).
     pub fn id(&self) -> usize {
         self.0.index
     }
 
-    /// 建堆的句柄析构时保留堆文件与堆号标记（主进程退出或重启后，别的进程照样 [`crate::PublicSpace::open`] 回来接着用）。
+    /// Keep the heap file and heap-number marker when the creating handle is dropped (after the main process exits or restarts, other processes can still [`crate::CrossHeapSpace::open`] it and continue).
     pub fn persist(&self) {
         self.0.sup().persist.store(1, Ordering::Release);
     }
 
-    /// 堆还活着：主人（建堆的进程）还在，或调过 [`PublicHeap::persist`]。主人不在了堆就死了：这里发现时标死、删掉堆文件与标记；
-    /// 之后本进程该放掉指向它的句柄（放掉最后一个，映射才拆、内存才还）。
+    /// The heap is alive: its owner (the creating process) is still there, or [`CrossHeap::persist`] was called. Once the owner is gone the heap is dead: on finding that, mark it dead and delete the heap file and marker;
+    /// this process should then let go of its handles (the mapping goes and memory returns only when the last one is dropped).
     pub fn is_alive(&self) -> bool {
         self.0.is_alive()
     }
 
-    /// 同时在这个堆与 `other` 里做事（两个不同的公开堆）：总是先进堆号小的那个。嵌套进几个公开堆时都照这个顺序，
-    /// 一起回收（按堆号逐个挡、逐个等走空）就不会和 mutator 互等；逆序嵌套也不会出错，只是回收要放开重来、慢一些。
-    pub fn mutate_with<R>(&self, other: &PublicHeap, f: impl for<'a, 'b> FnOnce(&PublicMutator<'a>, &PublicMutator<'b>) -> R) -> R {
-        assert!(self.id() != other.id(), "两个不同的公开堆");
+    /// Work in this heap and `other` at once (two different public heaps): always enters the lower heap number first. Nesting into several public heaps in this order everywhere,
+    /// group collections (holding back and waiting for each heap in heap-number order) never wait on mutators; reverse nesting is not wrong either, only slower as collections give up and retry.
+    pub fn mutate_with<R>(&self, other: &CrossHeap, f: impl for<'a, 'b> FnOnce(&CrossHeapMutator<'a>, &CrossHeapMutator<'b>) -> R) -> R {
+        assert!(self.id() != other.id(), "two different public heaps");
         if self.id() < other.id() { self.mutate(|ma| other.mutate(|mb| f(ma, mb))) } else { other.mutate(|mb| self.mutate(|ma| f(ma, mb))) }
     }
 
-    /// 同 [`PublicHeap::mutate`]，但堆已经死了（主人不在了）时不进去，返回 [`HeapDead`]。别的进程建的堆用这个。
-    pub fn try_mutate<R>(&self, f: impl for<'p> FnOnce(&PublicMutator<'p>) -> R) -> Result<R, HeapDead> {
+    /// As [`CrossHeap::mutate`], but does not enter a dead heap (owner gone) and returns [`HeapDead`]. Use it for heaps created by other processes.
+    pub fn try_mutate<R>(&self, f: impl for<'p> FnOnce(&CrossHeapMutator<'p>) -> R) -> Result<R, HeapDead> {
         if !self.0.alive_cached() {
             return Err(HeapDead);
         }
         Ok(self.mutate(f))
     }
 
-    /// 挂接表里占着的槽数（映射着这个堆的地方：进程，或同一进程里的多个地址区；含已死、还没被收拾的）。
+    /// Slots taken in the attachment table (places mapping this heap: processes, or several regions in one process; including dead ones not yet cleaned up).
     pub fn attached(&self) -> usize {
         (0..ATTACH_CAP).filter(|&i| self.0.attachment(i).pid.load(Ordering::Acquire) != 0).count()
     }
 
-    /// 在堆上做事；可以在多个线程上同时调用。闭包里分配的对象只有挂到 [`Public`] 上（直接或间接）才能活过下一次回收。
-    pub fn mutate<R>(&self, f: impl for<'p> FnOnce(&PublicMutator<'p>) -> R) -> R {
+    /// Work on the heap; can be called on several threads at once. Objects allocated in the closure survive the next collection only if they hang from a [`CrossHeapRoot`] (directly or indirectly).
+    pub fn mutate<R>(&self, f: impl for<'p> FnOnce(&CrossHeapMutator<'p>) -> R) -> R {
         let spare = self.0.spare.swap(null_mut(), Ordering::AcqRel);
         let mut tlab = if spare.is_null() {
             Box::default()
         } else {
-            // SAFETY: spare 里只放过 Box::into_raw 的 Tlab，swap 后归我们独有
+            // SAFETY: spare only ever holds Tlabs from Box::into_raw, and after the swap it is ours alone
             unsafe { Box::from_raw(spare) }
         };
         let r = {
             let _gate = Gate::enter(&self.0);
             tlab.adopt((Arc::as_ptr(&self.0).addr(), self.0.sup().collections.load(Ordering::Acquire)));
-            // 回收只在没有 mutator 时进行，所以一次 mutate 里纪元不变
+            // Collection happens only with no mutators, so the epoch does not change within one mutate
             let epoch = self.0.sup().epoch.load(Ordering::Acquire);
-            f(&PublicMutator { heap: &self.0, tlab: &tlab, epoch, _brand: PhantomData })
+            f(&CrossHeapMutator { heap: &self.0, tlab: &tlab, epoch, stamp: self.0.stamp(epoch), _brand: PhantomData })
         };
         let tlab = Box::into_raw(tlab);
         if self.0.spare.compare_exchange(null_mut(), tlab, Ordering::AcqRel, Ordering::Relaxed).is_err() {
-            // SAFETY: 没放进去，仍归我们独有
+            // SAFETY: it was not put back, so it is still ours alone
             drop(unsafe { Box::from_raw(tlab) });
         }
         r
     }
 
-    /// 暂停式回收：挂上请求、等所有挂着这个堆的地方（含别的进程）的 mutate 走空，并行标记 + 并行清扫。
-    /// 别人正在回收就等它做完返回；回收方被杀了就接手。死掉的进程不等，它持有的入口在这里还掉。
-    /// 不要在这个堆的 mutate 里调用（会一直等自己走空）。
+    /// Stop-the-world collection: set the request, wait until every place attached to this heap (including other processes) has left mutate, then mark in parallel + sweep in parallel.
+    /// If someone else is collecting, wait for them to finish and return; take over if the collector was killed. Dead processes are not waited for, and the entries they hold are returned here.
+    /// Do not call it inside this heap's mutate (it would wait forever for itself to leave).
     pub fn collect(&self) {
         self.0.collect();
     }
 
-    /// 几个公开堆（都映射在本进程里）一起回收，收掉跨堆的环：持有方是组里某个堆的 [`crate::PublicRef`] 登记不当根，
-    /// 由追踪决定死活；标完后组内的跨堆登记换成这次追踪到的。同一个堆不能出现两次。
-    pub fn collect_group(heaps: &[&PublicHeap]) {
-        // 已经死了的堆不参加：它持有的登记由各堆回收时按死活还掉
-        let mut members: Vec<&Inner> = heaps.iter().map(|h| &*h.0).filter(|m| m.is_alive()).collect();
+    /// As [`CrossHeap::collect`], and every empty block found by sweeping goes back to the system (ordinary collections keep some spares according to the allocation since the last one).
+    /// Allocating into returned blocks later faults the pages in again.
+    pub fn shrink(&self) {
+        self.0.collect_with(true);
+    }
+
+    /// The heap file's descriptor (anonymous heaps have none): pass it to another process through `SCM_RIGHTS`, and the receiver opens it with [`crate::CrossHeapSpace::open_fd`]
+    /// without needing access to the heap file's path.
+    pub fn fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        match &self.0.backing {
+            Backing::File { file, .. } => Some(file.as_fd()),
+            Backing::Anonymous => None,
+        }
+    }
+
+    /// Mail received so far (see [`CrossHeapMutator::post`]).
+    pub fn mail(&self) -> u32 {
+        self.0.sup().mail.load(Ordering::SeqCst)
+    }
+
+    /// Sleep while the mail count is still `seen`, at most `timeout` (waking does not guarantee new mail; check [`CrossHeap::mail`] again).
+    /// Do not wait inside this heap's mutate (collections would wait forever for you to leave).
+    pub fn wait_mail(&self, seen: u32, timeout: Duration) {
+        self.0.sup().mail.wait(seen, timeout);
+    }
+
+    /// Collect several public heaps (all mapped in this process) together, reclaiming cycles across heaps: [`crate::CrossHeapRef`] registrations held by heaps of the group are not roots,
+    /// tracing decides their liveness; after marking, the cross-heap registrations inside the group are replaced by the ones traced. The same heap must not appear twice.
+    pub fn collect_group(heaps: &[&CrossHeap]) {
+        // Dead heaps do not take part: the registrations they hold are returned by each heap's collection according to liveness. Heaps collected only by their owner (attached to a private heap as old generation) do not take part either
+        let mut members: Vec<&Inner> = heaps.iter().map(|h| &*h.0).filter(|m| m.is_alive() && m.sup().owner_only.load(Ordering::Acquire) == 0).collect();
         members.sort_by_key(|m| m.index);
-        assert!(members.windows(2).all(|w| w[0].index != w[1].index), "同一个公开堆不能在组里出现两次");
+        assert!(members.windows(2).all(|w| w[0].index != w[1].index), "the same public heap must not appear twice in a group");
         if !members.is_empty() {
             Inner::collect_group(&members);
         }
     }
 
-    /// 堆身份（建堆时随机取的；堆号会被重用，身份不会）。
+    /// Heap identity (chosen at random at creation; heap numbers are reused, identities are not).
     pub fn incarnation(&self) -> u64 {
         self.0.incarnation()
     }
 
-    pub fn stats(&self) -> PublicStats {
+    pub fn stats(&self) -> CrossHeapStats {
         let sup = self.0.sup();
-        PublicStats {
+        CrossHeapStats {
             live: usize::try_from(sup.live.load(Ordering::Relaxed)).unwrap_or(usize::MAX),
             allocated: usize::try_from(sup.allocated.load(Ordering::Relaxed)).unwrap_or(usize::MAX),
             blocks: sup.blocks.load(Ordering::Relaxed) as usize,
@@ -2047,37 +2310,88 @@ impl PublicHeap {
     }
 }
 
-/// 只给本 crate 用的操作：trait 在私有模块里、不导出，crate 外拿不到。
-#[cfg(target_os = "linux")]
-pub trait PublicHeapInternal {
+/// One collector worker's promoter in a young collection: copies shareable young objects into the owner's cross-heap (with its own allocation buffer, so workers do not interfere).
+/// The collector is the cross-heap's owner and only the owner collects it, so the cross-heap is not collected while copying.
+#[cfg(crossheap)]
+pub struct Promoter<'h> {
+    heap: &'h Inner,
+    tlab: Tlab,
+    /// The cross-heap's last completed epoch (to judge free lines) and the birth stamp of this batch of objects
+    epoch: u32,
+    stamp: u32,
+}
+
+#[cfg(crossheap)]
+impl<'h> Promoter<'h> {
+    pub fn new(heap: &'h Inner) -> Self {
+        let mut tlab = Tlab::default();
+        tlab.adopt((core::ptr::from_ref(heap).addr(), heap.sup().collections.load(Ordering::Acquire)));
+        let epoch = heap.sup().epoch.load(Ordering::Acquire);
+        Self { heap, tlab, epoch, stamp: heap.stamp(epoch) }
+    }
+
+    /// The number of `T` in the cross-heap's type table (registered if missing).
+    pub fn type_of<T: Shared>(&self) -> u32 {
+        self.heap.type_of::<T>(&self.tlab)
+    }
+
+    /// Copy the data of private heap object `from` into the cross-heap (type number `ty`) and return the new data address.
+    /// SAFETY (caller): `from` is a live object this thread claimed, and the type number is its own answer.
+    pub unsafe fn copy(&self, from: *const Header, ty: u32) -> *mut u8 {
+        // SAFETY: see above
+        let data = unsafe { &*from }.bytes() - HEADER;
+        let bytes = (PHEADER + data).next_multiple_of(GRANULE);
+        let large = bytes > LARGE;
+        let (p, run) = if large {
+            let (p, first, n) = self.heap.alloc_large(bytes);
+            (p, Some((first, n)))
+        } else {
+            (self.tlab.bump(bytes, self.epoch, || self.heap.acquire(), |_| self.heap.acquire()), None)
+        };
+        // SAFETY: p is new memory of bytes bytes, granule aligned; the data is copied bytewise (shareable types have no destructor and their edges are absolute addresses)
+        unsafe {
+            p.cast::<PHeader>().write(PHeader::new(bytes, large, ty, self.stamp));
+            PHeader::data(p.cast()).copy_from_nonoverlapping(Header::data(from), data);
+        }
+        match run {
+            Some((first, n)) => self.heap.publish_large(first, n),
+            None => Block::containing(p).set_start(p),
+        }
+        PHeader::data(p.cast())
+    }
+}
+
+/// Operations for this crate only: the trait lives in a private module and is not exported, so it is unreachable outside the crate.
+#[cfg(crossheap)]
+pub trait CrossHeapInternal {
     fn is(&self, inner: &Arc<Inner>) -> bool;
 }
 
-#[cfg(target_os = "linux")]
-impl PublicHeapInternal for PublicHeap {
+#[cfg(crossheap)]
+impl CrossHeapInternal for CrossHeap {
     fn is(&self, inner: &Arc<Inner>) -> bool {
         Arc::ptr_eq(&self.0, inner)
     }
 }
 
 
-/// 在 mutate 里：本挂接的计数加一，出门减一（panic 也减）。
+/// Inside mutate: increment this attachment's count on the way in and decrement on the way out (also on panic).
 ///
-/// 进门先加计数、再看回收请求，回收方先挂请求、再看计数（都是 SeqCst）：两边至少有一方看到对方，所以不会有
-/// mutator 在回收进行时溜进来。看到请求就退回去等；回收方死了（请求一直挂着）就自己接手把回收做完。
-#[cfg(target_os = "linux")]
+/// Entering increments the count before checking the collection request, and a collector sets the request before checking the counts (all SeqCst): at least one side sees the other, so no
+/// mutator slips in during a collection. Seeing a request, back out and wait; if the collector died (the request stays set), take over and finish the collection.
+#[cfg(crossheap)]
 struct Gate<'h> {
     inside: &'h AtomicU32,
     request: &'h AtomicU32,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl<'h> Gate<'h> {
     fn enter(heap: &'h Inner) -> Self {
         let request = &heap.sup().request;
         let a = heap.attachment(heap.slot);
         let (inside, waiting) = (&a.inside, &a.waiting);
-        // 挡在门口时记一笔，进了门再销掉（见 Attachment::waiting）
+        // Record it while held at the door and cancel it once inside (see Attachment::waiting)
         let mut queued = false;
         let leave_queue = |queued: &mut bool| {
             if core::mem::take(queued) && waiting.fetch_sub(1, Ordering::SeqCst) == 1 {
@@ -2094,7 +2408,7 @@ impl<'h> Gate<'h> {
                     }
                     request.wait(owner, POLL);
                 } else {
-                    // 回收方死了：自己接手（先销掉排队，回收方会等排队的人）
+                    // The collector died: take over (cancel the queueing first, since the collector waits for those queued)
                     leave_queue(&mut queued);
                     heap.collect();
                 }
@@ -2111,7 +2425,7 @@ impl<'h> Gate<'h> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(crossheap)]
 impl Drop for Gate<'_> {
     fn drop(&mut self) {
         self.inside.fetch_sub(1, Ordering::SeqCst);
@@ -2121,24 +2435,26 @@ impl Drop for Gate<'_> {
     }
 }
 
-/// 一次公开堆 mutate 里的分配器与品牌；只在调用线程上用。
-#[cfg(target_os = "linux")]
-pub struct PublicMutator<'p> {
+/// The allocator and brand of one public heap mutate; used only on the calling thread.
+#[cfg(crossheap)]
+pub struct CrossHeapMutator<'p> {
     heap: &'p Arc<Inner>,
     tlab: &'p Tlab,
-    /// 上次完成的纪元（空行判定）
+    /// The last completed epoch (to judge free lines)
     epoch: u32,
+    /// The birth stamp of objects allocated in this mutate ([`Inner::stamp`])
+    stamp: u32,
     _brand: Invariant<'p>,
 }
 
-#[cfg(target_os = "linux")]
-impl<'p> PublicMutator<'p> {
+#[cfg(crossheap)]
+impl<'p> CrossHeapMutator<'p> {
 
-    /// 分配一个对象。类型不能有析构（编译期检查）。
-    pub fn alloc<T: Shared>(&self, value: T) -> PublicGc<'p, T> {
+    /// Allocate an object. The type must not have a destructor (checked at compile time).
+    pub fn alloc<T: Shared>(&self, value: T) -> CrossHeapGc<'p, T> {
         const {
-            assert!(!core::mem::needs_drop::<T>(), "公开堆的对象不能有析构");
-            assert!(align_of::<T>() <= GRANULE, "对象数据的对齐不能超过 8 字节");
+            assert!(!core::mem::needs_drop::<T>(), "public heap objects must not have destructors");
+            assert!(align_of::<T>() <= GRANULE, "object data alignment must not exceed 8 bytes");
         };
         let bytes = (PHEADER + size_of::<T>()).next_multiple_of(GRANULE);
         let ty = self.heap.type_of::<T>(self.tlab);
@@ -2149,14 +2465,14 @@ impl<'p> PublicMutator<'p> {
         } else {
             (self.alloc_small(bytes), None)
         };
-        // SAFETY: p 是 bytes 字节、按粒度对齐的新内存，归这次分配独有
+        // SAFETY: p is new memory of bytes bytes, granule aligned, owned by this allocation
         let gc = unsafe {
-            p.cast::<PHeader>().write(PHeader::new(bytes, large, ty));
+            p.cast::<PHeader>().write(PHeader::new(bytes, large, ty, self.stamp));
             let data = PHeader::data(p.cast());
             data.cast::<T>().write(value);
-            PublicGc::from_data(data)
+            CrossHeapGc::from_data(data)
         };
-        // 写完才登记（小对象的起点位、大对象的块种类）：进程死在中间，清扫也不会去读一个没写完的对象
+        // Register only after writing (the start bit of a small object, the block kind of a large one): if the process dies in between, sweeping never reads a half-written object
         match run {
             Some((first, n)) => self.heap.publish_large(first, n),
             None => Block::containing(p).set_start(p),
@@ -2164,16 +2480,16 @@ impl<'p> PublicMutator<'p> {
         gc
     }
 
-    /// 给对象建一个句柄（入口）。
-    pub fn root<B: PublicBrand>(&self, gc: PublicGc<'p, B::Of<'p>>) -> Public<B> {
+    /// Make a handle (entry) for an object.
+    pub fn root<B: CrossHeapBrand>(&self, gc: CrossHeapGc<'p, B::Of<'p>>) -> CrossHeapRoot<B> {
         let entry = self.heap.claim_entry(gc.offset());
-        // SAFETY: Gc 的数据指针非空
-        Public::new(self.heap.clone(), entry, unsafe { NonNull::new_unchecked(gc.as_ptr().cast_mut().cast()) })
+        // SAFETY: a Gc's data pointer is non-null
+        CrossHeapRoot::new(self.heap.clone(), entry, unsafe { NonNull::new_unchecked(gc.as_ptr().cast_mut().cast()) })
     }
 
-    /// 凭入口号（[`Public::index`]，可能来自另一个映射或进程）拿到那个对象的新句柄。入口空着、
-    /// 或对象的类型（类型名 + 大小 + 指针图）和 `B` 对不上时返回 None。
-    pub fn find<B: PublicBrand>(&self, index: u32) -> Option<Public<B>> {
+    /// Get a new handle to the object of an entry number ([`CrossHeapRoot::index`], possibly from another mapping or process). None when the entry is empty
+    /// or the object's type (type name + size + pointer map) does not match `B`.
+    pub fn find<B: CrossHeapBrand>(&self, index: u32) -> Option<CrossHeapRoot<B>> {
         let sup = self.heap.sup();
         if index >= sup.entries.load(Ordering::Acquire) {
             return None;
@@ -2182,18 +2498,18 @@ impl<'p> PublicMutator<'p> {
         if off == 0 || !self.heap.owns(off) {
             return None;
         }
-        // 在 mutate 里：入口非空 ⇒ 对象此刻是根，下一次回收前不会死；下面领了自己的入口再离开
+        // Inside mutate: a non-empty entry ⇒ the object is a root right now and does not die before the next collection; take our own entry below before leaving
         let data = self.heap.ptr(off);
-        // SAFETY: 入口指着本堆一个活对象
+        // SAFETY: the entry points at a live object of this heap
         let ty = unsafe { (*PHeader::of(data)).ty };
         if !self.heap.same_type::<B::Of<'p>>(ty) {
             return None;
         }
         let entry = self.heap.claim_entry(off);
-        Some(Public::new(self.heap.clone(), entry, NonNull::new(data).expect("对象地址非空")))
+        Some(CrossHeapRoot::new(self.heap.clone(), entry, NonNull::new(data).expect("the object address is non-null")))
     }
 
-    /// 还掉一个不归任何人的入口（[`Public::persist`] 留下的）；入口空着或还归某个进程 / 堆时不动，返回 false。
+    /// Return an entry owned by nobody (left by [`CrossHeapRoot::persist`]); an empty entry or one still held by a process / heap is left alone and false returned.
     pub fn release(&self, index: u32) -> bool {
         let heap = self.heap;
         if index >= heap.sup().entries.load(Ordering::Acquire) {
@@ -2207,31 +2523,98 @@ impl<'p> PublicMutator<'p> {
         true
     }
 
+    /// Turn a private heap [`Gc`] pointing at an object of this heap (promoted by a young collection, see [`Heap::attach_cross_heap`]) into an object of this heap, to sign it or put it into
+    /// this heap's slots; None if it does not point into this heap or the type is not `B`.
+    pub fn adopt<B: CrossHeapBrand, T>(&self, gc: Gc<'_, T>) -> Option<CrossHeapGc<'p, B::Of<'p>>> {
+        let off = self.heap.offset_of(gc.as_ptr().addr()).filter(|&off| self.heap.owns(off))?;
+        let data = self.heap.ptr(off);
+        // SAFETY: an object of this heap (promoted here) with a matching type; it is not collected within this mutate
+        self.heap.is_type::<B::Of<'p>>(data).then(|| unsafe { CrossHeapGc::from_data(data) })
+    }
+
+    /// The signature of the object a private heap [`Gc`] points at, when it is an object of this heap (promoted here, see [`Heap::attach_cross_heap`]); None otherwise.
+    /// Needs no brand: the type key is read from the object's header.
+    pub fn sign_promoted<T>(&self, gc: Gc<'_, T>) -> Option<Signature> {
+        let off = self.heap.offset_of(gc.as_ptr().addr()).filter(|&off| self.heap.owns(off))?;
+        let data = self.heap.ptr(off);
+        // SAFETY: a live Gc pointing into this heap is the data of a promoted object, with its header in front
+        let stamp = unsafe { (*PHeader::of(data)).stamp };
+        Some((WeakWord::from((off, stamp)), self.heap.incarnation(), self.heap.key_of(data)).into())
+    }
+
+    /// The object's signature: send it to another process, which opens this heap and finds the object with it ([`CrossHeapMutator::resolve`]). A signature keeps nothing alive.
+    pub fn sign<T: Shared>(&self, gc: CrossHeapGc<'p, T>) -> Signature {
+        (WeakWord::from(gc), self.heap.incarnation(), self.heap.key_of(gc.as_ptr().cast())).into()
+    }
+
+    /// The signature points at a live object of this heap with a matching type key (no Rust type needed; signatures may come from untrusted parties and checking only reads).
+    pub fn verify(&self, sig: &Signature) -> bool {
+        self.find_signed(sig).is_some()
+    }
+
+    /// Get an object by signature: when the signature points at a live object of this heap whose type is `B`, give it; otherwise None (the object was collected, the heap number changed owner, the type is wrong, or it is forged).
+    /// The result is valid only within this mutate; to keep it, hang it from a [`CrossHeapRoot`] or write it into another object.
+    pub fn resolve<B: CrossHeapBrand>(&self, sig: &Signature) -> Option<CrossHeapGc<'p, B::Of<'p>>> {
+        let data = self.find_signed(sig)?;
+        // SAFETY: find_signed checked a live object of this heap right now; it is not collected within this mutate
+        self.heap.is_type::<B::Of<'p>>(data).then(|| unsafe { CrossHeapGc::from_data(data) })
+    }
+
+    fn find_signed(&self, sig: &Signature) -> Option<*mut u8> {
+        if sig.incarnation() != self.heap.incarnation() {
+            return None;
+        }
+        self.heap.locate(sig.into()).filter(|&data| self.heap.key_of(data) == sig.key())
+    }
+
+    /// Post an object to this heap's mailbox for the heap's owner to handle (other processes asking the owner to act for them): take an entry owned by no process pointing at it (so the letter stays even if the poster exits or is killed),
+    /// push it into the mailbox and wake the owner waiting for mail. Returns the entry number. The owner takes it with [`CrossHeapMutator::take_mail`] and, when done,
+    /// returns the entry with [`CrossHeapMutator::release`].
+    pub fn post<T: Shared>(&self, gc: CrossHeapGc<'p, T>) -> u32 {
+        let i = self.heap.claim_entry_for(gc.offset(), 0, 0);
+        let sup = self.heap.sup();
+        Stack::on(&sup.mailbox).push(i, &self.heap.entry(i).next);
+        sup.mail.fetch_add(1, Ordering::SeqCst);
+        sup.mail.wake_all();
+        i
+    }
+
+    /// Take all mail from the mailbox (entry numbers, earliest post first). Get the objects by type with [`CrossHeapMutator::find`] and [`CrossHeapMutator::release`] them when done.
+    pub fn take_mail(&self) -> Vec<u32> {
+        Stack::on(&self.heap.sup().mailbox).take_all(|i| &self.heap.entry(i).next)
+    }
+
     fn alloc_small(&self, bytes: usize) -> *mut u8 {
         self.tlab.bump(bytes, self.epoch, || self.heap.acquire(), |_| self.heap.acquire())
     }
 }
 
-/// 只给本 crate 用的操作：trait 在私有模块里、不导出，crate 外拿不到。
-#[cfg(target_os = "linux")]
-pub trait PublicMutatorInternal {
+/// Operations for this crate only: the trait lives in a private module and is not exported, so it is unreachable outside the crate.
+#[cfg(crossheap)]
+pub trait CrossHeapMutatorInternal {
     fn is(&self, inner: &Arc<Inner>) -> bool;
 
-    /// 公开偏移在本进程里的地址。
+    /// The address of a public offset in this process.
     fn at(&self, off: u64) -> *mut u8;
 
-    /// 堆号。
+    /// Heap number.
     fn index(&self) -> usize;
 
-    /// 给 `holder` 堆持有的引用在本堆登记一个入口。
-    fn register(&self, off: u64, holder: &PublicMutator<'_>);
+    /// Register an entry in this heap for a reference held by heap `holder`.
+    fn register(&self, off: u64, holder: &CrossHeapMutator<'_>);
 
-    /// 堆身份。
+    /// Heap identity.
     fn incarnation(&self) -> u64;
+
+    /// See [`Inner::locate`].
+    fn locate(&self, word: WeakWord) -> Option<*mut u8>;
+
+    /// See [`Inner::is_type`].
+    fn is_type<T: Shared>(&self, data: *const u8) -> bool;
 }
 
-#[cfg(target_os = "linux")]
-impl PublicMutatorInternal for PublicMutator<'_> {
+#[cfg(crossheap)]
+impl CrossHeapMutatorInternal for CrossHeapMutator<'_> {
     fn is(&self, inner: &Arc<Inner>) -> bool {
         Arc::ptr_eq(self.heap, inner)
     }
@@ -2244,11 +2627,19 @@ impl PublicMutatorInternal for PublicMutator<'_> {
         self.heap.index
     }
 
-    fn register(&self, off: u64, holder: &PublicMutator<'_>) {
+    fn register(&self, off: u64, holder: &CrossHeapMutator<'_>) {
         self.heap.claim_entry_for(off, holder.heap.holder_word(self.heap), holder.heap.incarnation());
     }
 
     fn incarnation(&self) -> u64 {
         self.heap.incarnation()
+    }
+
+    fn locate(&self, word: WeakWord) -> Option<*mut u8> {
+        self.heap.locate(word)
+    }
+
+    fn is_type<T: Shared>(&self, data: *const u8) -> bool {
+        self.heap.is_type::<T>(data)
     }
 }

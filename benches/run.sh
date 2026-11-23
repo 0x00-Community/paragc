@@ -1,19 +1,19 @@
 #!/bin/bash
-# 跑对比基准：每个配置跑 REPS 次取最小值，打印 Markdown 表。
-#   ./run.sh                       全部库
-#   ./run.sh paragc cppgc          只跑这几个
-# 环境变量：REPS（缺省 5）、THREADS（并行档的线程数，缺省 nproc）、RUSTY_V8_ARCHIVE（cppgc 用的 V8 静态库，不设就下载）
+# Run the comparison benchmarks: each configuration runs REPS times, keeping the minimum, and prints a Markdown table.
+#   ./run.sh                       every library
+#   ./run.sh paragc cppgc          only these
+# Environment: REPS (default 5), THREADS (thread count of the parallel runs, default nproc), RUSTY_V8_ARCHIVE (the V8 static library for cppgc; downloaded when unset)
 set -euo pipefail
 cd "$(dirname "$0")"
 REPS=${REPS:-5}
 THREADS=${THREADS:-$(nproc)}
 LIBS=("$@")
 [ ${#LIBS[@]} -eq 0 ] && LIBS=(paragc paragc-public cppgc cppgc-par cppgc-detached gc-arena rust-gc dumpster)
-# cppgc-par / cppgc-detached 都是 bench-cppgc：前者打开全部并行 / 并发标记选项，后者不挂 isolate（CPPGC_HEAP=detached）
+# cppgc-par / cppgc-detached are both bench-cppgc: the former turns on every parallel / concurrent marking option, the latter does not attach an isolate (CPPGC_HEAP=detached)
 CPPGC_PAR="--parallel-marking --concurrent-marking --cppheap-concurrent-marking --cppheap-incremental-marking --concurrent-marking-max-worker-num=$THREADS"
 cargo build --release -q $(printf -- '-p bench-%s ' "${LIBS[@]}" | sed 's/-p bench-cppgc-par//; s/-p bench-cppgc-detached//')
 
-# 每个库支持的 (工作负载, 线程数)
+# (workload, threads) supported by each library
 configs() {
     case $1 in
         paragc) echo "pause 1" "pause 4" "pause $THREADS" "pause-cm 1" "pause-cm 4" "pause-cm $THREADS" "pause-cs 1" "pause-cs 4" "pause-cs $THREADS" "pause-cms 1" "pause-cms 4" "pause-cms $THREADS" "gcbench 1" "gcbench 4" "gcbench $THREADS" "alloc-mt 1" "alloc-mt 4" "alloc-mt $THREADS" ;;
@@ -24,7 +24,7 @@ configs() {
     esac
 }
 
-echo "| 库 | 工作负载 | 线程 | 墙钟 ms（$REPS 次最小） | 那一次的 CPU ms | CPU ÷ 墙钟 |"
+echo "| Library | Workload | Threads | Wall ms (min of $REPS) | CPU ms of that run | CPU ÷ wall |"
 echo "|---|---|---:|---:|---:|---:|"
 for lib in "${LIBS[@]}"; do
     while read -r workload threads; do
@@ -41,14 +41,14 @@ for lib in "${LIBS[@]}"; do
     done < <(configs "$lib" | tr ' ' '\n' | paste - -)
 done
 
-# 碎片负载（四种大小、随机寿命，存活约 80 MB）：耗时与回收后 / 峰值 RSS，单独一张表
+# Fragmentation load (four sizes, random lifetimes, about 80 MB live): time and RSS after collection / at peak, in a table of its own
 FRAG_LIBS=()
 for lib in "${LIBS[@]}"; do
     case $lib in paragc | cppgc | cppgc-detached) FRAG_LIBS+=("$lib") ;; esac
 done
 if [ ${#FRAG_LIBS[@]} -gt 0 ]; then
     echo
-    echo "| 库 | 线程 | 墙钟 ms（$REPS 次最小） | 回收后 RSS MB | 峰值 RSS MB |"
+    echo "| Library | Threads | Wall ms (min of $REPS) | RSS after collection MB | Peak RSS MB |"
     echo "|---|---:|---:|---:|---:|"
     for lib in "${FRAG_LIBS[@]}"; do
         for threads in 1 "$THREADS"; do

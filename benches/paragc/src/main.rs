@@ -1,4 +1,4 @@
-//! paragc：pause / gcbench 的线程数是回收线程数；alloc-mt 是 mutator 线程数（回收线程同数）。
+//! paragc: for pause / gcbench the thread count is collector threads; for alloc-mt it is mutator threads (with as many collector threads).
 use std::num::NonZeroUsize;
 
 use bench_common::{Args, Bench, Clock, FRAG_PER_ROUND, FRAG_ROUNDS, Footprint, Frag, GcBench, LONG_LIVED_DEPTH, MT_DEPTH, MT_ROUNDS, MT_TREES, PAUSE_DEPTH, STRETCH_DEPTH, Size, Took, Tree};
@@ -13,13 +13,13 @@ struct Node<'gc> {
 
 brand!(NodeB = for<'gc> Node<'gc>);
 
-/// 碎片负载的对象：`N` 个 u64 的数据
+/// An object of the fragmentation load: `N` u64s of data
 #[derive(Trace)]
 struct Blob<const N: usize> {
     _data: [u64; N],
 }
 
-/// 碎片负载的持有者：每种大小一组槽
+/// The holder of the fragmentation load: one group of slots per size
 #[derive(Trace)]
 struct Holder<'gc> {
     small: Vec<Slot<'gc, Blob<3>>>,
@@ -38,7 +38,7 @@ impl<'gc> Holder<'gc> {
         Self { small: slots(Size::Small), medium: slots(Size::Medium), large: slots(Size::Large), huge: slots(Size::Huge) }
     }
 
-    /// 分配一个对象，需要的话放进槽里（覆盖掉的旧对象成为垃圾）。
+    /// Allocate an object and put it in a slot if needed (the old object overwritten becomes garbage).
     fn place(&self, m: &Mutator<'gc>, frag: &mut Frag) {
         fn put<'gc, const N: usize>(m: &Mutator<'gc>, slots: &[Slot<'gc, Blob<N>>], slot: Option<usize>) {
             let blob = m.alloc(Blob { _data: [0; N] });
@@ -70,8 +70,8 @@ impl Paragc {
         heap.mutate(|m| m.root(Self::tree(m, depth)))
     }
 
-    /// 一棵活树 + 一棵垃圾树，只量停住 mutator 的那段：
-    /// `concurrent_mark` 先并发标记（不计时）；`concurrent_sweep` 只量 `finish_marking`，清扫随后并发做（不计时）。
+    /// A live tree + a garbage tree, timing only the part that stops mutators:
+    /// `concurrent_mark` marks concurrently first (untimed); `concurrent_sweep` times only `finish_marking`, with sweeping done concurrently afterwards (untimed).
     fn timed_pause(&self, concurrent_mark: bool, concurrent_sweep: bool) -> Took {
         let mut heap = Heap::new(self.threads);
         let live = Self::rooted(&heap, PAUSE_DEPTH);

@@ -1,22 +1,22 @@
-//! 共享内存与进程（只在 Linux）：公开地址区与窗口映射 [`Region`]、[`PublicSpace`]、目录里的堆号登记 [`Registry`]、进程死活 [`Process`]。
+//! Shared memory and processes (Linux only): the public region and window mappings [`Region`], [`CrossHeapSpace`], heap-number registration in a directory [`Registry`], process liveness [`Process`].
 //!
-//! 公开地址区：每个进程保留一块同样大小、按自身大小对齐的地址，按堆号切成固定大小的窗口；公开堆 k 永远映射在第 k 个窗口。
+//! The public region: every process reserves an equally sized range of addresses aligned to its own size and cuts it into fixed-size windows by heap number; public heap k is always mapped at window k.
 //!
-//! 保留只占地址（`PROT_NONE` + `MAP_NORESERVE`），不占内存。Miri 跑不了文件映射，换成按同样对齐分配的一块零内存，
-//! 公开堆的逻辑照样能测（只是没有文件，不能跨进程）。
+//! Reserving takes only address space (`PROT_NONE` + `MAP_NORESERVE`), no memory. Miri cannot map files, so there it is a zeroed allocation with the same alignment;
+//! the public heap logic can still be tested (only without files, so not across processes).
 //!
-//! 跨进程要用的两样：认进程（进程号 + 启动时间，防进程号被复用后认错人）、共享内存上的 futex 等待 / 唤醒。
+//! Two things needed across processes: identifying a process (pid + start time, so a reused pid is not mistaken for the old one) and futex wait / wake on shared memory.
 //!
-//! 目录里的公开堆登记：堆号领取（`.paragc-<堆号>` 标记文件）与死活判断。
+//! Public heap registration in a directory: claiming heap numbers (`.paragc-<number>` marker files) and judging liveness.
 //!
-//! 公开堆跟着主人（建堆的进程）死：主人退出或被杀、又没有 persist，堆就死了。判断死活只读堆文件超级块开头的几个字段，
-//! 不用映射整个堆，所以回收方可以替一个自己没打开过的堆判死活；判定死了就把堆文件与标记删掉（文件内存等最后一个映射它的进程放手后还给系统）。
+//! A public heap dies with its owner (the creating process): when the owner exits or is killed without persist, the heap is dead. Liveness reads only a few fields at the start of the heap file's superblock,
+//! without mapping the whole heap, so a collector can judge a heap it never opened; once judged dead, the heap file and marker are deleted (the file's memory returns to the system when the last process mapping it lets go).
 //!
-//! 领号、判过期、删标记都在标记文件的 `flock` 里做（锁到之后核对路径还是这个文件，没被别人删掉重建）：
-//! 「看一眼再删」这种两步不会和别人的领号交错。进程被杀时内核替它放锁。
+//! Claiming numbers, judging staleness and deleting markers all happen under the marker file's `flock` (after locking, check that the path is still this file and was not deleted and recreated):
+//! two-step "look, then delete" sequences never interleave with someone else's claim. The kernel releases the lock when a process is killed.
 //!
-//! [`PublicSpace`]：本进程的公开地址区；在它上面建、打开公开堆。
-#![cfg(target_os = "linux")]
+//! [`CrossHeapSpace`]: this process's public region; public heaps are created and opened on it.
+#![cfg(crossheap)]
 use core::mem::offset_of;
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
@@ -29,29 +29,41 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::heap::{Backing, Inner, PublicHeap};
+use crate::heap::{Backing, Inner, CrossHeap};
 use crate::layout::{MAGIC, Super};
 
-/// 一个窗口的大小（一个公开堆的全部地址）
+/// Size of one window (all the addresses of one public heap)
 pub const WINDOW: usize = if cfg!(miri) { 16 << 20 } else { 16 << 30 };
-/// 窗口数（公开堆号的上限）
+/// Number of windows (the limit on public heap numbers)
 pub const WINDOWS: usize = if cfg!(miri) { 4 } else { 64 };
-/// 整个公开地址区；按它对齐，所以从区内任意地址抹低位就是区的起点
+/// The whole public region; aligned to its size, so masking the low bits of any address inside gives the region's start
 pub const REGION: usize = WINDOW * WINDOWS;
 
 const _: () = assert!(REGION.is_power_of_two() && WINDOW.is_power_of_two());
+
+/// The fixed-address public region sits here (the same in every process, so absolute addresses stored in objects are valid in every process): at 64 TiB, aligned to the region size,
+/// away from where executables, the heap and mmap usually go on x86-64 / AArch64 (48-bit virtual addresses)
+pub const FIXED_BASE: usize = 64 << 40;
+
+const _: () = assert!(FIXED_BASE.is_multiple_of(REGION));
 
 pub struct Region {
     base: NonNull<u8>,
 }
 
-// SAFETY: 只是一段地址；里面的内容由各个公开堆自己同步
+// SAFETY: just a range of addresses; its contents are synchronized by the public heaps themselves
 unsafe impl Send for Region {}
-// SAFETY: 同上
+// SAFETY: as above
 unsafe impl Sync for Region {}
 
 impl Region {
-    /// 区内地址 `p` 所在区的起点（抹掉低位）。
+    /// `addr` lies in the fixed-address public region ([`FIXED_BASE`]). There is no fixed region under Miri.
+    #[inline]
+    pub fn holds_fixed(addr: usize) -> bool {
+        !cfg!(miri) && addr & !(REGION - 1) == FIXED_BASE
+    }
+
+    /// The start of the region containing `p` (low bits masked off).
     pub fn base_of(p: usize) -> usize {
         p & !(REGION - 1)
     }
@@ -60,7 +72,7 @@ impl Region {
         self.base
     }
 
-    /// 第 `k` 个窗口的起点。
+    /// The start of window `k`.
     pub fn window(&self, k: usize) -> *mut u8 {
         self.base.as_ptr().wrapping_add(k * WINDOW)
     }
@@ -68,9 +80,9 @@ impl Region {
 
 #[cfg(not(miri))]
 impl Region {
-    /// 保留整个区：先多保留一倍找到对齐的起点，再把两头多出来的还掉。
+    /// Reserve the whole region: reserve twice as much to find an aligned start, then return the excess at both ends.
     pub fn reserve() -> io::Result<Self> {
-        // SAFETY: 匿名、不可访问的新映射，不碰已有内存
+        // SAFETY: a new anonymous inaccessible mapping that touches no existing memory
         let raw = unsafe { libc::mmap(core::ptr::null_mut(), 2 * REGION, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0) };
         if raw == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
@@ -78,54 +90,85 @@ impl Region {
         let raw = raw.cast::<u8>();
         let head = raw.align_offset(REGION);
         let base = raw.wrapping_add(head);
-        // SAFETY: 两段都在刚保留的映射里、不在保留下来的 [base, base + REGION) 里
+        // SAFETY: both pieces are inside the mapping just reserved and outside the kept [base, base + REGION)
         unsafe {
             if head > 0 {
                 libc::munmap(raw.cast(), head);
             }
             libc::munmap(base.wrapping_add(REGION).cast(), REGION - head);
         }
-        Ok(Self { base: NonNull::new(base).expect("mmap 不会返回空") })
+        Ok(Self { base: NonNull::new(base).expect("mmap never returns null") })
     }
 
-    /// 把文件映射到第 `k` 个窗口（整个窗口一次映射；文件比窗口短，只访问已经延长过的部分）。
-    /// SAFETY（调用方）：窗口 `k` 没被占用。
+    /// Reserve the whole region at [`FIXED_BASE`]; fails if something is already mapped there (or the address space is too small).
+    pub fn reserve_fixed() -> io::Result<Self> {
+        let want = core::ptr::without_provenance_mut::<libc::c_void>(FIXED_BASE);
+        // SAFETY: MAP_FIXED_NOREPLACE does not replace existing mappings
+        let raw = unsafe { libc::mmap(want, REGION, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_FIXED_NOREPLACE, -1, 0) };
+        if raw == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        if raw.addr() != FIXED_BASE {
+            // Old kernels ignore MAP_FIXED_NOREPLACE and treat the address as a hint: give it back
+            // SAFETY: just mapped
+            unsafe { libc::munmap(raw, REGION) };
+            return Err(io::Error::new(io::ErrorKind::AddrInUse, "the fixed-address public region is taken"));
+        }
+        Ok(Self { base: NonNull::new(raw.cast()).expect("mmap never returns null") })
+    }
+
+    /// Map a file at window `k` (the whole window at once; when the file is shorter only the extended part is accessed).
+    /// SAFETY (caller): window `k` is not in use.
     pub unsafe fn map_file(&self, k: usize, file: &File) -> io::Result<()> {
         use std::os::fd::AsRawFd;
         let at = self.window(k);
-        // SAFETY: 见上；MAP_FIXED 只覆盖本区保留的这一段
+        // SAFETY: see above; MAP_FIXED only replaces this region's own reserved range
         let p = unsafe { libc::mmap(at.cast(), WINDOW, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED | libc::MAP_FIXED, file.as_raw_fd(), 0) };
         if p == libc::MAP_FAILED { Err(io::Error::last_os_error()) } else { Ok(()) }
     }
 
-    /// 没有文件的公开堆：窗口换成共享的匿名内存（同一进程内可用）。SAFETY 同 [`Region::map_file`]。
+    /// A public heap without a file: the window becomes shared anonymous memory (usable within one process). SAFETY as for [`Region::map_file`].
     pub unsafe fn map_anonymous(&self, k: usize) -> io::Result<()> {
         let at = self.window(k);
-        // SAFETY: 同上
+        // SAFETY: as above
         let p = unsafe { libc::mmap(at.cast(), WINDOW, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_FIXED | libc::MAP_NORESERVE, -1, 0) };
         if p == libc::MAP_FAILED { Err(io::Error::last_os_error()) } else { Ok(()) }
     }
 
-    /// 窗口不用了：换回不可访问的保留（地址仍归本区）。SAFETY（调用方）：之后没人再访问这个窗口。
+    /// The window is no longer used: turn it back into an inaccessible reservation (the addresses still belong to the region). SAFETY (caller): nobody accesses the window afterwards.
     pub unsafe fn unmap(&self, k: usize) {
         let at = self.window(k);
-        // SAFETY: 见上
+        // SAFETY: see above
         unsafe { libc::mmap(at.cast(), WINDOW, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED | libc::MAP_NORESERVE, -1, 0) };
     }
 
-    /// 把文件延长到至少覆盖 `[offset, offset + len)`（只会变长；多个线程同时调也安全）。
+    /// Extend the file to cover at least `[offset, offset + len)` (it only grows; safe when several threads call at once).
     pub fn commit(file: &File, offset: usize, len: usize) -> io::Result<()> {
         use std::os::fd::AsRawFd;
-        let (offset, len) = (i64::try_from(offset).expect("窗口内偏移"), i64::try_from(len).expect("窗口内长度"));
-        // SAFETY: 只改文件长度与分配
+        let (offset, len) = (i64::try_from(offset).expect("offset within the window"), i64::try_from(len).expect("length within the window"));
+        // SAFETY: only changes the file's length and allocation
         if unsafe { libc::fallocate(file.as_raw_fd(), 0, offset, len) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    }
+
+    /// Punch a hole in the file over `[offset, offset + len)` (the length stays; it reads as zeros afterwards). Best effort: left alone on failure.
+    pub fn punch(file: &File, offset: usize, len: usize) {
+        use std::os::fd::AsRawFd;
+        let (Ok(offset), Ok(len)) = (i64::try_from(offset), i64::try_from(len)) else { return };
+        // SAFETY: only discards this part of the file's contents
+        unsafe { libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, offset, len) };
+    }
+
+    /// Give `[at, at + len)` of shared anonymous memory back to the system (it reads as zeros afterwards). Best effort.
+    pub fn remove(at: *mut u8, len: usize) {
+        // SAFETY: the caller passes a range within one of this region's windows that holds nothing still needed
+        unsafe { libc::madvise(at.cast(), len, libc::MADV_REMOVE) };
     }
 }
 
 #[cfg(not(miri))]
 impl Drop for Region {
     fn drop(&mut self) {
-        // SAFETY: 整个区归它，窗口里的堆都已析构（它们持有区的 Arc）
+        // SAFETY: the whole region belongs to it, and the heaps in its windows are all dropped (they hold the region's Arc)
         unsafe { libc::munmap(self.base.as_ptr().cast(), REGION) };
     }
 }
@@ -134,13 +177,17 @@ impl Drop for Region {
 impl Region {
     const LAYOUT: std::alloc::Layout = match std::alloc::Layout::from_size_align(REGION, REGION) {
         Ok(l) => l,
-        Err(_) => panic!("区的大小 / 对齐不合法"),
+        Err(_) => panic!("invalid region size / alignment"),
     };
 
     pub fn reserve() -> io::Result<Self> {
-        // SAFETY: 大小非零
+        // SAFETY: the size is non-zero
         let p = unsafe { std::alloc::alloc_zeroed(Self::LAYOUT) };
         Ok(Self { base: NonNull::new(p).unwrap_or_else(|| std::alloc::handle_alloc_error(Self::LAYOUT)) })
+    }
+
+    pub fn reserve_fixed() -> io::Result<Self> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 
     pub unsafe fn map_file(&self, _: usize, _: &File) -> io::Result<()> {
@@ -152,9 +199,13 @@ impl Region {
     }
 
     pub unsafe fn unmap(&self, k: usize) {
-        // SAFETY: 窗口在区内；之后没人再访问
+        // SAFETY: the window is inside the region; nobody accesses it afterwards
         unsafe { self.window(k).write_bytes(0, WINDOW) };
     }
+
+    pub fn punch(_: &File, _: usize, _: usize) {}
+
+    pub fn remove(_: *mut u8, _: usize) {}
 
     pub fn commit(_: &File, _: usize, _: usize) -> io::Result<()> {
         Ok(())
@@ -164,34 +215,34 @@ impl Region {
 #[cfg(miri)]
 impl Drop for Region {
     fn drop(&mut self) {
-        // SAFETY: 来自 reserve 的 alloc_zeroed
+        // SAFETY: from reserve's alloc_zeroed
         unsafe { std::alloc::dealloc(self.base.as_ptr(), Self::LAYOUT) };
     }
 }
 
-/// 一个进程：进程号 + 启动时间（开机以来的时钟滴答，`/proc/<pid>/stat` 第 22 个字段）。
+/// A process: pid + start time (clock ticks since boot, field 22 of `/proc/<pid>/stat`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Process {
     pub pid: u32,
     pub start: u64,
 }
 
-/// `/proc/<pid>/stat` 里右括号之后：第 3 个字段（状态）是第 0 个，第 22 个字段（启动时间）是第 19 个
+/// In `/proc/<pid>/stat` after the closing parenthesis: field 3 (state) is number 0 and field 22 (start time) is number 19
 const STATE_FIELD: usize = 0;
 const START_FIELD: usize = 19;
 
 impl Process {
-    /// 本进程。
+    /// This process.
     pub fn current() -> Self {
         let pid = std::process::id();
         Self { pid, start: Self::stat(pid).map_or(0, |(_, start)| start) }
     }
 
-    /// （状态字符, 启动时间）；进程不在了返回 None。Miri 下不读 /proc。
+    /// (state character, start time); None if the process is gone. Does not read /proc under Miri.
     #[cfg(not(miri))]
     fn stat(pid: u32) -> Option<(char, u64)> {
         let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        // 进程名在括号里、可能含空格，从最后一个右括号之后数
+        // The process name is in parentheses and may contain spaces, so count from after the last closing parenthesis
         let rest = &text[text.rfind(')')? + 1..];
         let fields: Vec<&str> = rest.split_whitespace().collect();
         Some((fields.get(STATE_FIELD)?.chars().next()?, fields.get(START_FIELD)?.parse().ok()?))
@@ -202,7 +253,7 @@ impl Process {
         None
     }
 
-    /// 还活着：/proc 里有它、不是僵尸、启动时间对得上。启动时间记成 0（还在登记，或读不到 /proc）时一律当活着。
+    /// Still alive: present in /proc, not a zombie, and the start time matches. A recorded start time of 0 (still registering, or /proc unreadable) always counts as alive.
     pub fn alive(self) -> bool {
         if self.start == 0 || cfg!(miri) {
             return true;
@@ -211,22 +262,22 @@ impl Process {
     }
 }
 
-/// 标记文件名的前缀：`.paragc-<堆号>`，内容是「建堆进程号 启动时间」一行 + 堆文件名（空 = 号空着）
+/// Marker file name prefix: `.paragc-<number>`; the content is one line "creator pid start time" + the heap file name (empty = the number is free)
 const MARKER_PREFIX: &str = ".paragc-";
 
-/// 一个堆还在不在。
+/// Whether a heap is still there.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Liveness {
     Alive,
-    /// 死了（主人不在了、没有 persist），文件与标记已经删掉
+    /// Dead (owner gone, no persist); file and marker already deleted
     Dead,
-    /// 要找的那个堆（按身份）已经不在了：这个号现在是别的堆的，或空着
+    /// The heap looked for (by identity) is gone: the number now belongs to another heap, or is free
     Gone,
-    /// 判断不了（读文件出错等）：当它还活着
+    /// Cannot tell (error reading files and so on): treat it as alive
     Unknown,
 }
 
-/// 从堆文件里读出来的超级块开头几个字段。
+/// A few fields from the start of a heap file's superblock.
 pub struct FileHeader {
     pub heap: usize,
     pub incarnation: u64,
@@ -236,16 +287,16 @@ pub struct FileHeader {
 }
 
 impl FileHeader {
-    /// 读堆文件的超级块；不是 paragc 公开堆（魔数、窗口大小、堆号不对）时报错。
+    /// Read a heap file's superblock; an error when it is not a paragc public heap (magic, window size or heap number wrong).
     pub fn read(file: &File) -> io::Result<Self> {
         let mut buf = [0u8; size_of::<Super>()];
         file.read_exact_at(&mut buf, 0)?;
-        let u64_at = |o: usize| u64::from_le_bytes(buf[o..o + size_of::<u64>()].try_into().expect("8 字节"));
-        let u32_at = |o: usize| u32::from_le_bytes(buf[o..o + size_of::<u32>()].try_into().expect("4 字节"));
+        let u64_at = |o: usize| u64::from_le_bytes(buf[o..o + size_of::<u64>()].try_into().expect("8 bytes"));
+        let u32_at = |o: usize| u32::from_le_bytes(buf[o..o + size_of::<u32>()].try_into().expect("4 bytes"));
         if u64_at(offset_of!(Super, magic)) != MAGIC || u64_at(offset_of!(Super, window)) != WINDOW as u64 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "不是 paragc 公开堆，或布局版本不同"));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "not a paragc public heap, or a different layout version"));
         }
-        let heap = usize::try_from(u64_at(offset_of!(Super, heap))).ok().filter(|&k| k < WINDOWS).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "堆号超出窗口数"))?;
+        let heap = usize::try_from(u64_at(offset_of!(Super, heap))).ok().filter(|&k| k < WINDOWS).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "heap number beyond the window count"))?;
         Ok(Self {
             heap,
             incarnation: u64_at(offset_of!(Super, incarnation)),
@@ -255,13 +306,13 @@ impl FileHeader {
         })
     }
 
-    /// 这个堆死了：标过死，或主人不在了又没有 persist。
+    /// This heap is dead: marked dead, or the owner is gone without persist.
     pub fn is_dead(&self) -> bool {
         self.dead || (!self.persist && !self.owner.alive())
     }
 }
 
-/// 标记文件的内容。
+/// Contents of a marker file.
 struct Marker {
     creator: Option<Process>,
     name: Vec<u8>,
@@ -279,13 +330,13 @@ impl Marker {
     }
 }
 
-/// 一个目录里的公开堆登记。
+/// Public heap registration in one directory.
 pub struct Registry<'d> {
     dir: &'d Path,
 }
 
 impl<'d> Registry<'d> {
-    /// 堆文件 `path` 所在目录的登记。
+    /// Registration of the directory containing heap file `path`.
     pub fn of(path: &'d Path) -> Self {
         Self { dir: path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new(".")) }
     }
@@ -298,14 +349,14 @@ impl<'d> Registry<'d> {
         self.dir.join(format!("{MARKER_PREFIX}{k}"))
     }
 
-    /// 打开并锁住堆号 `k` 的标记（`create`：没有就建一个空的；否则没有时返回 NotFound）；锁到之后路径必须还是这个文件，
-    /// 否则（被别人删了）重来。锁随文件关闭放开。
+    /// Open and lock the marker of heap number `k` (`create`: make an empty one if missing; otherwise NotFound when missing); after locking the path must still be this file,
+    /// otherwise (someone deleted it) start over. The lock is released when the file is closed.
     fn lock(&self, k: usize, create: bool) -> io::Result<File> {
         use std::os::fd::AsRawFd;
         let path = self.marker(k);
         loop {
             let f = OpenOptions::new().read(true).write(true).create(create).truncate(false).mode(0o600).open(&path)?;
-            // SAFETY: fd 有效；flock 只作用于这个打开的文件
+            // SAFETY: the fd is valid; flock affects only this open file
             if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -318,7 +369,7 @@ impl<'d> Registry<'d> {
         }
     }
 
-    /// 在锁里读标记内容。
+    /// Read the marker contents under the lock.
     fn read_locked(f: &mut File) -> io::Result<Vec<u8>> {
         let mut text = Vec::new();
         f.rewind()?;
@@ -326,7 +377,7 @@ impl<'d> Registry<'d> {
         Ok(text)
     }
 
-    /// 领堆号 `k`（记下本进程与堆文件名 `name`）；号被一个还活着（或正在建）的堆占着时返回 Ok(false)。过期的标记在锁里收回。
+    /// Claim heap number `k` (recording this process and heap file name `name`); Ok(false) when the number is held by a heap that is alive (or being created). Stale markers are reclaimed under the lock.
     pub fn claim(&self, k: usize, name: &OsStr) -> io::Result<bool> {
         let mut f = self.lock(k, true)?;
         let text = Self::read_locked(&mut f)?;
@@ -343,10 +394,10 @@ impl<'d> Registry<'d> {
         Ok(true)
     }
 
-    /// 按标记内容判堆号 `k` 上的堆（不删任何东西）。`expect`：要找的身份。
+    /// Judge the heap on number `k` from its marker contents (deleting nothing). `expect`: the identity looked for.
     ///
-    /// 建堆是几步做完的（领号、建文件、延长文件、写超级块），别的进程随时可能读到中间状态：只要建堆进程还活着，
-    /// 读到的任何不完整（文件还没有、超级块还是零或只看到一半）都当它正在建。
+    /// Creating a heap takes several steps (claim the number, create the file, extend it, write the superblock), and other processes may read any intermediate state: as long as the creating process lives,
+    /// anything incomplete (no file yet, a superblock that is still zero or half written) counts as being created.
     fn judge(&self, k: usize, marker: &Marker, expect: Option<u64>) -> Liveness {
         let gone = if expect.is_some() { Liveness::Gone } else { Liveness::Dead };
         let creator_alive = marker.creator.is_some_and(Process::alive);
@@ -378,16 +429,16 @@ impl<'d> Registry<'d> {
         }
     }
 
-    /// 堆号 `k` 的堆还在不在。`expect`：要找的是哪个身份的堆（None = 这个号上的随便哪个）。判定死了时删掉它的堆文件与标记。
+    /// Whether the heap on number `k` is still there. `expect`: which identity is looked for (None = whatever heap holds the number). Deletes the heap file and marker when it is judged dead.
     pub fn liveness(&self, k: usize, expect: Option<u64>) -> Liveness {
         let text = match std::fs::read(self.marker(k)) {
             Ok(t) => t,
-            // 标记没了：这个号上没有堆（死了、删掉了）
+            // The marker is gone: no heap on this number (it died and was deleted)
             Err(e) if e.kind() == io::ErrorKind::NotFound => return if expect.is_some() { Liveness::Gone } else { Liveness::Dead },
             Err(_) => return Liveness::Unknown,
         };
         let Some(marker) = Marker::parse(&text) else {
-            // 空标记（号空着）或正在写
+            // An empty marker (the number is free) or one being written
             return if text.is_empty() && expect.is_some() { Liveness::Gone } else { Liveness::Unknown };
         };
         let verdict = self.judge(k, &marker, expect);
@@ -400,8 +451,8 @@ impl<'d> Registry<'d> {
         verdict
     }
 
-    /// 删掉堆号 `k`、身份 `incarnation` 的堆的文件与标记：在标记的锁里核对标记还指着这个文件、文件还是这个身份才删
-    /// （这期间号可能已经被别人重用）。
+    /// Delete the file and marker of the heap with number `k` and identity `incarnation`: under the marker's lock, check that the marker still points at this file and the file still has this identity before deleting
+    /// (the number may have been reused meanwhile).
     pub fn bury(&self, path: &Path, k: usize, incarnation: u64) {
         let Ok(mut f) = self.lock(k, false) else { return };
         let Ok(text) = Self::read_locked(&mut f) else { return };
@@ -413,7 +464,7 @@ impl<'d> Registry<'d> {
         }
     }
 
-    /// 建堆失败：还掉刚领的号（标记还是本进程为 `name` 领的才删）。
+    /// Creating a heap failed: give back the number just claimed (the marker is deleted only if this process claimed it for `name`).
     pub fn abandon(&self, k: usize, name: &OsStr) {
         let Ok(mut f) = self.lock(k, false) else { return };
         let Ok(text) = Self::read_locked(&mut f) else { return };
@@ -423,13 +474,15 @@ impl<'d> Registry<'d> {
     }
 }
 
-const _: () = assert!(WINDOWS <= u64::BITS as usize, "窗口占用位图是一个 u64");
+const _: () = assert!(WINDOWS <= u64::BITS as usize, "the window bitmap is one u64");
 
 
 
 pub struct Space {
     region: Region,
-    /// 窗口占用位图
+    /// The region sits at [`FIXED_BASE`]
+    fixed: bool,
+    /// Bitmap of windows in use
     used: AtomicU64,
 }
 
@@ -438,12 +491,16 @@ impl Space {
         &self.region
     }
 
-    /// 占第 `k` 个窗口；已经被占返回 false。
+    pub fn is_fixed(&self) -> bool {
+        self.fixed
+    }
+
+    /// Take window `k`; false if it is already taken.
     fn claim(&self, k: usize) -> bool {
         self.used.fetch_or(1 << k, Ordering::AcqRel) & (1 << k) == 0
     }
 
-    /// 占一个空窗口。
+    /// Take a free window.
     fn claim_any(&self) -> Option<usize> {
         (0..WINDOWS).find(|&k| self.claim(k))
     }
@@ -453,23 +510,30 @@ impl Space {
     }
 }
 
-/// 本进程的公开地址区：保留一块地址（不占内存），按堆号切成窗口；公开堆 k 映射在第 k 个窗口，
-/// 所以公开堆里存的偏移在每个进程里都指向同一个对象。一个进程通常只要一个。
+/// This process's public region: a reserved range of addresses (no memory) cut into windows by heap number; public heap k is mapped at window k,
+/// so offsets stored in a public heap point at the same object in every process. A process usually needs one.
 #[derive(Clone)]
-pub struct PublicSpace(Arc<Space>);
+pub struct CrossHeapSpace(Arc<Space>);
 
-impl PublicSpace {
+impl CrossHeapSpace {
     pub fn reserve() -> io::Result<Self> {
-        Ok(Self(Arc::new(Space { region: Region::reserve()?, used: AtomicU64::new(0) })))
+        Ok(Self(Arc::new(Space { region: Region::reserve()?, fixed: false, used: AtomicU64::new(0) })))
     }
 
-    /// 在 `path`（共享内存文件系统上的新文件，比如 `/dev/shm/…` 或自己挂的 tmpfs / hugetlbfs）建一个公开堆。
-    /// 文件刚建时是空的，用到哪里延长到哪里；权限 0600，有文件权限的进程才能打开。
+    /// Reserve the public region at the fixed address ([`FIXED_BASE`], the same in every process): objects may store absolute addresses ([`crate::Gc`], [`crate::Slot`],
+    /// [`crate::WordSlot`]) and other processes read them correctly. A private heap that promotes young objects into a public heap ([`crate::Heap::attach_cross_heap`]) needs such a region;
+    /// a process can have only one. Fails if the address is taken.
+    pub fn reserve_fixed() -> io::Result<Self> {
+        Ok(Self(Arc::new(Space { region: Region::reserve_fixed()?, fixed: true, used: AtomicU64::new(0) })))
+    }
+
+    /// Create a public heap at `path` (a new file on a shared-memory file system, such as `/dev/shm/…` or your own tmpfs / hugetlbfs mount).
+    /// The file starts empty and is extended as it is used; mode 0600, so only processes with permission on the file can open it.
     ///
-    /// 堆号在同一个目录里跨进程唯一：在 `.paragc-<堆号>` 标记文件的锁里领号（标记指着的堆已经死了时收回重用）。
-    /// 本进程是这个堆的主人：这个句柄（连同它建出的 [`crate::Public`]）全部析构、或本进程退出 / 被杀，堆就跟着死，
-    /// 除非调过 [`PublicHeap::persist`]。
-    pub fn create(&self, path: impl AsRef<Path>, threads: NonZeroUsize) -> io::Result<PublicHeap> {
+    /// Heap numbers are unique across processes within a directory: they are claimed under the lock of a `.paragc-<number>` marker file (reclaimed when the heap it names is dead).
+    /// This process owns the heap: when this handle (and every [`crate::CrossHeapRoot`] made from it) is dropped, or this process exits / is killed, the heap dies,
+    /// unless [`CrossHeap::persist`] was called.
+    pub fn create(&self, path: impl AsRef<Path>, threads: NonZeroUsize) -> io::Result<CrossHeap> {
         use std::os::unix::fs::OpenOptionsExt;
         let path = path.as_ref();
         let k = self.claim_number(path)?;
@@ -486,17 +550,17 @@ impl PublicSpace {
                 return Err(e);
             }
         };
-        let backing = Backing::File { file, path: path.to_path_buf(), owner: true };
+        let backing = Backing::File { file, path: Some(path.to_path_buf()), owner: true };
         self.attach(k, backing, threads, true).inspect_err(|_| {
             let _ = std::fs::remove_file(path);
             abandon();
         })
     }
 
-    /// 领一个堆号：本地址区的窗口空着，并且在堆文件所在目录领得到 `.paragc-<堆号>`。
+    /// Claim a heap number: the window in this region is free and `.paragc-<number>` can be claimed in the heap file's directory.
     fn claim_number(&self, path: &Path) -> io::Result<usize> {
         let registry = Registry::of(path);
-        let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "堆文件路径没有文件名"))?;
+        let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "the heap file path has no file name"))?;
         for k in 0..WINDOWS {
             if !self.0.claim(k) {
                 continue;
@@ -510,34 +574,45 @@ impl PublicSpace {
                 }
             }
         }
-        Err(io::Error::new(io::ErrorKind::OutOfMemory, "公开堆号用完了（这个目录里的标记或本地址区的窗口）"))
+        Err(io::Error::new(io::ErrorKind::OutOfMemory, "out of public heap numbers (markers in this directory or windows in this region)"))
     }
 
-    /// 没有文件的公开堆（只在本进程里用；测试与 Miri 用它）。
-    pub fn create_anonymous(&self, threads: NonZeroUsize) -> io::Result<PublicHeap> {
-        let k = self.0.claim_any().ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "公开地址区的窗口用完了"))?;
+    /// A public heap without a file (used only within this process; for tests and Miri).
+    pub fn create_anonymous(&self, threads: NonZeroUsize) -> io::Result<CrossHeap> {
+        let k = self.0.claim_any().ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "out of windows in the public region"))?;
         self.attach(k, Backing::Anonymous, threads, true)
     }
 
-    /// 打开别人（或本进程另一个地址区）建的公开堆，映射到它的堆号对应的窗口。
-    pub fn open(&self, path: impl AsRef<Path>, threads: NonZeroUsize) -> io::Result<PublicHeap> {
+    /// Open a public heap created by someone else (or by another region of this process), mapped at the window of its heap number.
+    pub fn open(&self, path: impl AsRef<Path>, threads: NonZeroUsize) -> io::Result<CrossHeap> {
         let path = path.as_ref();
         let file = OpenOptions::new().read(true).write(true).open(path)?;
+        self.open_file(file, Some(path), threads)
+    }
+
+    /// Open a public heap from a file descriptor (a [`CrossHeap::fd`] passed by another process through `SCM_RIGHTS`), without access to the heap file's path.
+    pub fn open_fd(&self, fd: std::os::fd::OwnedFd, threads: NonZeroUsize) -> io::Result<CrossHeap> {
+        self.open_file(File::from(fd), None, threads)
+    }
+
+    fn open_file(&self, file: File, path: Option<&Path>, threads: NonZeroUsize) -> io::Result<CrossHeap> {
         let header = FileHeader::read(&file)?;
         if header.is_dead() {
-            Registry::of(path).bury(path, header.heap, header.incarnation);
-            return Err(io::Error::new(io::ErrorKind::NotFound, "这个公开堆已经死了（主人不在了）"));
+            if let Some(path) = path {
+                Registry::of(path).bury(path, header.heap, header.incarnation);
+            }
+            return Err(io::Error::new(io::ErrorKind::NotFound, "this public heap is dead (its owner is gone)"));
         }
         let k = header.heap;
         if !self.0.claim(k) {
-            return Err(io::Error::new(io::ErrorKind::AddrInUse, "这个公开堆的窗口在本地址区已被占用"));
+            return Err(io::Error::new(io::ErrorKind::AddrInUse, "this public heap's window is already taken in this region"));
         }
-        self.attach(k, Backing::File { file, path: path.to_path_buf(), owner: false }, threads, false)
+        self.attach(k, Backing::File { file, path: path.map(Path::to_path_buf), owner: false }, threads, false)
     }
 
-    /// 把窗口 `k` 映射上 `backing`，`fresh` 时写新的超级块。失败时还掉窗口。
-    fn attach(&self, k: usize, backing: Backing, threads: NonZeroUsize, fresh: bool) -> io::Result<PublicHeap> {
-        // SAFETY: 窗口 k 刚被占下，没人用
+    /// Map `backing` at window `k`, writing a new superblock when `fresh`. Gives the window back on failure.
+    fn attach(&self, k: usize, backing: Backing, threads: NonZeroUsize, fresh: bool) -> io::Result<CrossHeap> {
+        // SAFETY: window k was just taken and is unused
         let mapped = unsafe {
             match &backing {
                 Backing::File { file, .. } => self.0.region.map_file(k, file),
@@ -548,6 +623,6 @@ impl PublicSpace {
             self.0.release(k);
             return Err(e);
         }
-        Inner::new(self.0.clone(), k, backing, threads, fresh).map(PublicHeap::from)
+        Inner::new(self.0.clone(), k, backing, threads, fresh).map(CrossHeap::from)
     }
 }

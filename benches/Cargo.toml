@@ -1,5 +1,5 @@
-# paragc 与 cppgc（V8 Oilpan）/ gc-arena / gc（rust-gc）/ dumpster 的对比基准。
-# V8 的预编译库很大，所以自成 workspace，不进 paragc 的构建。跑法见 run.sh。
+# Comparison benchmarks of paragc against cppgc (V8 Oilpan) / gc-arena / gc (rust-gc) / dumpster.
+# V8's prebuilt library is large, so this is a workspace of its own outside paragc's build. See run.sh for how to run them.
 [workspace]
 members = ["common", "paragc", "paragc-public", "cppgc", "gc-arena", "rust-gc", "dumpster"]
 resolver = "3"
