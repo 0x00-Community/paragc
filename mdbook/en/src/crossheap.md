@@ -21,7 +21,7 @@ that cfg.
 
 | From → to | private heap | cross-heap |
 | --- | --- | --- |
-| private heap | ✓ direct pointer (`Far` between heaps) | ✓ `CrossHeapRoot`, or an absolute address once promoted |
+| private heap | ✓ direct pointer (`Far` between heaps) | ✓ `CrossHeapGlobal`, or an absolute address once promoted |
 | cross-heap | ✗ (other processes cannot see private memory) | ✓ `CrossHeapSlot`, `CrossHeapRef`, `CrossHeapWeak` |
 
 Because nothing in a cross-heap points into a private heap, private and cross-heaps never form cycles.

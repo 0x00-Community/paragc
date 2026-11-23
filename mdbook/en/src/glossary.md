@@ -6,11 +6,12 @@
 | line | 256 B unit of reuse inside a block |
 | granule | 8 B, the allocation alignment |
 | epoch | the number a collection writes into mark words and line marks; never cleared |
-| mutate | `Heap::mutate`, a call during which the thread may allocate and use `Gc` handles |
-| brand | the `'gc` lifetime tying a `Gc` to one `mutate`; also the `brand!` type mapping it back |
-| root | `Root<B>`, a handle with no lifetime that keeps its object alive |
+| scope | `Heap::scope`, a call during which the thread may allocate and use `ScopeLocal` handles |
+| brand | `'heap` (or `'xheap`), the lifetime that ties everything of one heap together; also the `brand!` type mapping `'heap` and `'scope` back onto a stored type |
+| scope | a stretch of work on a heap; scopes nest, and an exclusive one may collect ([Scopes and lifetimes](scopes.md)) |
+| root | `ScopeGlobal<'heap, 'heap, B>`, a handle with no lifetime that keeps its object alive |
 | entry | a root-table slot claimed for a reference from outside the heap (`Far`, cross-heap entries) |
-| handle | `Handle<'gc, T>`, a reference to an entry of the handle table; moving the object rewrites the entry, never the handle |
+| handle | `Handle<'heap, 'scope, T>`, a reference to an entry of the handle table; moving the object rewrites the entry, never the handle |
 | tlab | thread-local allocation buffer |
 | overflow cursor | second allocation cursor for medium objects that do not fit the current run |
 | black allocation | giving new objects the marking epoch during concurrent marking |

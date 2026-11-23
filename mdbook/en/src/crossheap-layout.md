@@ -14,7 +14,7 @@ every process, even across heaps. The base is found from any address in the regi
 ### The fixed region
 
 `CrossHeapSpace::reserve_fixed` reserves the region at `FIXED_BASE` = 64 TiB with `MAP_FIXED_NOREPLACE`. Every process
-that does so maps heap *k* at the same absolute address, so plain absolute pointers (`Gc`, `Slot`) inside cross-heap
+that does so maps heap *k* at the same absolute address, so plain absolute pointers (`ScopeLocal`, `Slot`) inside cross-heap
 objects are valid everywhere. Promotion depends on this (see [Promotion](promotion.md)). A process can hold the fixed
 region only once at a time.
 
@@ -41,7 +41,7 @@ mailbox head, the mail count, the `owner_only` flag, and how far each part has b
   processes can race on it safely.
 - On tmpfs, `fallocate` takes memory right away, so memory is used up to the file length. The rest of the window costs
   nothing.
-- A process entering `mutate` compares its mapped length with the superblock and maps more when needed: one
+- A process entering `scope` compares its mapped length with the superblock and maps more when needed: one
   comparison, no system call in the common case.
 
 ## Giving memory back

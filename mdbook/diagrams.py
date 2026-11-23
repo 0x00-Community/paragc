@@ -86,10 +86,10 @@ T = {
         bits_title='Bit layouts',
         bits_intro='Every word paragc and j8 put in memory, drawn to scale where it helps. Widths are proportional to bits or bytes; single-bit flags are drawn wider so their labels fit.',
         obj_h='A private object',
-        obj_p='An object is a 24-byte header, the data, and an optional tail, rounded up to 8 bytes: `(HEADER + size_of::<T>() + tail).next_multiple_of(8)`. A `Gc` points at the data, not at the header.',
+        obj_p='An object is a 24-byte header, the data, and an optional tail, rounded up to 8 bytes: `(HEADER + size_of::<T>() + tail).next_multiple_of(8)`. A `ScopeLocal` points at the data, not at the header.',
         obj_cap='Memory of one private object',
         data='data <code>T</code>', tail='tail', tailsub='plain bytes, optional',
-        gc_here='<code>Gc</code> points here ↑ at offset 24',
+        gc_here='<code>ScopeLocal</code> points here ↑ at offset 24',
         mark_cap='<code>mark</code> · u32 · bit 31 on the left',
         fwd='moved', busy='being copied', epoch='epoch of the last mark', epochn='0 = young',
         mark_note='FORWARDED and BUSY exist only during a collection that moves objects. The epoch never reaches them: MAX_EPOCH = 2³⁰ − 1.',
@@ -111,7 +111,7 @@ T = {
         gran_p='A line is 32 granules of 8 bytes. The **start bitmap** has one bit per granule, set at the first granule of each object; sweeping and cross-heap lookups walk it. 512 bytes of line marks plus 512 bytes of start bits per block.',
         gran_cap='One 256-byte line: objects A, B, C (6, 3 and 12 granules) and two holes', hole='hole', startbits='start bitmap: one bit per granule, set where an object begins',
         slot_h='Slots and words',
-        slot_cap='<code>Slot&lt;\'gc, T&gt;</code> · two words', slot_v='value', slot_vs='current pointer', slot_c='last counted', slot_cs='for reference counting',
+        slot_cap='<code>Slot&lt;\'scope, T&gt;</code> · two words', slot_v='value', slot_vs='current pointer', slot_c='last counted', slot_cs='for reference counting',
         word_cap='a <code>WordSlot</code> value word', word_tag='tag', word_tags='≥ 0xFFF8: a pointer', word_addr='data address', word_addrs='low 48 bits',
         word_note='Words below `0xFFF8 << 48` are plain data. The tag of a pointer word is kept as is when the object moves.',
         val_h="j8's JS values",
@@ -133,17 +133,17 @@ T = {
         str_note='A non-ASCII string continues the tail with padding to 2 and its UTF-16 code units.',
         # moving chapter
         mv_title='Why object addresses change',
-        mv_intro='From the outside, the first surprise with paragc is that the same object can have a different address in the next `mutate`. This chapter explains it from the user\'s side: what you see, when it happens, why paragc does it, and what you can and cannot keep across a collection.',
+        mv_intro='From the outside, the first surprise with paragc is that the same object can have a different address after a collection. This chapter explains it from the user\'s side: what you see, when it happens, why paragc does it, and what you can and cannot keep across a collection.',
         mv_see_h='What you see',
         mv_code='''```rust
-let root = heap.mutate(|m| m.root(m.alloc(Node { value: 1, next: None })));
-let before = heap.mutate(|m| m.get(&root).as_ptr() as usize);
+let root = heap.scope(|m| m.global(m.alloc(Node { value: 1, next: None })));
+let before = heap.scope(|m| m.scope_in(&root).as_ptr() as usize);
 heap.collect_young();
-let after = heap.mutate(|m| m.get(&root).as_ptr() as usize);
+let after = heap.scope(|m| m.scope_in(&root).as_ptr() as usize);
 assert_ne!(before, after);            // usually true: the survivor was copied
-assert_eq!(heap.mutate(|m| m.get(&root).value), 1);   // the object is the same
+assert_eq!(heap.scope(|m| m.scope_in(&root).value), 1);   // the object is the same
 ```''',
-        mv_see_p='The `Root` still finds the object and the value is unchanged. Only the address moved.',
+        mv_see_p='The `ScopeGlobal` still finds the object and the value is unchanged. Only the address moved.',
         mv_life_h='The life of one object',
         mv_life_cap='One object, four addresses',
         s1='Allocated', s1t='young, in a block the thread bump-allocates into; mark = 0',
@@ -157,7 +157,7 @@ assert_eq!(heap.mutate(|m| m.get(&root).value), 1);   // the object is the same
 | stop-the-world full collection | live objects in sparse blocks (under half live) | always on |
 | young collection with a cross-heap attached | shareable survivors, into the cross-heap | `alloc_shared` types only |
 
-Never moved: anything during `mutate`; anything during concurrent marking or group collections; large objects (over 16 KiB); targets of `Far`; objects already in a cross-heap.''',
+Never moved: anything inside a scope that does not collect; anything during concurrent marking or group collections; large objects (over 16 KiB); targets of `Far`; objects already in a cross-heap.''',
         mv_why_h='Why move at all',
         mv_why='''Moving costs a copy, so paragc only does it when it buys something you notice:
 
@@ -169,28 +169,28 @@ Never moved: anything during `mutate`; anything during concurrent marking or gro
         mv_fix_p='The collector leaves a forwarding address in the old copy and rewrites every reference it knows about:',
         fw_cap='The old copy after a move',
         fw_mark='FORWARDED set', fw_drop='new address', fw_rest='old data, never read again',
-        mv_fix_list='''- **`Gc` handles** cannot exist during a move: they never leave `mutate`, and a moving collection takes `&mut Heap`.
-- **Edges inside objects** (`Gc`, `Slot`, `WordSlot` fields) are rewritten through `Trace::relocate`, which `#[derive(Trace)]` generates.
+        mv_fix_list='''- **`ScopeLocal` handles** cannot exist during a move: they are borrows of their scope, and a moving collection takes `&mut` the heap or the scope.
+- **Edges inside objects** (`ScopeLocal`, `Slot`, `WordSlot` fields) are rewritten through `Trace::relocate`, which `#[derive(Trace)]` generates.
 - **Roots, weak references and `Far` entries** live in tables the collector owns, and are rewritten there.
 - **Remembered slots** of old objects are rewritten in `Full` mode; in `SkipRemembered` mode their targets simply do not move.''',
         mv_keep_h='What you can keep across a collection',
         mv_keep_tbl='''| Keep | Why it stays valid |
 | --- | --- |
-| `Root<B>`, `Weak<B>` | the collector rewrites their table slots |
+| `ScopeGlobal<'heap, 'heap, B>`, `Weak<B>` | the collector rewrites their table slots |
 | fields of heap objects | rewritten by `Trace::relocate` |
 | the tag bits of a `WordSlot` word | only the low 48 bits change |
-| `CrossHeapSlot`, `CrossHeapRoot::index`, `CrossHeapWeak`, `Signature` | they name cross-heap objects, which never move |
+| `CrossHeapSlot`, `CrossHeapGlobal::index`, `CrossHeapWeak`, `Signature` | they name cross-heap objects, which never move |
 | values copied out of the object | they are yours |''',
         mv_break_h='What breaks, and what to do instead',
         mv_break_tbl='''| Pattern | Why it breaks | Instead |
 | --- | --- | --- |
-| `as_ptr()` saved in a Rust struct, used in a later `mutate` | the object may have moved; the old address may now hold another object | keep a `Root` (or `Weak`) and call `m.get` |
+| `as_ptr()` saved in a Rust struct, used after a collection | the object may have moved; the old address may now hold another object | keep a `ScopeGlobal` (or `Weak`) and call `s.scope_in` |
 | a hash map keyed by address | the key is stale after a move | hash the content or a stable id; if it must be the address, rehash in `relocate` (below) |
-| comparing addresses from two different `mutate`s | the same object can have two addresses | compare inside one `mutate`, or compare a stable id |
-| handing an address to C, the OS or another thread that outlives `mutate` | nobody rewrites it | copy the bytes out; a pinned space is planned (principle 1: it will still be collected) |
+| comparing addresses from before and after a collection | the same object can have two addresses | compare between collections, or compare a stable id (a handle) |
+| handing an address to C, the OS or another thread that outlives the scope | nobody rewrites it | copy the bytes out; a pinned space is planned (principle 1: it will still be collected) |
 | addresses baked into generated code | the code is not an edge the collector knows | refer to the target through a handle and bake its id (j8's shapes), or make the code a traced object |''',
         mv_j8_h='In j8',
-        mv_j8='''- **`===` on objects** compares the NaN-boxed words. Both operands are read in the same turn, inside one `mutate`, so they agree.
+        mv_j8='''- **`===` on objects** compares the NaN-boxed words. Both operands are read in the same turn, inside one `scope`, so they agree.
 - **`Map` and `Set`** index objects by address (`MapKey::Ref`). `Collection::relocate` recomputes the key of every object entry after a move and re-inserts it. That is the "rehash in relocate" pattern above.
 - **Shapes** are compared in inline caches and baked into JIT code. They are GC objects referenced through [handles](handles.md): moving a shape rewrites only its handle entry, so the id that caches and machine code compare never changes.
 - **Strings** move freely: nothing outside the heap keeps their address, and their bytes travel in the tail.''',
@@ -201,10 +201,10 @@ T['zh-CN'] = dict(
     bits_title='比特布局',
     bits_intro='paragc 和 j8 放进内存的每个字，必要处按比例画出。宽度和位数或字节数成比例；单个位的标志画宽一些，好放得下标签。',
     obj_h='私有对象',
-    obj_p='一个对象由 24 字节的头、数据和可选的尾巴组成，向上取整到 8 字节：`(HEADER + size_of::<T>() + tail).next_multiple_of(8)`。`Gc` 指向数据，不指向头。',
+    obj_p='一个对象由 24 字节的头、数据和可选的尾巴组成，向上取整到 8 字节：`(HEADER + size_of::<T>() + tail).next_multiple_of(8)`。`ScopeLocal` 指向数据，不指向头。',
     obj_cap='一个私有对象的内存',
     data='数据 <code>T</code>', tail='尾巴', tailsub='纯字节，可选',
-    gc_here='<code>Gc</code> 指在这里 ↑ 偏移 24',
+    gc_here='<code>ScopeLocal</code> 指在这里 ↑ 偏移 24',
     mark_cap='<code>mark</code> · u32 · 第 31 位在最左',
     fwd='已搬走', busy='正在复制', epoch='最后一次标记的纪元', epochn='0 = 年轻',
     mark_note='FORWARDED 和 BUSY 只在会搬对象的回收期间出现。纪元永远到不了它们：MAX_EPOCH = 2³⁰ − 1。',
@@ -226,7 +226,7 @@ T['zh-CN'] = dict(
     gran_p='一行是 32 个 8 字节的粒。**起点位图**每个粒一位，在每个对象的第一个粒置位；清扫和跨堆查找都靠走它。每个块的行标记 512 字节，起点位也是 512 字节。',
     gran_cap='一行 256 字节：对象 A、B、C（6、3、12 个粒）和两个空洞', hole='空洞', startbits='起点位图：每个粒一位，对象开始的地方置 1',
     slot_h='槽与字',
-    slot_cap='<code>Slot&lt;\'gc, T&gt;</code> · 两个字', slot_v='值', slot_vs='当前指针', slot_c='上次计数的值', slot_cs='引用计数用',
+    slot_cap='<code>Slot&lt;\'scope, T&gt;</code> · 两个字', slot_v='值', slot_vs='当前指针', slot_c='上次计数的值', slot_cs='引用计数用',
     word_cap='<code>WordSlot</code> 的值字', word_tag='标签', word_tags='≥ 0xFFF8 即指针', word_addr='数据地址', word_addrs='低 48 位',
     word_note='小于 `0xFFF8 << 48` 的字是普通数据。对象搬动时，指针字的标签原样保留。',
     val_h='j8 的 JS 值',
@@ -247,17 +247,17 @@ T['zh-CN'] = dict(
     hdr='头', buf_s='空，或视图读的缓冲区', len_s='UTF-8 字节数', units_s='UTF-16 码元数', start_s='视图起点', cap_s='可续写的空间', used_s='已认领，原子', pad='填充', text='文本', texts='UTF-8',
     str_note='非 ASCII 字符串的尾巴后面，对齐到 2 字节，再接 UTF-16 码元。',
     mv_title='对象地址为什么会变',
-    mv_intro='从外面用 paragc，第一个意外是：同一个对象在下一次 `mutate` 里地址可能不同。本章从使用者的角度解释：你会看到什么、什么时候发生、paragc 为什么这样做、哪些东西能跨回收保存、哪些不能。',
+    mv_intro='从外面用 paragc，第一个意外是：同一个对象在一次回收之后地址可能不同。本章从使用者的角度解释：你会看到什么、什么时候发生、paragc 为什么这样做、哪些东西能跨回收保存、哪些不能。',
     mv_see_h='你会看到什么',
     mv_code='''```rust
-let root = heap.mutate(|m| m.root(m.alloc(Node { value: 1, next: None })));
-let before = heap.mutate(|m| m.get(&root).as_ptr() as usize);
+let root = heap.scope(|m| m.global(m.alloc(Node { value: 1, next: None })));
+let before = heap.scope(|m| m.scope_in(&root).as_ptr() as usize);
 heap.collect_young();
-let after = heap.mutate(|m| m.get(&root).as_ptr() as usize);
+let after = heap.scope(|m| m.scope_in(&root).as_ptr() as usize);
 assert_ne!(before, after);            // 通常成立：存活者被复制走了
-assert_eq!(heap.mutate(|m| m.get(&root).value), 1);   // 对象还是那个对象
+assert_eq!(heap.scope(|m| m.scope_in(&root).value), 1);   // 对象还是那个对象
 ```''',
-    mv_see_p='`Root` 仍然找得到这个对象，值也没变，变的只是地址。',
+    mv_see_p='`ScopeGlobal` 仍然找得到这个对象，值也没变，变的只是地址。',
     mv_life_h='一个对象的一生',
     mv_life_cap='一个对象，四个地址',
     s1='分配', s1t='年轻，在线程正在递增分配的块里；mark = 0',
@@ -271,7 +271,7 @@ assert_eq!(heap.mutate(|m| m.get(&root).value), 1);   // 对象还是那个对�
 | 全停的完整回收 | 稀疏块（活数据不到一半）里的活对象 | 总是开启 |
 | 挂着跨堆时的年轻回收 | 可共享的存活者，搬进跨堆 | 只限 `alloc_shared` 的类型 |
 
-从不搬：`mutate` 期间的任何对象；并发标记、一起回收期间的任何对象；大对象（超过 16 KiB）；`Far` 的目标；已经在跨堆里的对象。''',
+从不搬：不回收的 scope 里的任何对象；并发标记、一起回收期间的任何对象；大对象（超过 16 KiB）；`Far` 的目标；已经在跨堆里的对象。''',
     mv_why_h='为什么要搬',
     mv_why='''搬动要付一次复制的代价，所以 paragc 只在它换来你能感觉到的好处时才搬：
 
@@ -283,28 +283,28 @@ assert_eq!(heap.mutate(|m| m.get(&root).value), 1);   // 对象还是那个对�
     mv_fix_p='回收器在旧副本里留下转发地址，并改写它知道的每一个引用：',
     fw_cap='搬动之后的旧副本',
     fw_mark='置 FORWARDED', fw_drop='新地址', fw_rest='旧数据，不会再读',
-    mv_fix_list='''- **`Gc` 句柄**在搬动时不可能存在：它出不了 `mutate`，而会搬对象的回收要取 `&mut Heap`。
-- **对象里的边**（`Gc`、`Slot`、`WordSlot` 字段）经 `Trace::relocate` 改写，`#[derive(Trace)]` 会生成它。
+    mv_fix_list='''- **`ScopeLocal`** 在搬动时不可能存在：它是对所属 scope 的借用，而会搬对象的回收要取 `&mut` 堆或这个 scope。
+- **对象里的边**（`ScopeLocal`、`Slot`、`WordSlot` 字段）经 `Trace::relocate` 改写，`#[derive(Trace)]` 会生成它。
 - **根、弱引用、`Far` 入口**放在回收器自己的表里，在表里改写。
 - **老对象被记下的槽**在 `Full` 模式下改写；在 `SkipRemembered` 模式下，它们的目标干脆不搬。''',
     mv_keep_h='哪些东西能跨回收保存',
     mv_keep_tbl='''| 保存 | 为什么仍然有效 |
 | --- | --- |
-| `Root<B>`、`Weak<B>` | 回收器改写它们的表槽 |
+| `ScopeGlobal<'heap, 'heap, B>`、`Weak<B>` | 回收器改写它们的表槽 |
 | 堆对象的字段 | 由 `Trace::relocate` 改写 |
 | `WordSlot` 字的标签位 | 只有低 48 位会变 |
-| `CrossHeapSlot`、`CrossHeapRoot::index`、`CrossHeapWeak`、`Signature` | 它们指的是跨堆对象，而跨堆对象从不搬 |
+| `CrossHeapSlot`、`CrossHeapGlobal::index`、`CrossHeapWeak`、`Signature` | 它们指的是跨堆对象，而跨堆对象从不搬 |
 | 从对象里复制出来的值 | 它们归你了 |''',
     mv_break_h='哪些会坏，该怎么做',
     mv_break_tbl='''| 写法 | 为什么会坏 | 改成 |
 | --- | --- | --- |
-| 把 `as_ptr()` 存进 Rust 结构，下一次 `mutate` 再用 | 对象可能搬走了，旧地址上可能已经是别的对象 | 存 `Root`（或 `Weak`），用 `m.get` 取 |
+| 把 `as_ptr()` 存进 Rust 结构，回收之后再用 | 对象可能搬走了，旧地址上可能已经是别的对象 | 存 `ScopeGlobal`（或 `Weak`），用 `s.scope_in` 取 |
 | 按地址做键的哈希表 | 搬动后键就过期了 | 按内容或稳定的编号哈希；非用地址不可，就在 `relocate` 里重新哈希（见下） |
-| 比较两次不同 `mutate` 里拿到的地址 | 同一个对象可能有两个地址 | 在同一次 `mutate` 里比较，或比较稳定的编号 |
-| 把地址交给 C、操作系统，或活得比 `mutate` 久的线程 | 没有人会改写它 | 把字节复制出去；钉住空间在规划中（宗旨第 1 条：照样会被回收） |
+| 比较回收前后拿到的地址 | 同一个对象可能有两个地址 | 在两次回收之间比较，或比较稳定的编号（Handle） |
+| 把地址交给 C、操作系统，或活得比 scope 久的线程 | 没有人会改写它 | 把字节复制出去；钉住空间在规划中（宗旨第 1 条：照样会被回收） |
 | 把地址写死在生成的代码里 | 那段代码不是回收器认识的边 | 经 handle 引用目标、把 id 写进代码（j8 的 shape），或把代码做成被追踪的对象 |''',
     mv_j8_h='在 j8 里',
-    mv_j8='''- **对象的 `===`** 比较的是 NaN-boxing 的字。两个操作数在同一轮、同一次 `mutate` 里读出，结果一致。
+    mv_j8='''- **对象的 `===`** 比较的是 NaN-boxing 的字。两个操作数在同一轮、同一次 `scope` 里读出，结果一致。
 - **`Map` 和 `Set`** 按地址索引对象（`MapKey::Ref`）。`Collection::relocate` 在搬动后重算每个对象键并重新插入，就是上面说的「在 relocate 里重新哈希」。
 - **shape** 在内联缓存里被比较、被写死在 JIT 代码里。它们是经 [handle](handles.md) 引用的 GC 对象：shape 搬家只改写它的 handle 表项，缓存和机器码比较的 id 永远不变。
 - **字符串**随便搬：堆外没有谁记着它们的地址，它们的字节在尾巴里跟着走。''',
@@ -317,7 +317,7 @@ def bits_page(t):
     L.append(f'## {t["obj_h"]}\n\n{t["obj_p"]}\n')
     L.append(dg(t['obj_cap'],
                 bf([(4, 'k1', 'mark', '4 B'), (4, 'k2', 'info', '4 B'), (8, 'k3', 'visit', t['visit_sub']), (8, 'k4', 'drop', t['drop_sub']),
-                    (14, 'k5', t['data'], 'size_of::&lt;T&gt;()'), (8, 'k6 dim', t['tail'], t['tailsub'])], ['0', '4', '8', '16', '24 ▲ Gc', '24 + T'], 'end'),
+                    (14, 'k5', t['data'], 'size_of::&lt;T&gt;()'), (8, 'k6 dim', t['tail'], t['tailsub'])], ['0', '4', '8', '16', '24 ▲ ScopeLocal', '24 + T'], 'end'),
                 '', note=t['gc_here']) + '\n')
     L.append(dg(t['mark_cap'],
                 bf([(3, 'k7', 'FORWARDED', t['fwd'], '31'), (3, 'k3', 'BUSY', t['busy'], '30'), (26, 'k1', 'epoch', t['epoch'] + ' · ' + t['epochn'], '29 … 0')]),

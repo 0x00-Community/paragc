@@ -19,8 +19,8 @@ cross_heap_brand!(NodeB = for<'p> Node<'p>);
 
 - 必须 `#[repr(C)]`，这样各个进程、各个二进制看到的布局一致。
 - 字段可以是普通数据、`CrossHeapSlot`、`CrossHeapRef`、`CrossHeapWeak`、嵌套的 `Shared` 类型和定长数组。晋升又加了存绝对
-  地址的边：`Gc`、`Option<Gc>`、`Slot`、`WordSlot`。
-- 不能有析构：`CrossHeapMutator::alloc` 在编译期检查。
+  地址的边：`ScopeLocal`、`Option<ScopeLocal>`、`Slot`、`WordSlot`。
+- 不能有析构：`CrossHeapScope::alloc` 在编译期检查。
 - 派生会生成**指针图**：每个指针字段的偏移，嵌套类型和数组都展开。
 
 ## 类型表
@@ -30,7 +30,7 @@ cross_heap_brand!(NodeB = for<'p> Node<'p>);
 - **类型键**是类型名、大小和指针图的哈希；
 - 表项记着类型号、大小和指针图存在哪。
 
-进程查句柄时会核对类型键，类型不对的句柄会被拒绝，而不是被读错。
+进程查Handle时会核对类型键，类型不对的Handle会被拒绝，而不是被读错。
 
 ## 对象头
 
@@ -44,17 +44,17 @@ cross_heap_brand!(NodeB = for<'p> Node<'p>);
 
 回收按类型号的指针图走，从不调用代码。
 
-## 句柄
+## Handle
 
-| 句柄 | 有效范围 | 存的是 |
+| Handle | 有效范围 | 存的是 |
 | --- | --- | --- |
-| `CrossHeapGc<'p, T>` | 一次 `CrossHeap::mutate` 里 | 本映射里的绝对地址 |
+| `CrossHeapLocal<'p, T>` | 一次 `CrossHeap::scope` 里 | 本映射里的绝对地址 |
 | `CrossHeapSlot<'p, T>` | 跨堆对象的字段 | 相对地址区起点的偏移，所有映射里都一样 |
-| `CrossHeapRoot<B>` | 任何地方，私有堆里也行 | 入口号；让对象存活 |
+| `CrossHeapGlobal<B>` | 任何地方，私有堆里也行 | 入口号；让对象存活 |
 | `CrossHeapRef<'a, B>` | 堆 A 里对象的字段，指向堆 B | 目标偏移和 B 的化身号；在 B 里登记入口 |
 | `CrossHeapWeak<B>` | 任何地方 | 一个字：偏移和出生戳；什么都不保 |
 
-`CrossHeapSlot` 的 `get`、`set` 要传 `CrossHeapMutator`，它知道本映射的基地址。
+`CrossHeapSlot` 的 `get`、`set` 要传 `CrossHeapScope`，它知道本映射的基地址。
 
 ## 入口
 
@@ -64,7 +64,7 @@ cross_heap_brand!(NodeB = for<'p> Node<'p>);
 - `HEAP_HOLDER | k`，表示另一个跨堆；
 - 0，表示不归任何人：持久根。
 
-`CrossHeapRoot::index` 是入口号，在每个映射里都一样。`CrossHeapMutator::find` 核对类型键后，把入口号变回句柄；别的进程就是
+`CrossHeapGlobal::index` 是入口号，在每个映射里都一样。`CrossHeapScope::find` 核对类型键后，把入口号变回 Handle；别的进程就是
 这样拿到交给它的对象的。
 
 ## 大对象

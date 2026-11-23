@@ -21,16 +21,16 @@ heap.attach_cross_heap(&cross)?;
 ```rust
 #[repr(C)]
 #[derive(Trace, Shared)]
-struct Node<'gc> {
+struct Node<'heap, 'scope> {
     value: u64,
-    next: Slot<'gc, Node<'gc>>,
+    next: Slot<'heap, 'scope, Node<'heap, 'scope>>,
 }
 
-heap.mutate(|m| m.alloc_shared(Node { value: 1, next: None.into() }));
+heap.scope(|m| m.alloc_shared(Node { value: 1, next: None.into() }));
 ```
 
-`Mutator::alloc_shared`（以及 `alloc_shared_tail`）要求类型同时是 `Trace` 和 `Shared`，且没有 `Drop`。它的 `Gc`、
-`Option<Gc>`、`Slot`、`WordSlot` 字段在指针图里记成存绝对地址的边（`WORD_EDGE`、`PTR_EDGE`）。
+`Scope::alloc_shared`（以及 `alloc_shared_tail`）要求类型同时是 `Trace` 和 `Shared`，且没有 `Drop`。它的 `ScopeLocal`、
+`Option<ScopeLocal>`、`Slot`、`WordSlot` 字段在指针图里记成存绝对地址的边（`WORD_EDGE`、`PTR_EDGE`）。
 
 ## 年轻回收做了什么
 
@@ -68,7 +68,7 @@ heap.mutate(|m| m.alloc_shared(Node { value: 1, next: None.into() }));
 ## 把对象交给别的进程
 
 ```rust
-let sig = heap.mutate(|m| cross.mutate(|cm| cm.sign_promoted(m.get(&root))));
+let sig = heap.scope(|m| cross.scope(|cm| cm.sign_promoted(m.scope_in(&root))));
 ```
 
 对还在私有堆里的对象，`sign_promoted` 返回 `None`。签名不保活：主人丢掉对象并回收后，签名解析出来是 `None`。

@@ -1,19 +1,19 @@
 # Why object addresses change
 
-From the outside, the first surprise with paragc is that the same object can have a different address in the next `mutate`. This chapter explains it from the user's side: what you see, when it happens, why paragc does it, and what you can and cannot keep across a collection.
+From the outside, the first surprise with paragc is that the same object can have a different address after a collection. This chapter explains it from the user's side: what you see, when it happens, why paragc does it, and what you can and cannot keep across a collection.
 
 ## What you see
 
 ```rust
-let root = heap.mutate(|m| m.root(m.alloc(Node { value: 1, next: None })));
-let before = heap.mutate(|m| m.get(&root).as_ptr() as usize);
+let root = heap.scope(|m| m.global(m.alloc(Node { value: 1, next: None })));
+let before = heap.scope(|m| m.scope_in(&root).as_ptr() as usize);
 heap.collect_young();
-let after = heap.mutate(|m| m.get(&root).as_ptr() as usize);
+let after = heap.scope(|m| m.scope_in(&root).as_ptr() as usize);
 assert_ne!(before, after);            // usually true: the survivor was copied
-assert_eq!(heap.mutate(|m| m.get(&root).value), 1);   // the object is the same
+assert_eq!(heap.scope(|m| m.scope_in(&root).value), 1);   // the object is the same
 ```
 
-The `Root` still finds the object and the value is unchanged. Only the address moved.
+The `ScopeGlobal` still finds the object and the value is unchanged. Only the address moved.
 
 ## The life of one object
 
@@ -27,7 +27,7 @@ The `Root` still finds the object and the value is unchanged. Only the address m
 | stop-the-world full collection | live objects in sparse blocks (under half live) | always on |
 | young collection with a cross-heap attached | shareable survivors, into the cross-heap | `alloc_shared` types only |
 
-Never moved: anything during `mutate`; anything during concurrent marking or group collections; large objects (over 16 KiB); targets of `Far`; objects already in a cross-heap.
+Never moved: anything inside a scope that does not collect; anything during concurrent marking or group collections; large objects (over 16 KiB); targets of `Far`; objects already in a cross-heap.
 
 ## Why move at all
 
@@ -44,8 +44,8 @@ The collector leaves a forwarding address in the old copy and rewrites every ref
 
 <div class="dg"><div class="dg-cap">The old copy after a move</div><div class="bf"><div class="k7" style="--w:4"><b>mark</b><small>FORWARDED set</small><i>bit 31</i></div><div class="k2" style="--w:4"><b>info</b></div><div class="k3" style="--w:8"><b>visit</b></div><div class="k1" style="--w:8"><b>drop</b><small>→ new address</small></div><div class="dim" style="--w:20"><b>T</b><small>old data, never read again</small></div></div></div>
 
-- **`Gc` handles** cannot exist during a move: they never leave `mutate`, and a moving collection takes `&mut Heap`.
-- **Edges inside objects** (`Gc`, `Slot`, `WordSlot` fields) are rewritten through `Trace::relocate`, which `#[derive(Trace)]` generates.
+- **`ScopeLocal` handles** cannot exist during a move: they are borrows of their scope, and a moving collection takes `&mut` the heap or the scope.
+- **Edges inside objects** (`ScopeLocal`, `Slot`, `WordSlot` fields) are rewritten through `Trace::relocate`, which `#[derive(Trace)]` generates.
 - **Roots, weak references and `Far` entries** live in tables the collector owns, and are rewritten there.
 - **Remembered slots** of old objects are rewritten in `Full` mode; in `SkipRemembered` mode their targets simply do not move.
 
@@ -53,25 +53,25 @@ The collector leaves a forwarding address in the old copy and rewrites every ref
 
 | Keep | Why it stays valid |
 | --- | --- |
-| `Root<B>`, `Weak<B>` | the collector rewrites their table slots |
+| `ScopeGlobal<'heap, 'heap, B>`, `Weak<B>` | the collector rewrites their table slots |
 | fields of heap objects | rewritten by `Trace::relocate` |
 | the tag bits of a `WordSlot` word | only the low 48 bits change |
-| `CrossHeapSlot`, `CrossHeapRoot::index`, `CrossHeapWeak`, `Signature` | they name cross-heap objects, which never move |
+| `CrossHeapSlot`, `CrossHeapGlobal::index`, `CrossHeapWeak`, `Signature` | they name cross-heap objects, which never move |
 | values copied out of the object | they are yours |
 
 ## What breaks, and what to do instead
 
 | Pattern | Why it breaks | Instead |
 | --- | --- | --- |
-| `as_ptr()` saved in a Rust struct, used in a later `mutate` | the object may have moved; the old address may now hold another object | keep a `Root` (or `Weak`) and call `m.get` |
+| `as_ptr()` saved in a Rust struct, used after a collection | the object may have moved; the old address may now hold another object | keep a `ScopeGlobal` (or `Weak`) and call `s.scope_in` |
 | a hash map keyed by address | the key is stale after a move | hash the content or a stable id; if it must be the address, rehash in `relocate` (below) |
-| comparing addresses from two different `mutate`s | the same object can have two addresses | compare inside one `mutate`, or compare a stable id |
-| handing an address to C, the OS or another thread that outlives `mutate` | nobody rewrites it | copy the bytes out; a pinned space is planned (principle 1: it will still be collected) |
+| comparing addresses from before and after a collection | the same object can have two addresses | compare between collections, or compare a stable id (a handle) |
+| handing an address to C, the OS or another thread that outlives the scope | nobody rewrites it | copy the bytes out; a pinned space is planned (principle 1: it will still be collected) |
 | addresses baked into generated code | the code is not an edge the collector knows | refer to the target through a handle and bake its id (j8's shapes), or make the code a traced object |
 
 ## In j8
 
-- **`===` on objects** compares the NaN-boxed words. Both operands are read in the same turn, inside one `mutate`, so they agree.
+- **`===` on objects** compares the NaN-boxed words. Both operands are read in the same turn, inside one `scope`, so they agree.
 - **`Map` and `Set`** index objects by address (`MapKey::Ref`). `Collection::relocate` recomputes the key of every object entry after a move and re-inserts it. That is the "rehash in relocate" pattern above.
 - **Shapes** are compared in inline caches and baked into JIT code. They are GC objects referenced through [handles](handles.md): moving a shape rewrites only its handle entry, so the id that caches and machine code compare never changes.
 - **Strings** move freely: nothing outside the heap keeps their address, and their bytes travel in the tail.

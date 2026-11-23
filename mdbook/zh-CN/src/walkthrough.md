@@ -29,7 +29,7 @@
 | `Object` 外壳（原型、调用目标、类别位） | GC 堆 | 取决于下面几行 |
 | `Props.inline`（前 4 个属性值） | 对象里，每个一个 NaN-boxing 字 | ✓ |
 | `Props.store`（第 5 个起的属性值） | GC 堆 | ✓ |
-| `Props.shape` | `HandleSlot`：shape 的 handle id，一条强边 | ✗（handle 属于某一个私有堆） |
+| `Props.shape` | `HandleSlot`：shape 的 Handle id，一条强边 | ✗（Handle 属于某一个私有堆） |
 | 原型的 `shape_root` | 指向该原型下对象的根 shape 的 `HandleSlot` | ✗ |
 | `Shape` 本身：属性名、特性、转移、哈希索引 | 用 `alloc_handle` 分配的 GC 对象；属性名是 `SmallStr`；转移是 paragc 的 `Weak` | ✗（带析构） |
 | 字典模式的属性 | 装着 `Vec`、`HashMap` 的 GC 对象 | ✗ |
@@ -41,18 +41,18 @@ shape 就是对象的布局：哪个属性名在哪一格、带什么特性。�
 
 ## shape 怎样放在堆里
 
-1. **身份是 handle id。** 内联缓存比较 shape 的身份，JIT 把它写死在机器码里（`CheckShape`）。shape 用
-   [`alloc_handle`](handles.md) 分配，对象的 shape 字里存的是它的 handle id。paragc 搬动 shape 时只改写 handle 表项，所以 id、
+1. **身份是 Handle id。** 内联缓存比较 shape 的身份，JIT 把它写死在机器码里（`CheckShape`）。shape 用
+   [`alloc_handle`](handles.md) 分配，对象的 shape 字里存的是它的 Handle id。paragc 搬动 shape 时只改写 Handle 表项，所以 id、
    缓存和机器码都仍然有效。JIT 从不解引用这个字，只拿它做比较。
 2. **谁保活 shape。** 对象（经 `Props.shape`）、原型（`shape_root`），以及一个函数的内联缓存、字面量缓存和 JIT 代码，这些都存在
    该函数的 `Loaded` 对象里。shape 到子 shape 的转移是弱的：没人用的子 shape 会被回收，以后再加同一个属性就新建一个。
 3. **增长。** 转移放在一个 `Vec` 里，每次加子节点时顺手去掉已清空的项；哈希索引按需建；属性名经 `Arc<Prefix>` 与父 shape 共用。
    这些都是 malloc 内存，shape 死时由它的析构释放。
-4. **编译好的代码也会回收。** 每个函数的 `Loaded` 是一个 handle 对象；闭包、模块记录、暂停的帧都把它当作被追踪的 `Code` 持有，
+4. **编译好的代码也会回收。** 每个函数的 `Loaded` 是一个 Handle 对象；闭包、模块记录、暂停的帧都把它当作被追踪的 `Code` 持有，
    同一模块的函数挂在一个 `Unit` 上。执行器里从函数编号到代码的表只持有弱引用。
 
 ## 这对共享意味着什么
 
-shape 已经是 GC 对象，但仍是私有的：handle 只存在于私有堆，`Shape` 还带析构。对象晋升进跨堆时，值和字符串完好到达，shape 字却
-仍指着发送进程 handle 表里的一项。下一段要给晋升的对象一个住在跨堆里的 shape，让别的进程知道每一格是哪个属性。见
+shape 已经是 GC 对象，但仍是私有的：Handle 只存在于私有堆，`Shape` 还带析构。对象晋升进跨堆时，值和字符串完好到达，shape 字却
+仍指着发送进程 Handle 表里的一项。下一段要给晋升的对象一个住在跨堆里的 shape，让别的进程知道每一格是哪个属性。见
 [限制与未解决的问题](limits.md)。

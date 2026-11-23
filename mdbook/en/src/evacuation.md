@@ -24,7 +24,7 @@ Other workers that reach the old copy either wait for `BUSY` to clear or follow 
 ## Rewriting edges
 
 - Every edge is rewritten through `Trace::relocate`.
-- Root slots are rewritten with a CAS, so a handle that another thread drops at the same time stays dropped.
+- ScopeGlobal slots are rewritten with a CAS, so a handle that another thread drops at the same time stays dropped.
 - Weak references follow moved targets.
 - The sweep clears the old copies' start bits without running their destructors.
 
@@ -38,5 +38,5 @@ Other workers that reach the old copy either wait for `BUSY` to clear or follow 
 
 ## Consequence for users
 
-`Gc::as_ptr` may differ from one `mutate` to the next. Code must not keep raw addresses across a collection, except
+`ScopeLocal::as_ptr` may differ from one `scope` to the next. Code must not keep raw addresses across a collection, except
 through `Trace::relocate`.

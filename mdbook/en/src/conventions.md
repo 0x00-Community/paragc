@@ -18,10 +18,10 @@ The source is flat; similar things live together:
 | File | Contents |
 | --- | --- |
 | `layout.rs` | blocks, lines, headers, the cross-heap window layout and superblock |
-| `heap.rs` | `Heap`, `Mutator`, `Tlab`, collections, `CrossHeap`, `CrossHeapMutator`, promotion |
+| `heap.rs` | `Heap`, `Scope`, `Tlab`, collections, `CrossHeap`, `CrossHeapScope`, promotion |
 | `mark.rs` | `Tracer`, the work-stealing crew, the copier, the cross-heap marker |
 | `sweep.rs` | sweeping and large objects |
-| `handle.rs` | `Gc`, `Slot`, `WordSlot`, `Root`, `Weak`, `Far`, cross-heap handles, `Signature`, `Shared` |
+| `handle.rs` | `ScopeLocal`, `Slot`, `WordSlot`, `ScopeGlobal`, `Weak`, `Far`, cross-heap handles, `Signature`, `Shared` |
 | `shm.rs` | the cross-heap address region, windows, heap numbers, process liveness (Linux) |
 | `sync.rs` | lock-free building blocks and futex waits |
 

@@ -1,20 +1,20 @@
 # Far references and group collection
 
-Several private heaps can live in one process: one per isolate, one per subsystem. `Far<'a, B>` lets an object in one
+Several private heaps can live in one process: one per isolate, one per subsystem. `Far<'heap, 'scope, B>` lets an object in one
 heap point straight at an object in another, with no copy and no indirection.
 
 ## Creating and reading
 
 ```rust
-// inside both heaps' mutate
+// inside both heaps' scope
 let far = Far::new(&holder_m, &target_m, target_gc);
 let holder = holder_m.alloc(Holder { far });
-// later, reading needs the target heap's Mutator
+// later, reading needs the target heap's Scope
 let t = holder.far.get(&target_m);
 ```
 
 - A `Far` is branded with the **holder** heap, so it can only be stored in that heap's objects.
-- Reading takes the **target** heap's `Mutator`. Holding that mutator proves the target heap is open and that no
+- Reading takes the **target** heap's `Scope`. Holding that mutator proves the target heap is open and that no
   collection of it is running.
 - A `Far` never changes. To point elsewhere, put it in an object behind a `Slot` and replace that object.
 

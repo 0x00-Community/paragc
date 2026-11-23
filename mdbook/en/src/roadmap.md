@@ -10,6 +10,7 @@
 | 0.6.1 | `alloc_tail` / `alloc_shared_tail` |
 | 0.6.2 | `Handle` / `HandleSlot` / `alloc_handle`: references through a handle table |
 | 0.6.3 | `Handle::from_id` |
+| 0.7.0 | scopes: `Heap<'heap>` / `Scope<'heap, 'life>` nesting and collecting in place, `ScopeLocal` (was `Gc`), `ScopeGlobal` (was `Root`), `Slot` (was `GcSlot`), `'heap` / `'xheap` brands |
 
 ## Next
 
