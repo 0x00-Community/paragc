@@ -8,13 +8,14 @@
 | 0.5 | cross-heaps on shared memory with several processes and crash recovery; `CrossHeapRef` and group collections across cross-heaps; heap numbers and restarts; heap lifetime tied to the owner; `WordSlot` and `Weak` |
 | 0.6.0 | the `crossheap` feature (Linux only); the `Public*` API renamed to `CrossHeap*`; `CrossHeapWeak`, birth stamps and signatures; `open_fd`; the mailbox; shrinking cross-heaps; promotion into an attached cross-heap with owner-only collection; deferred promotion of private objects written into cross-heap slots; `sign_promoted` |
 | 0.6.1 | `alloc_tail` / `alloc_shared_tail` |
+| 0.6.2 | `Handle` / `HandleSlot` / `alloc_handle`: references through a handle table |
 
 ## Next
 
 - **Cross-process JS objects in j8**, stage by stage:
   1. an isolate takes a cross-heap and signs shared objects when a turn ends (done);
   2. strings in the GC heap (done);
-  3. shapes: see [Limits and open problems](limits.md);
+  3. shapes and compiled functions in the GC heap, referenced through handles;
   4. ordinary objects and arrays;
   5. functions, with bytecode in the cross-heap;
   6. host objects, through the owner and the mailbox.

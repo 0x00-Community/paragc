@@ -10,7 +10,7 @@ mod shm;
 mod sweep;
 mod sync;
 
-pub use handle::{Brand, Far, Gc, Root, Slot, Weak, WordSlot, word_pointer, RAW_TAG, WORD_PAYLOAD, WORD_POINTER_MIN};
+pub use handle::{Brand, Far, Gc, Handle, HandleSlot, Root, Slot, Weak, WordSlot, word_pointer, RAW_TAG, WORD_PAYLOAD, WORD_POINTER_MIN};
 #[cfg(crossheap)]
 pub use handle::{EdgeMap, CrossHeapRoot, CrossHeapBrand, CrossHeapGc, CrossHeapRef, CrossHeapSlot, CrossHeapWeak, SIGNATURE_BYTES, Shared, Signature};
 pub use heap::{Heap, Mutator, Stats, Tlab, YoungEvacuation};

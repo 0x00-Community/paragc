@@ -578,6 +578,32 @@ impl RootTable {
         ready.extend(self.returned.take());
     }
 
+    /// The objects of the non-empty entries.
+    pub fn entries(&self) -> impl Iterator<Item = *const Header> {
+        self.slots.iter().map(Entry::load).filter(|p| !p.is_null()).map(<*mut Header>::cast_const)
+    }
+
+    /// The handle table after marking and before sweeping: entries whose object was not marked with `epoch` are cleared and reused, moved ones rewritten to the new address, and live objects
+    /// get stuck counts (handles are not counted, so reference counting must never release an object with an entry). SAFETY (caller): as [`RootTable::clear_unreached`].
+    pub unsafe fn reap(&self, epoch: u32, parity: bool) {
+        for (i, slot) in self.slots.iter().enumerate() {
+            let old = slot.load();
+            if old.is_null() {
+                continue;
+            }
+            if let Some(new) = Header::survivor(old, epoch) {
+                // SAFETY: a live object
+                unsafe { &*new }.rc_stick(parity);
+                slot.store(new.cast_mut());
+            } else {
+                slot.store(null_mut());
+                self.returned.push(i);
+            }
+        }
+        // SAFETY: see above
+        unsafe { self.recycle() };
+    }
+
     /// A weak table ([`Weak`] slots) after marking and before sweeping: targets not marked with `epoch` are cleared, moved ones rewritten to the new address;
     /// live targets get stuck counts (`parity` is the current count's parity). Handles may be dropped on other threads meanwhile (clearing the slot), hence the CAS.
     /// SAFETY (caller): no mutators; marking (including evacuation) is done and sweeping has not started, so the memory of the objects in the slots is still there.
@@ -611,6 +637,140 @@ impl RootTable {
                 let _ = slot.ptr.compare_exchange(p, null_mut(), Ordering::AcqRel, Ordering::Relaxed);
             }
         }
+    }
+}
+
+/// A reference to an object allocated with [`Mutator::alloc_handle`], pointing at the object's entry in the heap's handle table instead of at the object.
+///
+/// - The handle never changes when the object moves: only the entry is rewritten. Equality, hashing and [`Handle::id`] use the entry, so they stay valid across collections
+///   (hash tables keyed by handles need no rehashing, generated code may embed the id as a constant).
+/// - Stored in objects it is a strong edge, like [`Gc`]; writing it needs no barrier, so it can sit in plain fields and in [`HandleSlot`]s.
+/// - Reading costs one load more than a [`Gc`]: entry, then object. Within one mutate, resolve it once with [`Handle::get`] and keep the `Gc`.
+///
+/// Like `Gc` it carries the mutate brand `'gc` and cannot escape the closure; outside, keep the object with a [`Root`].
+#[repr(transparent)]
+pub struct Handle<'gc, T> {
+    entry: NonNull<Entry>,
+    _brand: GcBrand<'gc, T>,
+}
+
+// SAFETY: as Gc: only shared references to T are handed out, and the entry is an atomic
+unsafe impl<T: Send + Sync> Send for Handle<'_, T> {}
+// SAFETY: as above
+unsafe impl<T: Send + Sync> Sync for Handle<'_, T> {}
+
+impl<T> Clone for Handle<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Handle<'_, T> {}
+
+impl<T> PartialEq for Handle<'_, T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.entry == other.entry
+    }
+}
+
+impl<T> Eq for Handle<'_, T> {}
+
+impl<T> core::hash::Hash for Handle<'_, T> {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.entry.hash(state);
+    }
+}
+
+/// Operations for this crate only.
+pub trait HandleInternal {
+    /// SAFETY (caller): `entry` is an entry of the heap's handle table holding an object of type `T`.
+    unsafe fn from_entry(entry: &Entry) -> Self;
+
+    /// The entry's current header.
+    fn header(self) -> *const Header;
+}
+
+impl<T> HandleInternal for Handle<'_, T> {
+    unsafe fn from_entry(entry: &Entry) -> Self {
+        Self { entry: NonNull::from(entry), _brand: PhantomData }
+    }
+
+    fn header(self) -> *const Header {
+        // SAFETY: entries live as long as the heap, and the brand keeps this handle inside one of its mutates
+        unsafe { self.entry.as_ref() }.load()
+    }
+}
+
+impl<'gc, T> Handle<'gc, T> {
+    /// The object. Objects do not move within a mutate, so the `Gc` stays valid for the rest of it.
+    #[inline]
+    pub fn get(self) -> Gc<'gc, T> {
+        // SAFETY: a handle reachable inside a mutate keeps its entry filled with a live object of type T
+        unsafe { Gc::from_data(Header::data(HandleInternal::header(self)).cast()) }
+    }
+
+    /// The identity: the address of the entry. Never changes while the object lives; after the object dies the entry (and the id) may be reused by a new object.
+    #[inline]
+    pub fn id(self) -> usize {
+        self.entry.as_ptr().addr()
+    }
+}
+
+impl<T> Deref for Handle<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.get().get()
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for Handle<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Handle").field(&**self).finish()
+    }
+}
+
+/// A rewritable field holding a [`Handle`] or nothing. Writing needs no mutator and no barrier.
+pub struct HandleSlot<'gc, T> {
+    entry: AtomicPtr<Entry>,
+    _brand: GcBrand<'gc, T>,
+}
+
+impl<T> Default for HandleSlot<'_, T> {
+    fn default() -> Self {
+        Self { entry: AtomicPtr::new(null_mut()), _brand: PhantomData }
+    }
+}
+
+impl<'gc, T> From<Option<Handle<'gc, T>>> for HandleSlot<'gc, T> {
+    fn from(v: Option<Handle<'gc, T>>) -> Self {
+        Self { entry: AtomicPtr::new(Self::raw(v)), _brand: PhantomData }
+    }
+}
+
+impl<'gc, T> From<Handle<'gc, T>> for HandleSlot<'gc, T> {
+    fn from(v: Handle<'gc, T>) -> Self {
+        Some(v).into()
+    }
+}
+
+impl<'gc, T> HandleSlot<'gc, T> {
+    fn raw(v: Option<Handle<'gc, T>>) -> *mut Entry {
+        v.map_or(null_mut(), |h| h.entry.as_ptr())
+    }
+
+    pub fn get(&self) -> Option<Handle<'gc, T>> {
+        NonNull::new(self.entry.load(Ordering::Acquire)).map(|entry| Handle { entry, _brand: PhantomData })
+    }
+
+    pub fn set(&self, v: Option<Handle<'gc, T>>) {
+        self.entry.store(Self::raw(v), Ordering::Release);
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for HandleSlot<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("HandleSlot").field(&self.get()).finish()
     }
 }
 
