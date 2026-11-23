@@ -1247,11 +1247,13 @@ pub struct Scope<'heap, 'life> {
 }
 
 impl<'heap> Scope<'heap, '_> {
+    #[inline]
     fn heap(&self) -> &Heap<'heap> {
         // SAFETY: the scope borrows the heap for its whole life
         unsafe { self.heap.as_ref() }
     }
 
+    #[inline]
     fn tlab(&self) -> &Tlab {
         // SAFETY: the allocation buffer is owned by the outermost scope and outlives every scope derived from it
         unsafe { self.tlab.as_ref() }
@@ -1386,6 +1388,7 @@ pub trait ScopeInternal<'heap> {
 }
 
 impl<'heap> ScopeInternal<'heap> for Scope<'heap, '_> {
+    #[inline]
     fn heap(&self) -> &Heap<'heap> {
         Scope::heap(self)
     }
