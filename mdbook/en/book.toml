@@ -1,0 +1,22 @@
+[book]
+title = "paragc: a parallel garbage collector for Rust"
+description = "A complete guide to paragc: the Immix-style private heap, concurrent and young collections, reference counting, references between heaps, and cross-heap sharing between processes"
+authors = ["0x00 Community"]
+language = "en"
+src = "src"
+
+[build]
+# The English book is the site root; build it first (it empties ../book), then zh-CN into ../book/zh-CN
+build-dir = "../book"
+
+[output.html]
+git-repository-url = "https://github.com/0x00-Community/paragc"
+edit-url-template = "https://github.com/0x00-Community/paragc/edit/main/mdbook/en/src/{path}"
+site-url = "/"
+default-theme = "light"
+preferred-dark-theme = "navy"
+additional-js = ["lang.js"]
+
+[output.html.fold]
+enable = true
+level = 1

@@ -1,0 +1,16 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "paragc-mdbook",
+	"compatibility_date": "2026-11-19",
+	"assets": {
+		// mdbook build writes the book here (book.toml: build-dir); 404.html is mdbook's own not-found page
+		"directory": "./book",
+		"not_found_handling": "404-page"
+	},
+	"routes": [
+		{ "pattern": "paragc.app238.com", "custom_domain": true }
+	],
+	"observability": {
+		"enabled": false
+	}
+}
