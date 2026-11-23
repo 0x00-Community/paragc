@@ -29,29 +29,30 @@
 | `Object` 外壳（原型、调用目标、类别位） | GC 堆 | 取决于下面几行 |
 | `Props.inline`（前 4 个属性值） | 对象里，每个一个 NaN-boxing 字 | ✓ |
 | `Props.store`（第 5 个起的属性值） | GC 堆 | ✓ |
-| `Props.shape` | **指向 malloc 内存的裸指针**，回收器看不见 | ✗ |
-| `Props.anchor`、原型的 `shape_root` | 装着 `Arc<Shape>` 的 GC 对象 | ✗（带析构） |
-| `Shape` 本身：属性名、特性、转移、哈希索引 | 堆外的 `Arc`；属性名是 `SmallStr`（短的内联，长的 `Arc<str>`） | ✗ |
+| `Props.shape` | `HandleSlot`：shape 的 handle id，一条强边 | ✗（handle 属于某一个私有堆） |
+| 原型的 `shape_root` | 指向该原型下对象的根 shape 的 `HandleSlot` | ✗ |
+| `Shape` 本身：属性名、特性、转移、哈希索引 | 用 `alloc_handle` 分配的 GC 对象；属性名是 `SmallStr`；转移是 paragc 的 `Weak` | ✗（带析构） |
 | 字典模式的属性 | 装着 `Vec`、`HashMap` 的 GC 对象 | ✗ |
 | 字符串 | GC 堆，文本在对象尾巴里 | ✓ |
-| 函数 | 字节码和 `FunctionInfo` 在堆外 | ✗ |
+| 函数 | 字节码、内联缓存、字面量 shape 都在每个函数一个的 GC 对象（`Loaded`）里 | ✗ |
 | 宿主对象 | `Box<dyn Any>` | ✗；经信箱请主人代办 |
 
 shape 就是对象的布局：哪个属性名在哪一格、带什么特性。按同样顺序加了同样属性的对象共用一个 shape。
 
-## shape 为什么在堆外
+## shape 怎样放在堆里
 
-1. **身份就是地址，而 paragc 会搬对象。** 执行器的内联缓存比较 shape 地址，JIT 把它写死在机器码里（`CheckShape`）。paragc 的
-   年轻回收和疏散都会改变对象地址。malloc 出来的 `Arc` 从不搬动，所以它的地址可以当作稳定的身份。
-2. **shape 是一个共享的、会长的缓存。** 加属性时要经 `&self` 无锁地往 shape 树上追加子节点（`Chain`、`Prefix`）；属性多的
-   shape 会懒建哈希索引（`OnceBox<HashMap>`）。这两样都需要可增长的 malloc 内存，而且发生时手里没有分配上下文（`mc`）。做成
-   GC 对象就得带 `Box` 和析构，而带析构的类型不能共享。
-3. **它们什么时候死，仍由 GC 决定。** 原型的 `shape_root`，以及 shape 不在原型那棵树里的对象自己的 `anchor`，都是持有 `Arc`
-   的 GC 对象。它们死了，计数减一，shape 随之释放。
-4. **历史原因（推断）。** j8 把堆换成 paragc 时（11-17，eb308d0），shape 沿用了原来基于 `Arc` 的设计。那时还没有跨进程的需求。
+1. **身份是 handle id。** 内联缓存比较 shape 的身份，JIT 把它写死在机器码里（`CheckShape`）。shape 用
+   [`alloc_handle`](handles.md) 分配，对象的 shape 字里存的是它的 handle id。paragc 搬动 shape 时只改写 handle 表项，所以 id、
+   缓存和机器码都仍然有效。JIT 从不解引用这个字，只拿它做比较。
+2. **谁保活 shape。** 对象（经 `Props.shape`）、原型（`shape_root`），以及一个函数的内联缓存、字面量缓存和 JIT 代码，这些都存在
+   该函数的 `Loaded` 对象里。shape 到子 shape 的转移是弱的：没人用的子 shape 会被回收，以后再加同一个属性就新建一个。
+3. **增长。** 转移放在一个 `Vec` 里，每次加子节点时顺手去掉已清空的项；哈希索引按需建；属性名经 `Arc<Prefix>` 与父 shape 共用。
+   这些都是 malloc 内存，shape 死时由它的析构释放。
+4. **编译好的代码也会回收。** 每个函数的 `Loaded` 是一个 handle 对象；闭包、模块记录、暂停的帧都把它当作被追踪的 `Code` 持有，
+   同一模块的函数挂在一个 `Unit` 上。执行器里从函数编号到代码的表只持有弱引用。
 
 ## 这对共享意味着什么
 
-对象晋升进跨堆时，它的值和字符串完好到达，但 `Props.shape` 仍指着发送进程的 malloc 堆。别的进程看得到每一格里的值，却不知道
-每一格属于哪个属性名。`Anchor` 还带析构，根本不能晋升。所以跨进程工作的第 3 段（shape）必须先于普通对象的共享完成。候选方案
-列在[限制与未解决的问题](limits.md)里。
+shape 已经是 GC 对象，但仍是私有的：handle 只存在于私有堆，`Shape` 还带析构。对象晋升进跨堆时，值和字符串完好到达，shape 字却
+仍指着发送进程 handle 表里的一项。下一段要给晋升的对象一个住在跨堆里的 shape，让别的进程知道每一格是哪个属性。见
+[限制与未解决的问题](limits.md)。

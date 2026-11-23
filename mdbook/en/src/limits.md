@@ -55,23 +55,27 @@ Sharing a JS value means the receiver must understand the object's layout, not j
 | Part of a JS object | Where it lives | Shareable |
 | --- | --- | --- |
 | strings | GC heap, bytes in the object's tail | ✓ (since j8 #49) |
-| shapes (property names, attributes, transitions) | `Arc<Shape>` outside the heap; objects keep a raw `*const Shape` | ✗ |
+| shapes (property names, attributes, transitions) | GC heap, referenced through [handles](handles.md) (j8 #55) | ✗ (private handles, a destructor) |
 | property values (inline slots, the store) | GC heap | only once their shape is shareable |
 | dictionary-mode properties | GC objects holding `Vec` and `HashMap` | ✗ |
-| functions | bytecode and `FunctionInfo` outside the heap | ✗ |
+| functions | bytecode and inline caches in one GC object per function (j8 #55) | ✗ |
 | host objects | `Box<dyn Any>` | ✗; the owner acts for others through the mailbox |
 
-**Shapes are the hard part.** Shape identity is a memory address:
-
-- the executor's inline caches compare shape addresses and keep `Arc<Shape>` to stay valid;
-- the JIT bakes shape addresses into machine code (`CheckShape`).
-
-A shape that is an ordinary moving GC object would break both. The candidate designs:
+**Shapes were the hard part.** Shape identity is compared everywhere: inline caches compare it, and the JIT bakes it
+into machine code (`CheckShape`). A shape that is an ordinary moving GC object would break both if identity were its
+address. The candidates were:
 
 1. ~~**Immortal shapes in a fixed place.**~~ **Rejected**: it breaks [core principle 1](principles.md), nothing is immortal.
-2. **Shapes as moving GC objects.** Memory is reclaimed, but inline caches must hold traced references and the JIT must
-   either stop baking addresses or recompile when shapes move.
+2. **Shapes as moving GC objects.** Memory is reclaimed, but caches need traced references and the JIT needs an identity
+   that survives moves.
 3. **A second, shareable description made at promotion.** The hot path is unchanged, but every object carries one more
    word, and later property additions must be kept in sync on both sides.
+4. **Shapes in a space that does not move**, still collected. This needs pinned allocation.
 
-A fourth design follows from the principles: **shapes as GC objects in a space that does not move**. Their address stays fixed, so caches and the JIT keep using it as identity, and they are still collected when unreachable. With a cross-heap attached, that space is the cross-heap itself, which never moves and is mapped at the same address in every process. paragc needs pinned allocation for this. The decision is open; it blocks stage 3 of cross-process objects in j8.
+j8 took option 2, made workable by [handles](handles.md): a shape is allocated with `alloc_handle` and its identity is
+the handle id, which does not change when the shape moves. Caches and generated code compare ids, and the compiled
+functions that hold them are GC objects too, so shapes and code die once nothing reaches them.
+
+**What is still open for sharing.** Handles exist only in private heaps, and a `Shape` has a destructor, so a promoted
+object's shape word still names an entry in the sending process's handle table. Sharing ordinary objects (stage 4)
+needs a shape that lives in the cross-heap.

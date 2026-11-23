@@ -188,11 +188,11 @@ Never moved: anything during `mutate`; anything during concurrent marking or gro
 | a hash map keyed by address | the key is stale after a move | hash the content or a stable id; if it must be the address, rehash in `relocate` (below) |
 | comparing addresses from two different `mutate`s | the same object can have two addresses | compare inside one `mutate`, or compare a stable id |
 | handing an address to C, the OS or another thread that outlives `mutate` | nobody rewrites it | copy the bytes out; a pinned space is planned (principle 1: it will still be collected) |
-| addresses baked into generated code | the code is not an edge the collector knows | keep the target out of moving spaces (j8's shapes), or make the code a traced object |''',
+| addresses baked into generated code | the code is not an edge the collector knows | refer to the target through a handle and bake its id (j8's shapes), or make the code a traced object |''',
         mv_j8_h='In j8',
         mv_j8='''- **`===` on objects** compares the NaN-boxed words. Both operands are read in the same turn, inside one `mutate`, so they agree.
 - **`Map` and `Set`** index objects by address (`MapKey::Ref`). `Collection::relocate` recomputes the key of every object entry after a move and re-inserts it. That is the "rehash in relocate" pattern above.
-- **Shapes** are compared by address in inline caches and baked into JIT code, so they live outside the moving heap today. Principle 1 rules out making them immortal; the plan is a space that does not move but is still collected.
+- **Shapes** are compared in inline caches and baked into JIT code. They are GC objects referenced through [handles](handles.md): moving a shape rewrites only its handle entry, so the id that caches and machine code compare never changes.
 - **Strings** move freely: nothing outside the heap keeps their address, and their bytes travel in the tail.''',
     ),
 }
@@ -302,11 +302,11 @@ assert_eq!(heap.mutate(|m| m.get(&root).value), 1);   // 对象还是那个对�
 | 按地址做键的哈希表 | 搬动后键就过期了 | 按内容或稳定的编号哈希；非用地址不可，就在 `relocate` 里重新哈希（见下） |
 | 比较两次不同 `mutate` 里拿到的地址 | 同一个对象可能有两个地址 | 在同一次 `mutate` 里比较，或比较稳定的编号 |
 | 把地址交给 C、操作系统，或活得比 `mutate` 久的线程 | 没有人会改写它 | 把字节复制出去；钉住空间在规划中（宗旨第 1 条：照样会被回收） |
-| 把地址写死在生成的代码里 | 那段代码不是回收器认识的边 | 让目标留在不搬的空间（j8 的 shape），或把代码做成被追踪的对象 |''',
+| 把地址写死在生成的代码里 | 那段代码不是回收器认识的边 | 经 handle 引用目标、把 id 写进代码（j8 的 shape），或把代码做成被追踪的对象 |''',
     mv_j8_h='在 j8 里',
     mv_j8='''- **对象的 `===`** 比较的是 NaN-boxing 的字。两个操作数在同一轮、同一次 `mutate` 里读出，结果一致。
 - **`Map` 和 `Set`** 按地址索引对象（`MapKey::Ref`）。`Collection::relocate` 在搬动后重算每个对象键并重新插入，就是上面说的「在 relocate 里重新哈希」。
-- **shape** 在内联缓存里按地址比较、被写死在 JIT 代码里，所以现在放在会搬的堆之外。宗旨第 1 条不允许让它们永生，计划是一个不搬家、但照样回收的空间。
+- **shape** 在内联缓存里被比较、被写死在 JIT 代码里。它们是经 [handle](handles.md) 引用的 GC 对象：shape 搬家只改写它的 handle 表项，缓存和机器码比较的 id 永远不变。
 - **字符串**随便搬：堆外没有谁记着它们的地址，它们的字节在尾巴里跟着走。''',
 )
 
