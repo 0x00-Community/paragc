@@ -14,6 +14,8 @@ cross-heaps.
 
 ## Cross-heaps
 
+- **Metadata that never dies.** The type table and pointer maps only grow, against [core principle 1](principles.md).
+
 - **Stop-the-world only.** A cross-heap has no concurrent marking, young collections, reference counting or evacuation.
   `collect` waits for every live process's mutators to leave, so a process that is alive but stuck inside `mutate`
   stalls collection. Only dead processes are skipped.
@@ -66,12 +68,10 @@ Sharing a JS value means the receiver must understand the object's layout, not j
 
 A shape that is an ordinary moving GC object would break both. The candidate designs:
 
-1. **Immortal shapes in a fixed place.** Shapes live in an append-only area inside the fixed region, never move and are
-   never freed. Caches and the JIT stay as they are, and `Arc` refcounting goes away. The cost is that shape memory only
-   grows; objects with more than 64 properties already switch to dictionary mode.
+1. ~~**Immortal shapes in a fixed place.**~~ **Rejected**: it breaks [core principle 1](principles.md), nothing is immortal.
 2. **Shapes as moving GC objects.** Memory is reclaimed, but inline caches must hold traced references and the JIT must
    either stop baking addresses or recompile when shapes move.
 3. **A second, shareable description made at promotion.** The hot path is unchanged, but every object carries one more
    word, and later property additions must be kept in sync on both sides.
 
-This decision is open; it blocks stage 3 of cross-process objects in j8.
+A fourth design follows from the principles: **shapes as GC objects in a space that does not move**. Their address stays fixed, so caches and the JIT keep using it as identity, and they are still collected when unreachable. With a cross-heap attached, that space is the cross-heap itself, which never moves and is mapped at the same address in every process. paragc needs pinned allocation for this. The decision is open; it blocks stage 3 of cross-process objects in j8.
