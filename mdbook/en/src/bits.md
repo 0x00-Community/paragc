@@ -1,102 +1,67 @@
 # Bit layouts
 
-Every word paragc and j8 put in memory, bit by bit.
+Every word paragc and j8 put in memory, drawn to scale where it helps. Widths are proportional to bits or bytes; single-bit flags are drawn wider so their labels fit.
 
 ## A private object
 
-An object is a 24-byte header, the data, and an optional tail. The total is rounded up to 8 bytes:
-`(HEADER + size_of::<T>() + tail).next_multiple_of(8)`.
+An object is a 24-byte header, the data, and an optional tail, rounded up to 8 bytes: `(HEADER + size_of::<T>() + tail).next_multiple_of(8)`. A `Gc` points at the data, not at the header.
 
-```text
-offset 0   mark   u32   bits 0–29  epoch of the last mark (0 = young; ceiling MAX_EPOCH = 2^30 − 1)
-                        bit 30     BUSY: a collector thread claimed it and is copying it
-                        bit 31     FORWARDED: moved; the new address is in the drop word
-offset 4   info   u32   bits 0–23  size in granules, header included (× 8 bytes; at most 128 MiB)
-                        bits 24–29 reference count (sticks at 63)
-                        bit 30     count parity (which generation of counts this one belongs to)
-                        bit 31     large object
-offset 8   visit  fn    traces, relocates or answers the type question (see Marking)
-offset 16  drop   fn?   destructor, or none; after a move, the forwarding address
-offset 24  data T, then the tail
-```
+<div class="dg"><div class="dg-cap">Memory of one private object</div><div class="bf ruled"><div class="k1" style="--w:4"><b>mark</b><small>4 B</small><u>0</u></div><div class="k2" style="--w:4"><b>info</b><small>4 B</small><u>4</u></div><div class="k3" style="--w:8"><b>visit</b><small>trace / relocate / ask</small><u>8</u></div><div class="k4" style="--w:8"><b>drop</b><small>destructor, or the new address after a move</small><u>16</u></div><div class="k5" style="--w:14"><b>data <code>T</code></b><small>size_of::&lt;T&gt;()</small><u>24 ▲ Gc</u></div><div class="k6 dim" style="--w:8"><b>tail</b><small>plain bytes, optional</small><u>24 + T</u><u class="end">end</u></div></div><div class="dg-note"><code>Gc</code> points here ↑ at offset 24</div></div>
 
-`mark` and `info` together are `Core`, the part blocks, lines and sweeping look at.
+<div class="dg"><div class="dg-cap"><code>mark</code> · u32 · bit 31 on the left</div><div class="bf"><div class="k7" style="--w:3"><b>FORWARDED</b><small>moved</small><i>31</i></div><div class="k3" style="--w:3"><b>BUSY</b><small>being copied</small><i>30</i></div><div class="k1" style="--w:26"><b>epoch</b><small>epoch of the last mark · 0 = young</small><i>29 … 0</i></div></div><div class="dg-note">FORWARDED and BUSY exist only during a collection that moves objects. The epoch never reaches them: MAX_EPOCH = 2³⁰ − 1.</div></div>
+
+<div class="dg"><div class="dg-cap"><code>info</code> · u32</div><div class="bf"><div class="k7" style="--w:3"><b>L</b><small>large</small><i>31</i></div><div class="k3" style="--w:3"><b>P</b><small>count parity</small><i>30</i></div><div class="k4" style="--w:6"><b>RC</b><small>reference count · sticks at 63</small><i>29 … 24</i></div><div class="k2" style="--w:20"><b>granules</b><small>size in granules · × 8 B, header included</small><i>23 … 0</i></div></div></div>
 
 ## A cross-heap object
 
-The header is 16 bytes and has no code pointers:
+The header is 16 bytes and holds no code pointer: another process may read and collect the object without linking its type. `mark` and `info` are the same two words, so blocks, lines and sweeping share their code with the private heap.
 
-```text
-offset 0   mark   u32   as above
-offset 4   info   u32   as above (so the block code is shared)
-offset 8   ty     u32   index in the heap's type table; collection follows that type's pointer map
-offset 12  stamp  u32   birth stamp: SplitMix64 of the heap's incarnation and the allocation epoch
-offset 16  data
-```
+<div class="dg"><div class="dg-cap">Memory of one cross-heap object</div><div class="bf ruled"><div class="k1" style="--w:4"><b>mark</b><small>4 B</small><u>0</u></div><div class="k2" style="--w:4"><b>info</b><small>4 B</small><u>4</u></div><div class="k3" style="--w:4"><b>ty</b><small>type-table index</small><u>8</u></div><div class="k4" style="--w:4"><b>stamp</b><small>birth stamp</small><u>12</u></div><div class="k5" style="--w:14"><b>data <code>T</code></b><small>size_of::&lt;T&gt;()</small><u>16</u></div><div class="k6 dim" style="--w:8"><b>tail</b><small>plain bytes, optional</small><u>16 + T</u><u class="end">end</u></div></div></div>
 
-When a private object is promoted, its 24-byte header is replaced by a 16-byte one, and the data and tail are copied
-unchanged.
+## Promotion swaps the header
 
-## Block metadata
+When a private object moves into a cross-heap, its 24-byte header becomes a 16-byte one. The data and the tail are copied byte for byte.
 
-For every 32 KiB block:
+<div class="dg"><div class="dg-cap"></div><div class="swap"><span>private</span><div class="bf"><div class="k1" style="--w:24"><b>Header</b><small>24 B</small></div><div class="k5" style="--w:32"><b>T</b></div><div class="k6" style="--w:16"><b>tail</b></div></div><span>cross-heap</span><div class="bf"><div class="k3" style="--w:16"><b>PHeader</b><small>16 B</small></div><div class="k5" style="--w:32"><b>T</b></div><div class="k6" style="--w:16"><b>tail</b></div><div class="dim" style="--w:8"><b></b></div></div></div></div>
 
-| Table | Size | Meaning |
-| --- | --- | --- |
-| line marks | 128 × `u32` = 512 B | epoch per 256-byte line; a line is free when its mark is older than the last finished epoch |
-| start bitmap | 4096 bits = 512 B | one bit per 8-byte granule, set at the first granule of each object |
+## A block and its metadata
 
-## Edges and words
+Every 32 KiB block has 128 lines of 256 bytes. Each line has a `u32` mark: the epoch of the last collection that found something alive in it. Allocation bumps through runs of free lines.
 
-| Thing | Layout |
-| --- | --- |
-| `Gc<'gc, T>` | one pointer to the data (after the header) |
-| `Slot<'gc, T>` | two words: the current value, and the value last counted for reference counting |
-| `WordSlot<'gc>` | two words. A value word ≥ `WORD_POINTER_MIN` (`0xFFF8 << 48`) is a pointer: top 16 bits are the user's tag (kept through moves), low 48 bits the data address. Any other word is plain data |
-| `CrossHeapSlot` | one `u64`: offset from the start of the cross-heap region, the same in every process |
-| `CrossHeapWeak` | one `u64`: high 37 bits are the offset ÷ 8 (a 1 TiB region needs 40 bits, minus 3 for alignment), low 27 bits the stamp |
-| `Signature` | 32 bytes: the weak word (8), the heap incarnation (8), the type key (16) |
+<div class="dg"><div class="dg-cap">One block: 128 lines, 16 per row</div><div class="blk"><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="old"></span><span class="old"></span><span class="old"></span><span class="old"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="old"></span><span class="old"></span><span class="old"></span><span class="old"></span><span class="old"></span><span class="old"></span><span class="old"></span><span class="old"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="old"></span><span class="old"></span><span class="old"></span><span class="old"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="free"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span><span class="live"></span></div><div class="legend"><span class="live">marked in the last finished epoch (live)</span><span class="old">older mark: free again</span><span class="free">never used</span></div></div>
+
+## Zoom into one line
+
+A line is 32 granules of 8 bytes. The **start bitmap** has one bit per granule, set at the first granule of each object; sweeping and cross-heap lookups walk it. 512 bytes of line marks plus 512 bytes of start bits per block.
+
+<div class="dg"><div class="dg-cap">One 256-byte line: objects A, B, C (6, 3 and 12 granules) and two holes</div><div class="bf exact ruled"><div class="k1" style="--w:6"><b>A</b><small>48 B</small><u>0</u></div><div class="k2" style="--w:3"><b>B</b><small>24 B</small><u>48</u></div><div class="dim" style="--w:5"><b>hole</b><small>40 B</small><u>72</u></div><div class="k3" style="--w:12"><b>C</b><small>96 B</small><u>112</u></div><div class="dim" style="--w:6"><b>hole</b><small>48 B</small><u>208</u><u class="end">256 B</u></div></div><div class="dg-sub">start bitmap: one bit per granule, set where an object begins</div><div class="gran bits"><span class="on">1</span><span class="">0</span><span class="">0</span><span class="">0</span><span class="">0</span><span class="">0</span><span class="on">1</span><span class="">0</span><span class="">0</span><span class="">0</span><span class="">0</span><span class="">0</span><span class="">0</span><span class="">0</span><span class="on">1</span><span class="">0</span><span class="">0</span><span class="">0</span><span class="">0</span><span class="">0</span><span class="">0</span><span class="">0</span><span class="">0</span><span class="">0</span><span class="">0</span><span class="">0</span><span class="">0</span><span class="">0</span><span class="">0</span><span class="">0</span><span class="">0</span><span class="">0</span></div></div>
+
+## Slots and words
+
+<div class="dg"><div class="dg-cap"><code>Slot&lt;'gc, T&gt;</code> · two words</div><div class="bf"><div class="k1" style="--w:1"><b>value</b><small>current pointer</small><i>8 B</i></div><div class="k2" style="--w:1"><b>last counted</b><small>for reference counting</small><i>8 B</i></div></div></div>
+
+<div class="dg"><div class="dg-cap">a <code>WordSlot</code> value word</div><div class="bf"><div class="k3" style="--w:16"><b>tag</b><small>≥ 0xFFF8: a pointer</small><i>63 … 48</i></div><div class="k1" style="--w:48"><b>data address</b><small>low 48 bits</small><i>47 … 0</i></div></div><div class="dg-note">Words below <code>0xFFF8 &lt;&lt; 48</code> are plain data. The tag of a pointer word is kept as is when the object moves.</div></div>
 
 ## j8's JS values
 
-A JS `Value` is one 64-bit word, NaN-boxed:
+A JS `Value` is one NaN-boxed 64-bit word. A double is stored as it is. Every other value puts `0xFFF` in the top 12 bits, the kind in the next 4, and a payload in the low 48.
 
-- a double is stored as is (NaNs are canonicalised to `0x7FF8_0000_0000_0000`);
-- every other value is `0xFFF0 << 48 | (tag + 1) << 48 | payload`.
+<div class="dg"><div class="dg-cap">a double</div><div class="bf"><div class="k7" style="--w:3"><b>S</b><small>sign</small><i>63</i></div><div class="k3" style="--w:11"><b>exp</b><small>exponent</small><i>62 … 52</i></div><div class="k2" style="--w:50"><b>fraction</b><small>fraction</small><i>51 … 0</i></div></div></div>
 
-| Top 16 bits | Kind | Payload |
-| --- | --- | --- |
-| `0xFFF1` | undefined | – |
-| `0xFFF2` | null | – |
-| `0xFFF3` | boolean | 0 or 1 |
-| `0xFFF5` | uninitialised binding (TDZ) | – |
-| `0xFFF6` | lazy value | index |
-| `0xFFF8` | string | address of a `JsStr` |
-| `0xFFF9` | symbol | address |
-| `0xFFFA` | bigint | address |
-| `0xFFFB` | object | address of an `Object` |
-| `0xFFFC` | accessor pair | address |
-| `0xFFFD` | context (closure environment) | address |
+<div class="dg"><div class="dg-cap">any other value</div><div class="bf"><div class="k7" style="--w:12"><b>0xFFF</b><i>63 … 52</i></div><div class="k4" style="--w:4"><b>kind</b><small>kind + 1</small><i>51 … 48</i></div><div class="k1" style="--w:48"><b>payload</b><small>address, index or bit</small><i>47 … 0</i></div></div></div>
 
-Every kind that points into the heap has a top half ≥ `0xFFF8`, which is exactly the range `WordSlot` treats as a
-pointer. A JS value stored in a `WordSlot` (j8's `ValueCell`) is therefore an edge the collector traces, counts and
-relocates, and the tag survives the move.
+<div class="dg"><div class="dg-cap">Top 16 bits by kind (blue: points into the heap)</div><div class="chips"><div class="chip"><b>0xFFF1</b><span>undefined</span><small>no payload</small></div><div class="chip"><b>0xFFF2</b><span>null</span><small>no payload</small></div><div class="chip"><b>0xFFF3</b><span>boolean</span><small>0 or 1</small></div><div class="chip"><b>0xFFF5</b><span>uninitialised (TDZ)</span><small>no payload</small></div><div class="chip"><b>0xFFF6</b><span>lazy value</span><small>index</small></div><div class="chip ptr"><b>0xFFF8</b><span>string</span><small>address</small></div><div class="chip ptr"><b>0xFFF9</b><span>symbol</span><small>address</small></div><div class="chip ptr"><b>0xFFFA</b><span>bigint</span><small>address</small></div><div class="chip ptr"><b>0xFFFB</b><span>object</span><small>address</small></div><div class="chip ptr"><b>0xFFFC</b><span>accessor pair</span><small>address</small></div><div class="chip ptr"><b>0xFFFD</b><span>context</span><small>address</small></div></div><div class="dg-note">Every kind that points into the heap starts at <code>0xFFF8</code>, exactly where <code>WordSlot</code> starts treating a word as a pointer. A JS value in a <code>WordSlot</code> (j8's <code>ValueCell</code>) is therefore an edge the collector traces, counts and moves, and the kind survives the move.</div></div>
+
+## Cross-heap words
+
+<div class="dg"><div class="dg-cap"><code>CrossHeapSlot</code> · u64</div><div class="bf"><div class="k1" style="--w:64"><b>offset</b><small>offset from the start of the region · the same in every process</small><i>63 … 0</i></div></div></div>
+
+<div class="dg"><div class="dg-cap"><code>CrossHeapWeak</code> · u64</div><div class="bf"><div class="k1" style="--w:37"><b>offset / 8</b><small>1 TiB region: 40 bits − 3</small><i>63 … 27</i></div><div class="k4" style="--w:27"><b>stamp</b><small>low 27 bits</small><i>26 … 0</i></div></div></div>
+
+<div class="dg"><div class="dg-cap"><code>Signature</code> · 32 bytes</div><div class="bf"><div class="k1" style="--w:8"><b>word</b><small>weak word</small><i>8 B</i></div><div class="k3" style="--w:8"><b>incarnation</b><small>heap incarnation</small><i>8 B</i></div><div class="k5" style="--w:16"><b>type key</b><small>type key</small><i>16 B</i></div></div></div>
 
 ## Example: a JS string
 
-`JsStr` is 32 bytes of fields followed by its text in the tail:
+`JsStr` is 32 bytes of fields with its text in the tail. A 40-byte ASCII string takes 96 bytes, 12 granules, in a private heap, and 88 bytes once promoted.
 
-```text
-private header 24 B
-JsStr          32 B  buf    8  none: the text is in my tail; some: a view into another string's buffer
-                     len    4  UTF-8 bytes
-                     units  4  UTF-16 code units (equal to len exactly when the text is ASCII)
-                     start  4  start in the buffer (views)
-                     cap    4  tail capacity for UTF-8 (spare room for appending)
-                     used   4  bytes of the buffer claimed so far (atomic; appending claims with a CAS)
-                     pad    4
-tail           cap B UTF-8, then (non-ASCII only) padding to 2 and units × u16 of UTF-16
-```
-
-A 40-byte ASCII string is 24 + 32 + 40 = 96 bytes = 12 granules, and the low 24 bits of `info` hold 12. Promoted into a
-cross-heap, the same string is 16 + 32 + 40 = 88 bytes.
+<div class="dg"><div class="dg-cap">"…40 ASCII bytes…" in a private heap</div><div class="bf ruled"><div class="k1" style="--w:24"><b>header</b><small>24 B</small><u>0</u></div><div class="k2" style="--w:8"><b>buf</b><small>none, or the buffer a view reads</small><u>24</u></div><div class="k2" style="--w:4"><b>len</b><small>UTF-8 bytes</small><u>32</u></div><div class="k2" style="--w:4"><b>units</b><small>UTF-16 units</small><u>36</u></div><div class="k2" style="--w:4"><b>start</b><small>view start</small><u>40</u></div><div class="k2" style="--w:4"><b>cap</b><small>room to append</small><u>44</u></div><div class="k2" style="--w:4"><b>used</b><small>claimed, atomic</small><u>48</u></div><div class="dim" style="--w:4"><b>pad</b><u>52</u></div><div class="k6" style="--w:40"><b>text</b><small>40 B UTF-8</small><u>56</u><u class="end">96</u></div></div><div class="dg-note">A non-ASCII string continues the tail with padding to 2 and its UTF-16 code units.</div></div>

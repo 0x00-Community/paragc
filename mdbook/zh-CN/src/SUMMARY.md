@@ -21,6 +21,7 @@
 
 - [块、行与对象头](layout.md)
 - [比特布局](bits.md)
+- [对象地址为什么会变](moving.md)
 - [分配](allocation.md)
 - [标记与线程池](marking.md)
 - [清扫](sweeping.md)

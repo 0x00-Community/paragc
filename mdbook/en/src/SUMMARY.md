@@ -21,6 +21,7 @@
 
 - [Blocks, lines and headers](layout.md)
 - [Bit layouts](bits.md)
+- [Why object addresses change](moving.md)
 - [Allocation](allocation.md)
 - [Marking and the thread pool](marking.md)
 - [Sweeping](sweeping.md)
