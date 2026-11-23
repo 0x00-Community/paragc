@@ -13,6 +13,7 @@
 # 入门
 
 - [paragc 是什么](intro.md)
+- [核心宗旨](principles.md)
 - [快速上手](quickstart.md)
 - [句柄与品牌](handles.md)
 

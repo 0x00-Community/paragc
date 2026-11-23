@@ -13,6 +13,7 @@
 # Getting started
 
 - [What paragc is](intro.md)
+- [Core principles](principles.md)
 - [Quick start](quickstart.md)
 - [Handles and brands](handles.md)
 
