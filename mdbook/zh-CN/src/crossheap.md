@@ -19,7 +19,7 @@ paragc = { version = "0.6", features = ["crossheap"] }
 
 | 从 → 到 | 私有堆 | 跨堆 |
 | --- | --- | --- |
-| 私有堆 | ✓ 直接指针（堆之间用 `Far`） | ✓ `CrossHeapRoot`，晋升后是绝对地址 |
+| 私有堆 | ✓ 直接指针（堆之间用 `Far`） | ✓ `CrossHeapGlobal`，晋升后是绝对地址 |
 | 跨堆 | ✗（别的进程看不到私有内存） | ✓ `CrossHeapSlot`、`CrossHeapRef`、`CrossHeapWeak` |
 
 跨堆里没有东西指向私有堆，所以私有堆和跨堆之间不会成环。
@@ -29,7 +29,7 @@ paragc = { version = "0.6", features = ["crossheap"] }
 | 部分 | 页面 |
 | --- | --- |
 | 堆映射在哪；文件布局；文件怎么长、怎么缩 | [地址空间与文件布局](crossheap-layout.md) |
-| 不带代码的对象：`#[derive(Shared)]`、类型号、指针图、句柄 | [对象、类型与指针图](crossheap-objects.md) |
+| 不带代码的对象：`#[derive(Shared)]`、类型号、指针图、Handle | [对象、类型与指针图](crossheap-objects.md) |
 | 几个进程共用一个堆；随时可能死；堆号、主人、重启 | [进程、崩溃与寿命](crossheap-processes.md) |
 | 不拖住任何人的引用；别的进程能解析的签名；请主人代办的信箱 | [弱引用、签名与信箱](crossheap-weak.md) |
 | 把跨堆当私有堆的老年代 | [晋升](promotion.md) |

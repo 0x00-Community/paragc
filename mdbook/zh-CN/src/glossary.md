@@ -6,11 +6,12 @@
 | 行（line） | 块内 256 B 的复用单位 |
 | 粒（granule） | 8 B，分配对齐 |
 | 纪元（epoch） | 回收写进标记字和行标记的编号；从不清零 |
-| mutate | `Heap::mutate`，线程在其中可以分配、使用 `Gc` 句柄的一次调用 |
-| 品牌（brand） | 把 `Gc` 绑在一次 `mutate` 上的 `'gc` 生命周期；也指把它映射回来的 `brand!` 类型 |
-| 根（root） | `Root<B>`，不带生命周期、让对象存活的句柄 |
+| scope | `Heap::scope`，线程在其中可以分配、使用 `ScopeLocal` Handle 的一次调用 |
+| Brand | `'heap`（或 `'xheap`），把一个堆的所有东西绑在一起的生命周期；也指把 `'heap`、`'scope` 映射回存储类型的 `brand!` 类型 |
+| scope | 在一个堆上的一段工作；scope 可以嵌套，独占的 scope 可以在内部回收（[Scope 与生命周期](scopes.md)） |
+| 根（root） | `ScopeGlobal<'heap, 'heap, B>`，不带生命周期、让对象存活的 Handle |
 | 入口（entry） | 为来自堆外的引用（`Far`、跨堆入口）领的根表槽 |
-| handle | `Handle<'gc, T>`，指向 handle 表某一项的引用；对象搬家只改写表项，handle 本身不变 |
+| Handle | `Handle<'heap, 'scope, T>`，指向 Handle 表某一项的引用；对象搬家只改写表项，Handle 本身不变 |
 | tlab | 线程本地分配缓冲 |
 | 溢出游标 | 放不进当前这段的中等对象用的第二个分配游标 |
 | 黑分配 | 并发标记期间新对象直接拿到标记纪元 |

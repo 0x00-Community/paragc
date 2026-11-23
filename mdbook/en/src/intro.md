@@ -10,8 +10,8 @@ paragc is **a tracing garbage collector for Rust programs that share one heap ac
 
 | | |
 | --- | --- |
-| Many mutators | `Heap::mutate(&self)` runs on any number of threads at once. Each thread allocates from its own buffer (`Tlab`) and claims whole blocks with one atomic operation. |
-| Exclusive by borrowing | `Heap::collect(&mut self)` cannot overlap a `mutate`, because the borrow checker forbids it. That borrow is the stop-the-world: there is no safepoint protocol and no lock. |
+| Many mutators | `Heap::scope(&self)` runs on any number of threads at once. Each thread allocates from its own buffer (`Tlab`) and claims whole blocks with one atomic operation. |
+| Exclusive by borrowing | A collection takes `&mut` the heap or an exclusive scope, and every `ScopeLocal` is a borrow of its scope, so none survives it: the borrow checker forbids it. That borrow is the stop-the-world: there is no safepoint protocol and no lock. |
 | Concurrent marking | `Heap::mark_concurrently(&self)` marks while mutators keep running. A snapshot-at-the-beginning barrier on `Slot` writes keeps it correct, and new objects are allocated black. |
 | Concurrent sweeping | `Heap::finish_marking` only finishes marking. Mutators sweep a block themselves when they need one, and `sweep_concurrently` sweeps the rest on the pool. |
 | Evacuation | A stop-the-world collection copies live objects out of sparse blocks while it marks (Immix defragmentation). |
@@ -33,7 +33,7 @@ paragc is the heap of the [j8](https://github.com/0x00-Community/j8) JavaScript 
 ## What it is not
 
 - **Not a conservative collector.** paragc does not scan stacks. Every object that must survive a collection is
-  reachable from a `Root`. Inside a `mutate`, `Gc` handles are safe because no collection can run.
+  reachable from a `ScopeGlobal`. A `ScopeLocal` is safe because the borrow checker ends it before any collection of its scope; `ScopeGlobal`s are rewritten instead.
 - **Not `no_std`.** It needs threads, `mmap` and atomics from `std`.
 - **Not a drop-in `Rc` replacement.** Objects are reached through branded handles. Types implement `Trace` (usually
-  with `#[derive(Trace)]`), and a type with `Gc` fields must not implement `Drop`.
+  with `#[derive(Trace)]`), and a type with `ScopeLocal` fields must not implement `Drop`.

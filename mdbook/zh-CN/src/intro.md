@@ -10,8 +10,8 @@ paragc 是**给多个线程共用一个堆的 Rust 程序用的追踪式垃圾�
 
 | | |
 | --- | --- |
-| 多个 mutator | `Heap::mutate(&self)` 可以同时在任意多个线程上跑。每个线程从自己的缓冲（`Tlab`）分配，用一次原子操作领整块。 |
-| 靠借用互斥 | `Heap::collect(&mut self)` 不可能和 `mutate` 重叠，借用检查器不允许。这个借用就是全停：没有安全点协议，也没有锁。 |
+| 多个 mutator | `Heap::scope_shared(&self)` 可以同时在任意多个线程上跑。每个线程从自己的缓冲（`Tlab`）分配，用一次原子操作领整块。 |
+| 靠借用互斥 | 回收要 `&mut` 堆或某个独占 scope，而每个 `ScopeLocal` 都是对自己 scope 的借用，所以没有一个能活过回收：借用检查器不允许。这个借用就是全停：没有安全点协议，也没有锁。 |
 | 并发标记 | `Heap::mark_concurrently(&self)` 在 mutator 继续跑的同时标记。`Slot` 写入上的「开始时快照」屏障保证正确，新对象直接分配成黑色。 |
 | 并发清扫 | `Heap::finish_marking` 只把标记收尾。mutator 需要块时自己清扫一块，`sweep_concurrently` 在线程池上清扫剩下的。 |
 | 疏散 | 全停回收在标记的同时把活对象从稀疏的块里搬出去（Immix 的碎片整理）。 |
@@ -31,8 +31,8 @@ paragc 是 [j8](https://github.com/0x00-Community/j8) JavaScript 引擎的堆。
 
 ## 它不是什么
 
-- **不是保守式回收器。** paragc 不扫栈。回收后要活下来的对象，都必须能从某个 `Root` 走到。在 `mutate` 里用 `Gc` 句柄是
-  安全的，因为这期间不会有回收。
+- **不是保守式回收器。** paragc 不扫栈。回收后要活下来的对象，都必须能从某个 `ScopeGlobal` 走到。`ScopeLocal` 是
+  安全的，因为借用检查器会在它所属 scope 的任何一次回收之前让它失效；`ScopeGlobal` 则由回收改写。
 - **不是 `no_std`。** 它需要 `std` 的线程、`mmap` 和原子操作。
-- **不是 `Rc` 的直接替代品。** 对象通过带品牌的句柄访问。类型要实现 `Trace`（通常用 `#[derive(Trace)]`），带 `Gc` 字段的
+- **不是 `Rc` 的直接替代品。** 对象通过带Brand的Handle访问。类型要实现 `Trace`（通常用 `#[derive(Trace)]`），带 `ScopeLocal` 字段的
   类型不能实现 `Drop`。

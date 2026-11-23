@@ -878,7 +878,7 @@ pub struct Super {
     pub window: AtomicU64,
     /// Heap number = window number
     pub heap: AtomicU64,
-    /// Collection request (a futex word): 0 = nobody is collecting, otherwise the collector's attachment slot + 1; while non-zero new mutates wait first
+    /// Collection request (a futex word): 0 = nobody is collecting, otherwise the collector's attachment slot + 1; while non-zero new scopes wait first
     pub request: AtomicU32,
     /// The epoch of the most recently started collection (written when it starts): if the collector is killed, the one taking over marks from scratch with a newer epoch
     pub marking: AtomicU32,
@@ -962,7 +962,7 @@ impl Super {
 pub struct Attachment {
     /// pid; 0 = free slot
     pub pid: AtomicU32,
-    /// Threads of this attachment inside a mutate (a futex word: the collector waits for it to reach zero)
+    /// Threads of this attachment inside a scope (a futex word: the collector waits for it to reach zero)
     pub inside: AtomicU32,
     /// Process start time (see [`crate::shm::Process`]); 0 = still registering
     pub start: AtomicU64,

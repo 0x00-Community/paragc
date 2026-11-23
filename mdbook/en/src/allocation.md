@@ -2,7 +2,7 @@
 
 ## The thread-local buffer
 
-Each thread in a `mutate` allocates through a `Tlab`: a cursor and a limit inside one block. An allocation that fits
+Each thread in a `scope` allocates through a `Tlab`: a cursor and a limit inside one block. An allocation that fits
 bumps the cursor and writes the header; nothing else is shared.
 
 When the current run of free lines is too small, the buffer tries, in order:
@@ -37,7 +37,7 @@ end of marking.
 
 ## Allocating with a tail
 
-`Mutator::alloc_tail(value, tail, fill)` allocates an object followed by `tail` bytes of plain data:
+`Scope::alloc_tail(value, tail, fill)` allocates an object followed by `tail` bytes of plain data:
 
 - the tail starts right after `T` (at `size_of::<T>()` from the data pointer), and `fill` writes all of it before the
   object can be reached;

@@ -15,7 +15,8 @@
 - [paragc 是什么](intro.md)
 - [核心宗旨](principles.md)
 - [快速上手](quickstart.md)
-- [句柄与品牌](handles.md)
+- [Handle 与 Brand](handles.md)
+- [Scope 与生命周期](scopes.md)
 
 # 私有堆
 

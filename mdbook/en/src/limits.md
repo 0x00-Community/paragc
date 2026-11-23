@@ -5,7 +5,7 @@ cross-heaps.
 
 ## The private heap
 
-- **No stack scanning.** Every object that must survive a collection is reachable from a `Root`, `Far` or entry.
+- **No stack scanning.** Every object that must survive a collection is reachable from a `ScopeGlobal`, `Far` or entry.
 - **128 MiB per object.** The header stores the size in 24 bits of granules.
 - **`Slot` is two words**: the value and the value last counted for reference counting.
 - **Concurrent young collections do not exist.** A young collection is a pause, short as it is.
@@ -17,7 +17,7 @@ cross-heaps.
 - **Metadata that never dies.** The type table and pointer maps only grow, against [core principle 1](principles.md).
 
 - **Stop-the-world only.** A cross-heap has no concurrent marking, young collections, reference counting or evacuation.
-  `collect` waits for every live process's mutators to leave, so a process that is alive but stuck inside `mutate`
+  `collect` waits for every live process's mutators to leave, so a process that is alive but stuck inside `scope`
   stalls collection. Only dead processes are skipped.
 - **No compaction.** Cross-heap objects never move, so fragmentation is only reduced by reusing lines and punching empty
   blocks.

@@ -25,16 +25,16 @@ heap.attach_cross_heap(&cross)?;
 ```rust
 #[repr(C)]
 #[derive(Trace, Shared)]
-struct Node<'gc> {
+struct Node<'heap, 'scope> {
     value: u64,
-    next: Slot<'gc, Node<'gc>>,
+    next: Slot<'heap, 'scope, Node<'heap, 'scope>>,
 }
 
-heap.mutate(|m| m.alloc_shared(Node { value: 1, next: None.into() }));
+heap.scope(|m| m.alloc_shared(Node { value: 1, next: None.into() }));
 ```
 
-`Mutator::alloc_shared` (and `alloc_shared_tail`) takes a type that is both `Trace` and `Shared`, without `Drop`. Its
-`Gc`, `Option<Gc>`, `Slot` and `WordSlot` fields are recorded in the pointer map as absolute-address edges (`WORD_EDGE`,
+`Scope::alloc_shared` (and `alloc_shared_tail`) takes a type that is both `Trace` and `Shared`, without `Drop`. Its
+`ScopeLocal`, `Option<ScopeLocal>`, `Slot` and `WordSlot` fields are recorded in the pointer map as absolute-address edges (`WORD_EDGE`,
 `PTR_EDGE`).
 
 ## What a young collection does
@@ -80,7 +80,7 @@ empty. The next young collection promotes `fresh` and rewrites the slot through 
 ## Handing an object to another process
 
 ```rust
-let sig = heap.mutate(|m| cross.mutate(|cm| cm.sign_promoted(m.get(&root))));
+let sig = heap.scope(|m| cross.scope(|cm| cm.sign_promoted(m.scope_in(&root))));
 ```
 
 `sign_promoted` returns `None` for an object that is still private. A signature keeps nothing alive. If the owner drops

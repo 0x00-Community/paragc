@@ -10,7 +10,7 @@ Every mapping takes one of 32 slots in the superblock page (at offset 1024). A s
 - the process id;
 - the process start time, read from `/proc/<pid>/stat`. A reused pid is never mistaken for the old process, and
   zombies count as dead;
-- the number of its threads inside `mutate`;
+- the number of its threads inside `scope`;
 - the number of its threads waiting at the door.
 
 ## The handshake
@@ -50,12 +50,12 @@ A cross-heap belongs to the process that created it. The superblock records the 
 
 - When the owner exits or is killed, the heap dies with it unless `CrossHeap::persist` was called. Whoever notices first
   marks it dead and deletes the file and its marker. Memory goes back once every mapping is dropped.
-- Other processes see `is_alive() == false`, and `try_mutate` returns `HeapDead`. Their handles stay safe to use and to
+- Other processes see `is_alive() == false`, and `try_scope` returns `HeapDead`. Their handles stay safe to use and to
   drop.
 - A `CrossHeapRef` stores its target heap's incarnation. Once a dead heap's number is reused, the reference reads `None`
   and collections do not follow it.
-- `CrossHeapRoot::persist` makes a root that belongs to no process. It is found again by entry number and returned with
-  `CrossHeapMutator::release`.
+- `CrossHeapGlobal::persist` makes a root that belongs to no process. It is found again by entry number and returned with
+  `CrossHeapScope::release`.
 
 ## Heap numbers
 

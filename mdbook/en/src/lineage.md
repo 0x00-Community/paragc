@@ -7,9 +7,9 @@ paragc to where it comes from; the rest of the book explains each part in detail
 
 | Idea | Origin | In paragc |
 | --- | --- | --- |
-| Tracing from roots | McCarthy, 1960 | every collection marks from `Root`s, entries and remembered slots |
+| Tracing from roots | McCarthy, 1960 | every collection marks from `ScopeGlobal`s, entries and remembered slots |
 | Tri-color marking, SATB barrier | Dijkstra et al. 1978; Yuasa 1990 | concurrent marking with a deletion barrier on `Slot` writes and black allocation ([Concurrent](concurrent.md)) |
-| Bump allocation in thread-local buffers | copying collectors; JVM TLABs | `Tlab`, one per thread in `mutate` ([Allocation](allocation.md)) |
+| Bump allocation in thread-local buffers | copying collectors; JVM TLABs | `Tlab`, one per thread in `scope` ([Allocation](allocation.md)) |
 | Mark-region heap: blocks and lines | Immix, 2008 | 32 KiB blocks, 256 B lines, overflow allocation ([Layout](layout.md)) |
 | Opportunistic evacuation | Immix | sparse blocks copied while marking ([Evacuation](evacuation.md)) |
 | Generations, remembered sets | Lieberman & Hewitt; Ungar | sticky-mark young collections, slot logging ([Young collections](young.md)) |
@@ -23,8 +23,8 @@ paragc to where it comes from; the rest of the book explains each part in detail
 **The borrow checker as the stop-the-world.** JVMs need safepoints and stack maps. cppgc needs conservative stack
 scanning. paragc needs neither:
 
-- a `Gc<'gc, T>` cannot leave the `mutate` call it came from, so outside `mutate` no unregistered pointer exists;
-- a stop-the-world collection takes `&mut Heap`, so the compiler proves no `mutate` is running.
+- a `ScopeLocal<'heap, 'scope, T>` is a borrow of the scope it came from, so no unregistered pointer outlives it;
+- a stop-the-world collection takes `&mut` the heap or an exclusive scope, so the compiler proves no direct pointer is alive across it.
 
 That is why paragc can **move** objects (evacuation, young copying) without read barriers and without conservative
 pinning, as a plain library.

@@ -16,10 +16,10 @@ paragc 不拿锁，回收里也不拿。共享状态的变化全靠原子操作�
 | 文件 | 内容 |
 | --- | --- |
 | `layout.rs` | 块、行、对象头、跨堆窗口布局与超级块 |
-| `heap.rs` | `Heap`、`Mutator`、`Tlab`、各种回收、`CrossHeap`、`CrossHeapMutator`、晋升 |
+| `heap.rs` | `Heap`、`Scope`、`Tlab`、各种回收、`CrossHeap`、`CrossHeapScope`、晋升 |
 | `mark.rs` | `Tracer`、工作窃取工人组、复制器、跨堆标记器 |
 | `sweep.rs` | 清扫与大对象 |
-| `handle.rs` | `Gc`、`Slot`、`WordSlot`、`Root`、`Weak`、`Far`、跨堆句柄、`Signature`、`Shared` |
+| `handle.rs` | `ScopeLocal`、`Slot`、`WordSlot`、`ScopeGlobal`、`Weak`、`Far`、跨堆 Handle、`Signature`、`Shared` |
 | `shm.rs` | 跨堆地址区、窗口、堆号、进程死活（Linux） |
 | `sync.rs` | 无锁构件与 futex 等待 |
 

@@ -8,9 +8,9 @@ With concurrent marking, the only pauses are a short handshake at the start and 
 
 1. finishes the previous sweep. The sweep judges objects by "mark ≠ that epoch", so it must end before marking stamps
    live objects with a newer epoch;
-2. raises the request bit in the gate word. The top bit is the request; the low bits count threads inside `mutate`;
+2. raises the request bit in the gate word. The top bit is the request; the low bits count threads inside `scope`;
 3. waits until no mutator is inside. paragc does not scan stacks, so the snapshot must be taken while no mutator holds
-   an unrooted `Gc`;
+   an unrooted `ScopeLocal`;
 4. marks the roots grey and drops the request.
 
 Marking then runs on the pool while mutators continue.
@@ -45,5 +45,5 @@ Counts are trusted again as soon as the finish returns.
 ## Limits
 
 - Concurrent marking never moves objects, so mutators need no read barrier for moved objects.
-- Never call `mark_concurrently` from inside a `mutate` on the same heap: it would wait for itself to leave.
+- Never call `mark_concurrently` from inside a `scope` on the same heap: it would wait for itself to leave.
 - While a cross-heap is attached, concurrent marking is not supported.

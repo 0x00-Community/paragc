@@ -20,8 +20,8 @@ cross_heap_brand!(NodeB = for<'p> Node<'p>);
 
 - `#[repr(C)]` is required, so the layout agrees across processes and binaries.
 - Fields may be plain data, `CrossHeapSlot`, `CrossHeapRef`, `CrossHeapWeak`, nested `Shared` types and fixed-size
-  arrays. Promotion adds absolute-address edges: `Gc`, `Option<Gc>`, `Slot`, `WordSlot`.
-- No destructor: `CrossHeapMutator::alloc` checks it at compile time.
+  arrays. Promotion adds absolute-address edges: `ScopeLocal`, `Option<ScopeLocal>`, `Slot`, `WordSlot`.
+- No destructor: `CrossHeapScope::alloc` checks it at compile time.
 - The derive generates a **pointer map**: the offset of every pointer field, through nested types and arrays.
 
 ## The type table
@@ -49,13 +49,13 @@ Collection follows the pointer map of the type number; it never calls code.
 
 | Handle | Valid | Stores |
 | --- | --- | --- |
-| `CrossHeapGc<'p, T>` | inside one `CrossHeap::mutate` | an absolute address in this mapping |
+| `CrossHeapLocal<'p, T>` | inside one `CrossHeap::scope` | an absolute address in this mapping |
 | `CrossHeapSlot<'p, T>` | field of a cross-heap object | an offset from the region start, the same in every mapping |
-| `CrossHeapRoot<B>` | anywhere; in private heaps too | an entry number; holds the object alive |
+| `CrossHeapGlobal<B>` | anywhere; in private heaps too | an entry number; holds the object alive |
 | `CrossHeapRef<'a, B>` | field of an object in heap A, pointing into heap B | the target's offset and B's incarnation; registers an entry in B |
 | `CrossHeapWeak<B>` | anywhere | one word: offset and stamp; holds nothing |
 
-`get` and `set` on a `CrossHeapSlot` take the `CrossHeapMutator`, which knows this mapping's base address.
+`get` and `set` on a `CrossHeapSlot` take the `CrossHeapScope`, which knows this mapping's base address.
 
 ## Entries
 
@@ -65,7 +65,7 @@ The entry table is the cross-heap's root set. Each entry records the target's of
 - `HEAP_HOLDER | k`, meaning another cross-heap;
 - 0, meaning nobody: a persistent root.
 
-`CrossHeapRoot::index` is the entry number, valid in every mapping. `CrossHeapMutator::find` turns an entry number back
+`CrossHeapGlobal::index` is the entry number, valid in every mapping. `CrossHeapScope::find` turns an entry number back
 into a handle after checking the type key; this is how another process picks up an object handed to it.
 
 ## Large objects

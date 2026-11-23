@@ -73,3 +73,17 @@
 .bf u.end { left: auto; right: -1px; border-left: 0; border-right: 1px solid currentColor; padding: 0 0.25em 0 0; }
 .bf.exact > div { min-width: 0; }
 .dg-sub { font-size: 0.85em; opacity: 0.75; margin: 0.4em 0 0.3em; }
+
+/* Nested scopes: each scope a box with its values inside */
+.nest { border: 1px solid var(--table-border-color); border-radius: 10px; padding: 0.55em 0.8em 0.75em; margin-top: 0.55em; }
+.dg > .nest { margin-top: 0; }
+.nest > .label { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.6em; margin-bottom: 0.3em; }
+.nest > .label b { font-family: var(--mono-font, monospace); }
+.nest > .label small { opacity: 0.7; }
+.vals { display: flex; flex-wrap: wrap; gap: 0.35em; margin: 0.25em 0; }
+.val { font-family: var(--mono-font, monospace); font-size: 0.82em; padding: 0.12em 0.5em; border-radius: 4px; border: 1px solid var(--table-border-color); }
+.val.local { background: rgba(59, 130, 246, 0.18); }
+.val.global { background: rgba(16, 185, 129, 0.2); }
+.val.dead { text-decoration: line-through; opacity: 0.45; }
+.legend .local::before { background: rgba(59, 130, 246, 0.18); }
+.legend .global::before { background: rgba(16, 185, 129, 0.2); }

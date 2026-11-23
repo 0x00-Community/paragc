@@ -4,9 +4,9 @@ Every word paragc and j8 put in memory, drawn to scale where it helps. Widths ar
 
 ## A private object
 
-An object is a 24-byte header, the data, and an optional tail, rounded up to 8 bytes: `(HEADER + size_of::<T>() + tail).next_multiple_of(8)`. A `Gc` points at the data, not at the header.
+An object is a 24-byte header, the data, and an optional tail, rounded up to 8 bytes: `(HEADER + size_of::<T>() + tail).next_multiple_of(8)`. A `ScopeLocal` points at the data, not at the header.
 
-<div class="dg"><div class="dg-cap">Memory of one private object</div><div class="bf ruled"><div class="k1" style="--w:4"><b>mark</b><small>4 B</small><u>0</u></div><div class="k2" style="--w:4"><b>info</b><small>4 B</small><u>4</u></div><div class="k3" style="--w:8"><b>visit</b><small>trace / relocate / ask</small><u>8</u></div><div class="k4" style="--w:8"><b>drop</b><small>destructor, or the new address after a move</small><u>16</u></div><div class="k5" style="--w:14"><b>data <code>T</code></b><small>size_of::&lt;T&gt;()</small><u>24 ▲ Gc</u></div><div class="k6 dim" style="--w:8"><b>tail</b><small>plain bytes, optional</small><u>24 + T</u><u class="end">end</u></div></div><div class="dg-note"><code>Gc</code> points here ↑ at offset 24</div></div>
+<div class="dg"><div class="dg-cap">Memory of one private object</div><div class="bf ruled"><div class="k1" style="--w:4"><b>mark</b><small>4 B</small><u>0</u></div><div class="k2" style="--w:4"><b>info</b><small>4 B</small><u>4</u></div><div class="k3" style="--w:8"><b>visit</b><small>trace / relocate / ask</small><u>8</u></div><div class="k4" style="--w:8"><b>drop</b><small>destructor, or the new address after a move</small><u>16</u></div><div class="k5" style="--w:14"><b>data <code>T</code></b><small>size_of::&lt;T&gt;()</small><u>24 ▲ ScopeLocal</u></div><div class="k6 dim" style="--w:8"><b>tail</b><small>plain bytes, optional</small><u>24 + T</u><u class="end">end</u></div></div><div class="dg-note"><code>ScopeLocal</code> points here ↑ at offset 24</div></div>
 
 <div class="dg"><div class="dg-cap"><code>mark</code> · u32 · bit 31 on the left</div><div class="bf"><div class="k7" style="--w:3"><b>FORWARDED</b><small>moved</small><i>31</i></div><div class="k3" style="--w:3"><b>BUSY</b><small>being copied</small><i>30</i></div><div class="k1" style="--w:26"><b>epoch</b><small>epoch of the last mark · 0 = young</small><i>29 … 0</i></div></div><div class="dg-note">FORWARDED and BUSY exist only during a collection that moves objects. The epoch never reaches them: MAX_EPOCH = 2³⁰ − 1.</div></div>
 
@@ -38,7 +38,7 @@ A line is 32 granules of 8 bytes. The **start bitmap** has one bit per granule, 
 
 ## Slots and words
 
-<div class="dg"><div class="dg-cap"><code>Slot&lt;'gc, T&gt;</code> · two words</div><div class="bf"><div class="k1" style="--w:1"><b>value</b><small>current pointer</small><i>8 B</i></div><div class="k2" style="--w:1"><b>last counted</b><small>for reference counting</small><i>8 B</i></div></div></div>
+<div class="dg"><div class="dg-cap"><code>Slot&lt;'scope, T&gt;</code> · two words</div><div class="bf"><div class="k1" style="--w:1"><b>value</b><small>current pointer</small><i>8 B</i></div><div class="k2" style="--w:1"><b>last counted</b><small>for reference counting</small><i>8 B</i></div></div></div>
 
 <div class="dg"><div class="dg-cap">a <code>WordSlot</code> value word</div><div class="bf"><div class="k3" style="--w:16"><b>tag</b><small>≥ 0xFFF8: a pointer</small><i>63 … 48</i></div><div class="k1" style="--w:48"><b>data address</b><small>low 48 bits</small><i>47 … 0</i></div></div><div class="dg-note">Words below <code>0xFFF8 &lt;&lt; 48</code> are plain data. The tag of a pointer word is kept as is when the object moves.</div></div>
 

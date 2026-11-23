@@ -7,11 +7,30 @@
 | `tests/gc.rs` | 私有堆：存活、析构计数、多线程、大对象、深结构、并发标记与清扫、疏散、年轻回收、引用计数、收缩、串行析构 |
 | `tests/weak.rs` | 各种回收下的弱引用、并发标记期间的读屏障 |
 | `tests/word.rs` | `WordSlot` 经历完整、年轻、并发回收 |
+| `tests/handle.rs` | Handle：各种年轻回收模式下对象在它下面搬动、老对象不经屏障持有、表项重用、并发标记、id 变回 Handle |
+| `tests/scope.rs` | 嵌套 scope：在 scope 里回收、在两个小 scope 之间把对象带出去 |
 | `tests/far.rs` | `Far`、入口不搬、一起回收、私有堆之间的环 |
 | `tests/cross_heap.rs` | 单进程里的跨堆：指针图、大对象、映射两次、`CrossHeapRef`、一起回收、弱引用、签名、信箱、收缩、晋升、尾巴（需要 `--features crossheap`） |
 | `tests/processes.rs` | 多个进程共用一个堆：杀 mutator、杀回收方、随机杀、重启、堆号、8 个进程杀一半（需要 `--features crossheap`） |
 
-README 的验证表列了每一条测试和它检查什么。
+README 的验证表列了每一条测试和它检查什么。`Scope` 上的两个 `compile_fail` 文档测试检查借用规则：回收之后还用
+`ScopeLocal`，以及把一个堆的对象写进另一个堆。
+
+## 结果（0.7.0）
+
+| 文件 | 测试数 | 结果 |
+| --- | ---: | --- |
+| `gc.rs` | 26 | 通过 |
+| `weak.rs` | 8 | 通过 |
+| `far.rs` | 7 | 通过 |
+| `word.rs` | 5 | 通过 |
+| `handle.rs` | 5 | 通过 |
+| `scope.rs` | 2 | 通过 |
+| `cross_heap.rs` | 18 | 通过 |
+| `processes.rs` | 9 | 通过 |
+| 文档测试（README 示例、两个 `compile_fail`） | 3 | 通过 |
+
+开不开 `crossheap`，clippy 都没有警告。
 
 ## 怎么跑
 

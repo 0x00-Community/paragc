@@ -3,17 +3,17 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use paragc::{Gc, Heap, Root, Slot, Trace, Tracer, YoungEvacuation, brand};
+use paragc::{ScopeLocal, Heap, ScopeGlobal, Slot, Trace, Tracer, YoungEvacuation, brand};
 
 #[derive(Trace)]
-struct Node<'gc> {
+struct Node<'heap, 'scope> {
     value: u64,
-    next: Option<Gc<'gc, Node<'gc>>>,
+    next: Option<ScopeLocal<'heap, 'scope, Node<'heap, 'scope>>>,
 }
 
-brand!(NodeB = for<'gc> Node<'gc>);
+brand!(NodeB = for<'heap, 'scope> Node<'heap, 'scope>);
 
-/// Counts on drop (no Gc, so it may have Drop).
+/// Counts on drop (no ScopeLocal, so it may have Drop).
 struct Counted(Arc<AtomicUsize>);
 
 impl Drop for Counted {
@@ -22,39 +22,39 @@ impl Drop for Counted {
     }
 }
 
-// SAFETY: no Gc
+// SAFETY: no ScopeLocal
 unsafe impl Trace for Counted {
     const NO_EDGES: bool = true;
     fn trace(&self, _: &mut Tracer<'_>) {}
 }
 
 #[derive(Trace)]
-enum Tree<'gc> {
+enum Tree<'heap, 'scope> {
     Leaf(Counted),
-    Branch { left: Slot<'gc, Tree<'gc>>, right: Slot<'gc, Tree<'gc>> },
+    Branch { left: Slot<'heap, 'scope, Tree<'heap, 'scope>>, right: Slot<'heap, 'scope, Tree<'heap, 'scope>> },
 }
 
-brand!(TreeB = for<'gc> Tree<'gc>);
+brand!(TreeB = for<'heap, 'scope> Tree<'heap, 'scope>);
 
 /// Collector threads per heap; under Miri the idle workers' backoff spinning costs a lot of interpretation time, so 2 (still parallel marking and a thread pool)
 const THREADS: NonZeroUsize = NonZeroUsize::new(if cfg!(miri) { 2 } else { 4 }).unwrap();
 /// Smaller sizes under Miri (each test must still finish within 15 s)
 const LIST_LEN: u64 = if cfg!(miri) { 200 } else { 20_000 };
 
-fn build_list(heap: &Heap, len: u64) -> Root<NodeB> {
-    heap.mutate(|m| {
+fn build_list<'h>(heap: &Heap<'h>, len: u64) -> ScopeGlobal<'h, 'h, NodeB> {
+    heap.scope_shared(|m| {
         let mut top = None;
         for value in 0..len {
             top = Some(m.alloc(Node { value, next: top }));
         }
-        m.root(top.expect("len > 0"))
+        m.global(top.expect("len > 0"))
     })
 }
 
-fn sum_list(heap: &Heap, root: &Root<NodeB>) -> u64 {
-    heap.mutate(|m| {
+fn sum_list<'h>(heap: &Heap<'h>, root: &ScopeGlobal<'h, 'h, NodeB>) -> u64 {
+    heap.scope_shared(|m| {
         let mut sum = 0;
-        let mut cur = Some(m.get(root));
+        let mut cur = Some(m.scope_in(root));
         while let Some(n) = cur {
             sum += n.value;
             cur = n.next;
@@ -65,10 +65,10 @@ fn sum_list(heap: &Heap, root: &Root<NodeB>) -> u64 {
 
 #[test]
 fn rooted_list_survives() {
-    let mut heap = Heap::new(THREADS);
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
     let root = build_list(&heap, LIST_LEN);
     // Garbage: not rooted
-    heap.mutate(|m| {
+    heap.scope_shared(|m| {
         for value in 0..LIST_LEN {
             m.alloc(Node { value, next: None });
         }
@@ -81,14 +81,14 @@ fn rooted_list_survives() {
 #[test]
 fn garbage_is_finalized() {
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new(THREADS);
-    let kept: Root<TreeB> = heap.mutate(|m| {
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
+    let kept: ScopeGlobal<'_, '_, TreeB> = heap.scope_shared(|m| {
         let leaf = || Slot::from(m.alloc(Tree::Leaf(Counted(drops.clone()))));
         let keep = m.alloc(Tree::Branch { left: leaf(), right: leaf() });
         for _ in 0..1000 {
             m.alloc(Tree::Branch { left: leaf(), right: leaf() });
         }
-        m.root(keep)
+        m.global(keep)
     });
     heap.collect();
     assert_eq!(drops.load(Ordering::Relaxed), 2000);
@@ -100,8 +100,8 @@ fn garbage_is_finalized() {
 #[test]
 fn heap_drop_finalizes_everything() {
     let drops = Arc::new(AtomicUsize::new(0));
-    let heap = Heap::new(THREADS);
-    let root: Root<TreeB> = heap.mutate(|m| m.root(m.alloc(Tree::Leaf(Counted(drops.clone())))));
+    let heap = unsafe { Heap::new_unchecked(THREADS) };
+    let root: ScopeGlobal<'_, '_, TreeB> = heap.scope_shared(|m| m.global(m.alloc(Tree::Leaf(Counted(drops.clone())))));
     drop(heap);
     assert_eq!(drops.load(Ordering::Relaxed), 1);
     drop(root);
@@ -110,8 +110,8 @@ fn heap_drop_finalizes_everything() {
 #[test]
 fn threads_mutate_at_once() {
     const WRITERS: u64 = 4;
-    let mut heap = Heap::new(THREADS);
-    let roots: Vec<Root<NodeB>> = std::thread::scope(|s| {
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
+    let roots: Vec<ScopeGlobal<'_, '_, NodeB>> = std::thread::scope(|s| {
         let heap = &heap;
         let handles: Vec<_> = (0..WRITERS).map(|_| s.spawn(move || build_list(heap, LIST_LEN))).collect();
         handles.into_iter().map(|h| h.join().expect("mutator panicked")).collect()
@@ -125,7 +125,7 @@ fn threads_mutate_at_once() {
 #[test]
 fn blocks_are_reused() {
     const ROUNDS: usize = if cfg!(miri) { 3 } else { 20 };
-    let mut heap = Heap::new(THREADS);
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
     let root = build_list(&heap, LIST_LEN);
     let mut peak = 0;
     for round in 0..ROUNDS {
@@ -147,14 +147,14 @@ fn large_objects() {
     const BIG: usize = 64 * 1024;
     /// The size class using the global allocator (half a block up to 64 KiB)
     const MID: usize = 20 * 1024;
-    let mut heap = Heap::new(THREADS);
-    let root: Root<TreeB> = heap.mutate(|m| {
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
+    let root: ScopeGlobal<'_, '_, TreeB> = heap.scope_shared(|m| {
         let big = m.alloc(vec![7u8; BIG]);
         let _garbage = m.alloc([0u64; BIG / 8]);
         let mid = m.alloc([3u64; MID / 8]);
         assert_eq!(big.len(), BIG);
         assert!(mid.iter().all(|&x| x == 3));
-        m.root(m.alloc(Tree::Leaf(Counted(Arc::default()))))
+        m.global(m.alloc(Tree::Leaf(Counted(Arc::default()))))
     });
     assert_eq!(heap.stats().large, 2);
     heap.collect();
@@ -164,23 +164,23 @@ fn large_objects() {
 
 /// A chain node of the cross test: carries a counted tag; the chain head holds the root of a chain on another heap; every few nodes hold a large object (pointing back into the chain, forming a cycle).
 #[derive(Trace)]
-struct Item<'gc> {
+struct Item<'heap, 'scope> {
     value: u64,
-    next: Option<Gc<'gc, Item<'gc>>>,
+    next: Option<ScopeLocal<'heap, 'scope, Item<'heap, 'scope>>>,
     /// (heap id, root): a chain on another heap, released when this object is finalized
-    guest: Option<(usize, Root<ItemB>)>,
-    ballast: Option<Gc<'gc, Ballast<'gc>>>,
+    guest: Option<(usize, ScopeGlobal<'static, 'static, ItemB>)>,
+    ballast: Option<ScopeLocal<'heap, 'scope, Ballast<'heap, 'scope>>>,
     tag: Counted,
 }
 
 /// A large object (above half a block, allocated on its own), pointing back at the node holding it (a cycle).
 #[derive(Trace)]
-struct Ballast<'gc> {
+struct Ballast<'heap, 'scope> {
     words: [u64; BALLAST_WORDS],
-    owner: Slot<'gc, Item<'gc>>,
+    owner: Slot<'heap, 'scope, Item<'heap, 'scope>>,
 }
 
-brand!(ItemB = for<'gc> Item<'gc>);
+brand!(ItemB = for<'heap, 'scope> Item<'heap, 'scope>);
 
 const BALLAST_WORDS: usize = 2100;
 /// Under Miri 8 × 8 takes more than 15 s per test, so 4 × 4
@@ -207,8 +207,8 @@ impl Ledger {
 
     /// Make a chain on heap `h` whose head carries `guest`.
     #[allow(clippy::large_stack_arrays, reason = "a large object has to exceed half a block")]
-    fn build(&self, heaps: &[Heap], h: usize, guest: Option<(usize, Root<ItemB>)>) -> Root<ItemB> {
-        heaps[h].mutate(|m| {
+    fn build(&self, heaps: &[Heap<'static>], h: usize, guest: Option<(usize, ScopeGlobal<'static, 'static, ItemB>)>) -> ScopeGlobal<'static, 'static, ItemB> {
+        heaps[h].scope_shared(|m| {
             let mut guest = guest;
             let mut top = None;
             for value in 0..ITEMS {
@@ -220,21 +220,21 @@ impl Ledger {
                 }
                 top = Some(item);
             }
-            m.root(top.expect("ITEMS > 0"))
+            m.global(top.expect("ITEMS > 0"))
         })
     }
 }
 
 /// Check that a chain is intact; with `depth > 0` also the chain on another heap held by the chain head (every chain is also checked on its own, so only one level down).
-fn check(heaps: &[Heap], h: usize, root: &Root<ItemB>, depth: usize) {
-    heaps[h].mutate(|m| {
+fn check(heaps: &[Heap<'static>], h: usize, root: &ScopeGlobal<'static, 'static, ItemB>, depth: usize) {
+    heaps[h].scope_shared(|m| {
         let mut sum = 0;
-        let mut cur = Some(m.get(root));
+        let mut cur = Some(m.scope_in(root));
         while let Some(n) = cur {
             sum += n.value;
             if let Some(b) = n.ballast {
                 assert!(b.words[0] == n.value && b.words[BALLAST_WORDS - 1] == n.value, "the large object's contents are corrupted");
-                assert!(b.owner.get().is_some_and(|o| Gc::ptr_eq(o, n)), "the large object's back pointer is corrupted");
+                assert!(b.owner.get().is_some_and(|o| ScopeLocal::ptr_eq(o, n)), "the large object's back pointer is corrupted");
             }
             if let Some((g, guest)) = &n.guest
                 && depth > 0
@@ -267,21 +267,21 @@ fn collect_all<T: Send>(heaps: &mut [Heap], dropping: Vec<T>) {
 #[test]
 fn eight_threads_eight_heaps_crossed() {
     let ledger = Ledger::default();
-    let mut heaps: Vec<Heap> = (0..HEAPS).map(|_| Heap::new(THREADS)).collect();
-    let mut kept_prev: Vec<(usize, Root<ItemB>)> = Vec::new();
+    let mut heaps: Vec<Heap<'static>> = (0..HEAPS).map(|_| unsafe { Heap::new_unchecked(THREADS) }).collect();
+    let mut kept_prev: Vec<(usize, ScopeGlobal<'_, '_, ItemB>)> = Vec::new();
     for round in 0..CROSS_ROUNDS {
         // Make: thread t makes chains on heap (t + k + round) % HEAPS in turn
-        let made: Vec<Vec<(usize, Root<ItemB>)>> = std::thread::scope(|s| {
+        let made: Vec<Vec<(usize, ScopeGlobal<'_, '_, ItemB>)>> = std::thread::scope(|s| {
             let (heaps, ledger) = (&heaps, &ledger);
             let handles: Vec<_> = (0..WORKERS)
                 .map(|t| {
                     s.spawn(move || {
-                        let mut carry: Option<(usize, Root<ItemB>)> = None;
+                        let mut carry: Option<(usize, ScopeGlobal<'_, '_, ItemB>)> = None;
                         let mut out = Vec::new();
                         for k in 0..HEAPS {
                             let h = (t + k + round) % HEAPS;
                             let root = ledger.build(heaps, h, carry.take());
-                            carry = Some((h, heaps[h].mutate(|m| m.root(m.get(&root)))));
+                            carry = Some((h, heaps[h].scope_shared(|m| m.global(m.scope_in(&root)))));
                             out.push((h, root));
                         }
                         out
@@ -291,7 +291,7 @@ fn eight_threads_eight_heaps_crossed() {
             handles.into_iter().map(|h| h.join().expect("a chain-making thread panicked")).collect()
         });
         // Check: thread t checks the chains made by thread t + 1 and releases half on the spot
-        let kept_now: Vec<(usize, Root<ItemB>)> = std::thread::scope(|s| {
+        let kept_now: Vec<(usize, ScopeGlobal<'_, '_, ItemB>)> = std::thread::scope(|s| {
             let heaps = &heaps;
             let mut made = made;
             made.rotate_left(1);
@@ -333,37 +333,37 @@ fn eight_threads_eight_heaps_crossed() {
 
 /// A node of the deep tree test: two mutable children, with a drop counter.
 #[derive(Trace)]
-struct Bin<'gc> {
-    left: Slot<'gc, Bin<'gc>>,
-    right: Slot<'gc, Bin<'gc>>,
+struct Bin<'heap, 'scope> {
+    left: Slot<'heap, 'scope, Bin<'heap, 'scope>>,
+    right: Slot<'heap, 'scope, Bin<'heap, 'scope>>,
     tag: Counted,
 }
 
-brand!(BinB = for<'gc> Bin<'gc>);
+brand!(BinB = for<'heap, 'scope> Bin<'heap, 'scope>);
 
-impl Bin<'_> {
+impl Bin<'_, '_> {
     /// Nodes reachable from `self` (explicit stack, no recursion).
     fn count(&self) -> usize {
         let mut stack = vec![self];
         let mut n = 0;
         while let Some(b) = stack.pop() {
             n += 1;
-            stack.extend(b.left.get().map(Gc::get));
-            stack.extend(b.right.get().map(Gc::get));
+            stack.extend(b.left.get().map(ScopeLocal::get));
+            stack.extend(b.right.get().map(ScopeLocal::get));
         }
         n
     }
 }
 
 /// A full binary tree (`depth` levels, 2^depth − 1 nodes), built bottom up level by level.
-fn build_tree(heap: &Heap, drops: &Arc<AtomicUsize>, depth: u32) -> Root<BinB> {
-    heap.mutate(|m| {
+fn build_tree<'h>(heap: &Heap<'h>, drops: &Arc<AtomicUsize>, depth: u32) -> ScopeGlobal<'h, 'h, BinB> {
+    heap.scope_shared(|m| {
         let tag = || Counted(drops.clone());
         let mut level: Vec<_> = (0..1usize << (depth - 1)).map(|_| m.alloc(Bin { left: Slot::default(), right: Slot::default(), tag: tag() })).collect();
         while level.len() > 1 {
             level = level.chunks(2).map(|pair| m.alloc(Bin { left: pair[0].into(), right: pair[1].into(), tag: tag() })).collect();
         }
-        m.root(level[0])
+        m.global(level[0])
     })
 }
 
@@ -373,16 +373,16 @@ fn deep_binary_tree() {
     const ALL: usize = (1 << DEPTH) - 1;
     const HALF: usize = (1 << (DEPTH - 1)) - 1;
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new(THREADS);
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
     let root = build_tree(&heap, &drops, DEPTH);
     heap.collect();
     assert_eq!(drops.load(Ordering::Relaxed), 0);
-    assert_eq!(heap.mutate(|m| m.get(&root).count()), ALL);
+    assert_eq!(heap.scope_shared(|m| m.scope_in(&root).count()), ALL);
     // Prune the right subtree: exactly 2^(DEPTH-1) − 1 nodes are finalized
-    heap.mutate(|m| m.get(&root).right.set(m, None));
+    heap.scope_shared(|m| m.scope_in(&root).right.set(m, None));
     heap.collect();
     assert_eq!(drops.load(Ordering::Relaxed), HALF);
-    assert_eq!(heap.mutate(|m| m.get(&root).count()), ALL - HALF);
+    assert_eq!(heap.scope_shared(|m| m.scope_in(&root).count()), ALL - HALF);
     drop(root);
     heap.collect();
     assert_eq!(drops.load(Ordering::Relaxed), ALL);
@@ -393,19 +393,19 @@ fn deep_binary_tree() {
 fn deep_chain() {
     const LEN: usize = if cfg!(miri) { 500 } else { 1_000_000 };
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new(THREADS);
-    let root: Root<BinB> = heap.mutate(|m| {
-        let mut top: Option<Gc<'_, Bin<'_>>> = None;
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
+    let root: ScopeGlobal<'_, '_, BinB> = heap.scope_shared(|m| {
+        let mut top: Option<ScopeLocal<'_, '_, Bin<'_, '_>>> = None;
         for _ in 0..LEN {
             top = Some(m.alloc(Bin { left: top.into(), right: Slot::default(), tag: Counted(drops.clone()) }));
         }
-        m.root(top.expect("LEN > 0"))
+        m.global(top.expect("LEN > 0"))
     });
     heap.collect();
-    assert_eq!(heap.mutate(|m| m.get(&root).count()), LEN);
+    assert_eq!(heap.scope_shared(|m| m.scope_in(&root).count()), LEN);
     // Cut in the middle: the second half is finalized
-    heap.mutate(|m| {
-        let mut cur = m.get(&root);
+    heap.scope_shared(|m| {
+        let mut cur = m.scope_in(&root);
         for _ in 1..LEN / 2 {
             cur = cur.left.get().expect("the chain is long enough");
         }
@@ -413,7 +413,7 @@ fn deep_chain() {
     });
     heap.collect();
     assert_eq!(drops.load(Ordering::Relaxed), LEN - LEN / 2);
-    assert_eq!(heap.mutate(|m| m.get(&root).count()), LEN / 2);
+    assert_eq!(heap.scope_shared(|m| m.scope_in(&root).count()), LEN / 2);
     drop(root);
     heap.collect();
     assert_eq!(drops.load(Ordering::Relaxed), LEN);
@@ -421,15 +421,15 @@ fn deep_chain() {
 
 /// A node of the cross deep tree: tree nodes use both children, chain nodes only left; tree leaves hold the root of a node in a deep chain on another heap.
 #[derive(Trace)]
-struct XNode<'gc> {
-    left: Slot<'gc, XNode<'gc>>,
-    right: Slot<'gc, XNode<'gc>>,
+struct XNode<'heap, 'scope> {
+    left: Slot<'heap, 'scope, XNode<'heap, 'scope>>,
+    right: Slot<'heap, 'scope, XNode<'heap, 'scope>>,
     /// (heap id, root): a node in a deep chain on another heap
-    guest: Option<(usize, Root<XB>)>,
+    guest: Option<(usize, ScopeGlobal<'static, 'static, XB>)>,
     tag: Counted,
 }
 
-brand!(XB = for<'gc> XNode<'gc>);
+brand!(XB = for<'heap, 'scope> XNode<'heap, 'scope>);
 
 /// Levels of the full binary tree on each heap
 const X_DEPTH: u32 = if cfg!(miri) { 4 } else { 15 };
@@ -441,15 +441,15 @@ const X_STEP: usize = if cfg!(miri) { 1 } else { 4 };
 /// Length of the deep chain on each heap
 const X_CHAIN: usize = X_OFFSET + X_LEAVES * X_STEP;
 
-impl XNode<'_> {
+impl XNode<'_, '_> {
     /// Nodes of this heap reachable from here (not crossing heaps, explicit stack).
     fn reach(&self) -> usize {
         let mut stack = vec![self];
         let mut n = 0;
         while let Some(x) = stack.pop() {
             n += 1;
-            stack.extend(x.left.get().map(Gc::get));
-            stack.extend(x.right.get().map(Gc::get));
+            stack.extend(x.left.get().map(ScopeLocal::get));
+            stack.extend(x.right.get().map(ScopeLocal::get));
         }
         n
     }
@@ -457,19 +457,19 @@ impl XNode<'_> {
 
 impl Ledger {
     /// A deep chain of length X_CHAIN on heap `h`.
-    fn x_chain(&self, heap: &Heap) -> Root<XB> {
-        heap.mutate(|m| {
-            let mut top: Option<Gc<'_, XNode<'_>>> = None;
+    fn x_chain<'h>(&self, heap: &Heap<'h>) -> ScopeGlobal<'h, 'h, XB> {
+        heap.scope_shared(|m| {
+            let mut top: Option<ScopeLocal<'_, '_, XNode<'_, '_>>> = None;
             for _ in 0..X_CHAIN {
                 top = Some(m.alloc(XNode { left: top.into(), right: Slot::default(), guest: None, tag: self.tag() }));
             }
-            m.root(top.expect("X_CHAIN > 0"))
+            m.global(top.expect("X_CHAIN > 0"))
         })
     }
 
     /// Build a full binary tree on `heap` whose i-th leaf carries `guests[i]`.
-    fn x_tree(&self, heap: &Heap, guests: Vec<(usize, Root<XB>)>) -> Root<XB> {
-        heap.mutate(|m| {
+    fn x_tree<'h>(&self, heap: &Heap<'h>, guests: Vec<(usize, ScopeGlobal<'static, 'static, XB>)>) -> ScopeGlobal<'h, 'h, XB> {
+        heap.scope_shared(|m| {
             let mut guests = guests.into_iter();
             let mut level: Vec<_> = (0..X_LEAVES)
                 .map(|_| m.alloc(XNode { left: Slot::default(), right: Slot::default(), guest: guests.next(), tag: self.tag() }))
@@ -480,20 +480,20 @@ impl Ledger {
                     .map(|pair| m.alloc(XNode { left: pair[0].into(), right: pair[1].into(), guest: None, tag: self.tag() }))
                     .collect();
             }
-            m.root(level[0])
+            m.global(level[0])
         })
     }
 }
 
 /// Roots of the anchors in the deep chain of heap `h` (the i-th at depth X_OFFSET + i·X_STEP).
-fn x_anchors(heap: &Heap, h: usize, chain: &Root<XB>) -> Vec<(usize, Root<XB>)> {
-    heap.mutate(|m| {
+fn x_anchors<'h>(heap: &Heap<'h>, h: usize, chain: &ScopeGlobal<'h, 'h, XB>) -> Vec<(usize, ScopeGlobal<'h, 'h, XB>)> {
+    heap.scope_shared(|m| {
         let mut out = Vec::with_capacity(X_LEAVES);
-        let mut cur = Some(m.get(chain));
+        let mut cur = Some(m.scope_in(chain));
         let mut depth = 0;
         while let Some(n) = cur {
             if depth >= X_OFFSET && (depth - X_OFFSET).is_multiple_of(X_STEP) && out.len() < X_LEAVES {
-                out.push((h, m.root(n)));
+                out.push((h, m.global(n)));
             }
             depth += 1;
             cur = n.left.get();
@@ -502,15 +502,15 @@ fn x_anchors(heap: &Heap, h: usize, chain: &Root<XB>) -> Vec<(usize, Root<XB>)> 
     })
 }
 
-/// How long the deep chain anchored by the leftmost (or rightmost) leaf of tree `h` is from the anchor down; tree and chain are on different heaps, so the mutates nest.
-fn x_edge_reach(heaps: &[Heap], h: usize, tree: &Root<XB>, leftmost: bool) -> usize {
-    heaps[h].mutate(|m| {
-        let mut cur = m.get(tree);
+/// How long the deep chain anchored by the leftmost (or rightmost) leaf of tree `h` is from the anchor down; tree and chain are on different heaps, so the scopes nest.
+fn x_edge_reach(heaps: &[Heap<'static>], h: usize, tree: &ScopeGlobal<'static, 'static, XB>, leftmost: bool) -> usize {
+    heaps[h].scope_shared(|m| {
+        let mut cur = m.scope_in(tree);
         while let Some(next) = if leftmost { cur.left.get().or(cur.right.get()) } else { cur.right.get().or(cur.left.get()) } {
             cur = next;
         }
         let (g, root) = cur.guest.as_ref().expect("every leaf carries an anchor");
-        heaps[*g].mutate(|gm| gm.get(root).reach())
+        heaps[*g].scope_shared(|gm| gm.scope_in(root).reach())
     })
 }
 
@@ -520,15 +520,15 @@ fn x_edge_reach(heaps: &[Heap], h: usize, tree: &Root<XB>, leftmost: bool) -> us
 fn crossed_deep_trees() {
     let ledger = Ledger::default();
     let dropped = || ledger.dropped.load(Ordering::Relaxed);
-    let mut heaps: Vec<Heap> = (0..HEAPS).map(|_| Heap::new(THREADS)).collect();
+    let mut heaps: Vec<Heap<'static>> = (0..HEAPS).map(|_| unsafe { Heap::new_unchecked(THREADS) }).collect();
     // 1. Each thread makes a deep chain on its own heap
-    let chains: Vec<Root<XB>> = std::thread::scope(|s| {
+    let chains: Vec<ScopeGlobal<'_, '_, XB>> = std::thread::scope(|s| {
         let (heaps, ledger) = (&heaps, &ledger);
         let hs: Vec<_> = (0..WORKERS).map(|t| s.spawn(move || ledger.x_chain(&heaps[t]))).collect();
         hs.into_iter().map(|h| h.join().expect("making a chain panicked")).collect()
     });
     // 2. Thread t takes anchors in the next heap's deep chain (while that heap's thread builds its tree) and builds a tree on its own heap
-    let trees: Vec<Root<XB>> = std::thread::scope(|s| {
+    let trees: Vec<ScopeGlobal<'_, '_, XB>> = std::thread::scope(|s| {
         let (heaps, ledger, chains) = (&heaps, &ledger, &chains);
         let hs: Vec<_> = (0..WORKERS)
             .map(|t| {
@@ -546,7 +546,7 @@ fn crossed_deep_trees() {
     collect_all(&mut heaps, Vec::<()>::new());
     assert_eq!(dropped(), HEAPS * X_OFFSET);
     for (h, tree) in trees.iter().enumerate() {
-        assert_eq!(heaps[h].mutate(|m| m.get(tree).reach()), X_TREE);
+        assert_eq!(heaps[h].scope_shared(|m| m.scope_in(tree).reach()), X_TREE);
         assert_eq!(x_edge_reach(&heaps, h, tree, true), X_CHAIN - X_OFFSET);
         assert_eq!(x_edge_reach(&heaps, h, tree, false), X_CHAIN - X_OFFSET - (X_LEAVES - 1) * X_STEP);
     }
@@ -557,7 +557,7 @@ fn crossed_deep_trees() {
         for t in 0..WORKERS {
             s.spawn(move || {
                 let h = (t + 2) % HEAPS;
-                heaps[h].mutate(|m| m.get(&trees[h]).left.set(m, None));
+                heaps[h].scope_shared(|m| m.scope_in(&trees[h]).left.set(m, None));
             });
         }
     });
@@ -565,7 +565,7 @@ fn crossed_deep_trees() {
     collect_all(&mut heaps, Vec::<()>::new());
     assert_eq!(dropped(), HEAPS * (X_OFFSET + X_TREE / 2 + X_LEAVES / 2 * X_STEP));
     for (h, tree) in trees.iter().enumerate() {
-        assert_eq!(heaps[h].mutate(|m| m.get(tree).reach()), X_TREE - X_TREE / 2);
+        assert_eq!(heaps[h].scope_shared(|m| m.scope_in(tree).reach()), X_TREE - X_TREE / 2);
         assert_eq!(x_edge_reach(&heaps, h, tree, true), X_CHAIN - X_OFFSET - X_LEAVES / 2 * X_STEP);
     }
     // 5. Tree roots go to another thread and are released during the first round of collection: the release may come after that heap's marking, so the tree dies only in the second round;
@@ -579,23 +579,23 @@ fn crossed_deep_trees() {
 
 /// A node of the concurrent marking test: the next one in the chain is a mutable slot.
 #[derive(Trace)]
-struct Link<'gc> {
-    next: Slot<'gc, Link<'gc>>,
+struct Link<'heap, 'scope> {
+    next: Slot<'heap, 'scope, Link<'heap, 'scope>>,
     tag: Counted,
 }
 
 /// A row of slots, each holding a chain.
 #[derive(Trace)]
-struct Board<'gc> {
-    cells: Vec<Slot<'gc, Link<'gc>>>,
+struct Board<'heap, 'scope> {
+    cells: Vec<Slot<'heap, 'scope, Link<'heap, 'scope>>>,
 }
 
-brand!(BoardB = for<'gc> Board<'gc>);
+brand!(BoardB = for<'heap, 'scope> Board<'heap, 'scope>);
 
 /// The slot count is a multiple of MOVERS (every thread gets as many slots)
 const CELLS: usize = if cfg!(miri) { 4 } else { 16 };
 const MOVERS: usize = if cfg!(miri) { 2 } else { 4 };
-/// Mutates per mutator per round, and steps per mutate
+/// Mutates per mutator per round, and steps per scope
 const MUTATES: usize = if cfg!(miri) { 6 } else { 400 };
 const STEPS: usize = if cfg!(miri) { 4 } else { 32 };
 const MARK_ROUNDS: usize = if cfg!(miri) { 2 } else { 6 };
@@ -626,7 +626,7 @@ struct Moves {
 impl Moves {
     /// One step, chosen at random: move (take a chain head off its own slot, hold it on the stack, hang it on any slot) / make / discard.
     /// Slot i is taken from only by thread i % MOVERS (a multi-producer single-consumer Treiber stack has no ABA); anyone can hang onto it.
-    fn step<'gc>(&self, m: &paragc::Mutator<'gc>, board: &Board<'gc>, me: usize, rng: &mut Rng) {
+    fn step<'heap, 'scope>(&self, m: &'scope paragc::Scope<'heap, '_>, board: &Board<'heap, 'scope>, me: usize, rng: &mut Rng) {
         let (a, b) = (rng.below(CELLS / MOVERS) * MOVERS + me, rng.below(CELLS));
         match rng.below(4) {
             0 | 1 => {
@@ -647,7 +647,7 @@ impl Moves {
     }
 
     /// Take off the chain head (only this slot's owner takes; the CAS races only with hangers); the node taken lives only on the stack afterwards.
-    fn pop<'gc>(m: &paragc::Mutator<'gc>, cell: &Slot<'gc, Link<'gc>>) -> Option<Gc<'gc, Link<'gc>>> {
+    fn pop<'heap, 'scope>(m: &'scope paragc::Scope<'heap, '_>, cell: &Slot<'heap, 'scope, Link<'heap, 'scope>>) -> Option<ScopeLocal<'heap, 'scope, Link<'heap, 'scope>>> {
         loop {
             let x = cell.get()?;
             if cell.compare_exchange(m, Some(x), x.next.get()).is_ok() {
@@ -657,7 +657,7 @@ impl Moves {
     }
 
     /// Hang onto the chain head (CAS).
-    fn push<'gc>(m: &paragc::Mutator<'gc>, cell: &Slot<'gc, Link<'gc>>, x: Gc<'gc, Link<'gc>>) {
+    fn push<'heap, 'scope>(m: &'scope paragc::Scope<'heap, '_>, cell: &Slot<'heap, 'scope, Link<'heap, 'scope>>, x: ScopeLocal<'heap, 'scope, Link<'heap, 'scope>>) {
         loop {
             let head = cell.get();
             x.next.set(m, head);
@@ -668,10 +668,10 @@ impl Moves {
     }
 
     /// Nodes on all chains (explicit stack).
-    fn reachable(heap: &Heap, board: &Root<BoardB>) -> usize {
-        heap.mutate(|m| {
+    fn reachable<'h>(heap: &Heap<'h>, board: &ScopeGlobal<'h, 'h, BoardB>) -> usize {
+        heap.scope_shared(|m| {
             let mut n = 0;
-            for cell in &m.get(board).cells {
+            for cell in &m.scope_in(board).cells {
                 let mut cur = cell.get();
                 while let Some(x) = cur {
                     n += 1;
@@ -684,9 +684,9 @@ impl Moves {
 }
 
 impl Moves {
-    /// One round: MOVERS mutators keep moving / making / discarding (STEPS steps per mutate), stopping after MUTATES mutates and only once
+    /// One round: MOVERS mutators keep moving / making / discarding (STEPS steps per scope), stopping after MUTATES scopes and only once
     /// `background` has finished; the background thread starts after the mutators have run a while (so the two overlap).
-    fn round(&self, heap: &Heap, board: &Root<BoardB>, round: usize, background: impl FnOnce(&Heap) + Send) {
+    fn round<'h>(&self, heap: &Heap<'h>, board: &ScopeGlobal<'h, 'h, BoardB>, round: usize, background: impl FnOnce(&Heap<'h>) + Send) {
         let started = std::sync::atomic::AtomicBool::new(false);
         let done = std::sync::atomic::AtomicBool::new(false);
         std::thread::scope(|s| {
@@ -701,14 +701,14 @@ impl Moves {
                             started.store(true, Ordering::Release);
                         }
                         i += 1;
-                        heap.mutate_in(&mut tlab, |m| {
+                        heap.scope_shared_in(&mut tlab, |m| {
                             if m.is_marking() {
                                 self.overlapped.fetch_add(1, Ordering::Relaxed);
                             }
                             if heap.is_sweeping() {
                                 self.overlapped_sweep.fetch_add(1, Ordering::Relaxed);
                             }
-                            let board = m.get(board);
+                            let board = m.scope_in(board);
                             for _ in 0..STEPS {
                                 self.step(m, &board, t, &mut rng);
                             }
@@ -727,7 +727,7 @@ impl Moves {
     }
 
     /// After each round: no node still on a chain was finalized, and the nodes on chains are exactly made − discarded.
-    fn check(&self, heap: &Heap, board: &Root<BoardB>, round: usize) {
+    fn check<'h>(&self, heap: &Heap<'h>, board: &ScopeGlobal<'h, 'h, BoardB>, round: usize) {
         let (dropped, discarded) = (self.ledger.dropped.load(Ordering::Relaxed), self.discarded.load(Ordering::Relaxed));
         assert!(dropped <= discarded, "round {round} finalized nodes still on a chain: {dropped} finalized > {discarded} discarded");
         let live = self.ledger.made.load(Ordering::Relaxed) - discarded;
@@ -735,7 +735,7 @@ impl Moves {
     }
 
     /// Finish: one more full collection clears floating garbage, the finalized count is exactly the discarded count; after dropping the board everything is finalized.
-    fn finish(&self, mut heap: Heap, board: Root<BoardB>) {
+    fn finish(&self, mut heap: Heap, board: ScopeGlobal<'_, '_, BoardB>) {
         heap.collect();
         assert_eq!(self.ledger.dropped.load(Ordering::Relaxed), self.discarded.load(Ordering::Relaxed));
         drop(board);
@@ -744,8 +744,8 @@ impl Moves {
     }
 }
 
-fn board(heap: &Heap) -> Root<BoardB> {
-    heap.mutate(|m| m.root(m.alloc(Board { cells: (0..CELLS).map(|_| Slot::default()).collect() })))
+fn board<'h>(heap: &Heap<'h>) -> ScopeGlobal<'h, 'h, BoardB> {
+    heap.scope_shared(|m| m.global(m.alloc(Board { cells: (0..CELLS).map(|_| Slot::default()).collect() })))
 }
 
 /// During concurrent marking, several mutators keep taking nodes off one slot (leaving only a stack reference), hanging them on another slot, making and discarding;
@@ -754,14 +754,14 @@ fn board(heap: &Heap) -> Root<BoardB> {
 #[test]
 fn concurrent_marking_while_relinking() {
     let moves = Moves::default();
-    let mut heap = Heap::new(THREADS);
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
     let board = board(&heap);
     for round in 0..MARK_ROUNDS {
         moves.round(&heap, &board, round, |h| assert!(h.mark_concurrently(), "this round is not marking yet"));
         heap.collect();
         moves.check(&heap, &board, round);
     }
-    assert!(moves.overlapped.load(Ordering::Relaxed) > 0, "no mutate fell within concurrent marking");
+    assert!(moves.overlapped.load(Ordering::Relaxed) > 0, "no scope fell within concurrent marking");
     moves.finish(heap, board);
 }
 
@@ -770,7 +770,7 @@ fn concurrent_marking_while_relinking() {
 #[test]
 fn concurrent_sweeping_while_relinking() {
     let moves = Moves::default();
-    let mut heap = Heap::new(THREADS);
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
     let board = board(&heap);
     for round in 0..MARK_ROUNDS {
         moves.round(&heap, &board, round, |h| assert!(h.mark_concurrently(), "this round is not marking yet"));
@@ -779,8 +779,8 @@ fn concurrent_sweeping_while_relinking() {
         assert!(!heap.is_sweeping());
         moves.check(&heap, &board, round);
     }
-    assert!(moves.overlapped.load(Ordering::Relaxed) > 0, "no mutate fell within concurrent marking");
-    assert!(moves.overlapped_sweep.load(Ordering::Relaxed) > 0, "no mutate fell within concurrent sweeping");
+    assert!(moves.overlapped.load(Ordering::Relaxed) > 0, "no scope fell within concurrent marking");
+    assert!(moves.overlapped_sweep.load(Ordering::Relaxed) > 0, "no scope fell within concurrent sweeping");
     moves.finish(heap, board);
 }
 
@@ -791,13 +791,13 @@ struct Cell8 {
     tag: Counted,
 }
 
-/// Root: the elements kept.
+/// ScopeGlobal: the elements kept.
 #[derive(Trace)]
-struct Keep<'gc> {
-    items: Vec<Gc<'gc, Cell8>>,
+struct Keep<'heap, 'scope> {
+    items: Vec<ScopeLocal<'heap, 'scope, Cell8>>,
 }
 
-brand!(KeepB = for<'gc> Keep<'gc>);
+brand!(KeepB = for<'heap, 'scope> Keep<'heap, 'scope>);
 
 /// Allocate many elements and keep only 1/16: after the first collection each block is only ~6% live (sparse), and the second collection should evacuate them:
 /// the block count drops, the kept elements keep their values but change address, and the finalized count is exactly the discarded count.
@@ -806,8 +806,8 @@ fn evacuation_compacts_sparse_blocks() {
     const ITEMS: u64 = if cfg!(miri) { 4_000 } else { 64_000 };
     const KEEP_EVERY: u64 = 16;
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new(THREADS);
-    let keep: Root<KeepB> = heap.mutate(|m| {
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
+    let keep: ScopeGlobal<'_, '_, KeepB> = heap.scope_shared(|m| {
         let mut items = Vec::new();
         for value in 0..ITEMS {
             let x = m.alloc(Cell8 { value, tag: Counted(drops.clone()) });
@@ -815,19 +815,19 @@ fn evacuation_compacts_sparse_blocks() {
                 items.push(x);
             }
         }
-        m.root(m.alloc(Keep { items }))
+        m.global(m.alloc(Keep { items }))
     });
     let kept = ITEMS / KEEP_EVERY;
     let discarded = usize::try_from(ITEMS - kept).expect("small");
     heap.collect();
     assert_eq!(drops.load(Ordering::Relaxed), discarded);
     let before_blocks = heap.stats().blocks;
-    let before: Vec<usize> = heap.mutate(|m| m.get(&keep).items.iter().map(|x| x.as_ptr().addr()).collect());
+    let before: Vec<usize> = heap.scope_shared(|m| m.scope_in(&keep).items.iter().map(|x| x.as_ptr().addr()).collect());
     heap.collect();
     let stats = heap.stats();
     assert!(stats.evacuated_blocks > 0, "sparse blocks were not evacuated: {stats:?}");
     assert!(stats.blocks < before_blocks, "the block count did not drop after evacuation: {before_blocks} ⇒ {}", stats.blocks);
-    let after: Vec<(usize, u64)> = heap.mutate(|m| m.get(&keep).items.iter().map(|x| (x.as_ptr().addr(), x.value)).collect());
+    let after: Vec<(usize, u64)> = heap.scope_shared(|m| m.scope_in(&keep).items.iter().map(|x| (x.as_ptr().addr(), x.value)).collect());
     assert!(after.iter().enumerate().all(|(i, &(_, v))| v == u64::try_from(i).expect("small") * KEEP_EVERY), "moved elements have wrong values");
     let moved = before.iter().zip(&after).filter(|(b, (a, _))| *b != a).count();
     assert!(moved > 0, "no element changed address");
@@ -839,18 +839,18 @@ fn evacuation_compacts_sparse_blocks() {
 
 /// Children shared by many parents: each parent has two slots pointing at a shared child.
 #[derive(Trace)]
-struct Parent<'gc> {
-    a: Slot<'gc, Cell8>,
-    b: Gc<'gc, Cell8>,
+struct Parent<'heap, 'scope> {
+    a: Slot<'heap, 'scope, Cell8>,
+    b: ScopeLocal<'heap, 'scope, Cell8>,
     tag: Counted,
 }
 
 #[derive(Trace)]
-struct Family<'gc> {
-    parents: Vec<Gc<'gc, Parent<'gc>>>,
+struct Family<'heap, 'scope> {
+    parents: Vec<ScopeLocal<'heap, 'scope, Parent<'heap, 'scope>>>,
 }
 
-brand!(FamilyB = for<'gc> Family<'gc>);
+brand!(FamilyB = for<'heap, 'scope> Family<'heap, 'scope>);
 
 /// Many parents point at the same few children (one slot and one plain field each), parents and children all in sparse blocks: during evacuation several collector threads reach the same child at once
 /// and race to claim and copy it. Afterwards both edges of each parent must point at the same (new) child with its value intact, and each child is copied once (never finalized twice, never lost).
@@ -860,8 +860,8 @@ fn evacuation_with_shared_children() {
     const CHILDREN: u64 = 64;
     const KEEP_EVERY: u64 = 8;
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new(THREADS);
-    let family: Root<FamilyB> = heap.mutate(|m| {
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
+    let family: ScopeGlobal<'_, '_, FamilyB> = heap.scope_shared(|m| {
         let children: Vec<_> = (0..CHILDREN).map(|value| m.alloc(Cell8 { value, tag: Counted(drops.clone()) })).collect();
         let mut parents = Vec::new();
         for i in 0..PARENTS {
@@ -874,7 +874,7 @@ fn evacuation_with_shared_children() {
                 parents.push(p);
             }
         }
-        m.root(m.alloc(Family { parents }))
+        m.global(m.alloc(Family { parents }))
     });
     // Kept parents: i = 0, KEEP_EVERY, 2·KEEP_EVERY … ⌈PARENTS / KEEP_EVERY⌉ in all
     let garbage = usize::try_from(PARENTS * 2 - PARENTS.div_ceil(KEEP_EVERY)).expect("small");
@@ -882,10 +882,10 @@ fn evacuation_with_shared_children() {
     assert_eq!(drops.load(Ordering::Relaxed), garbage);
     heap.collect();
     assert!(heap.stats().evacuated_blocks > 0, "no evacuation: {:?}", heap.stats());
-    heap.mutate(|m| {
-        for (i, p) in m.get(&family).parents.iter().enumerate() {
+    heap.scope_shared(|m| {
+        for (i, p) in m.scope_in(&family).parents.iter().enumerate() {
             let a = p.a.get().expect("the slot is not empty");
-            assert!(Gc::ptr_eq(a, p.b), "the two edges to the same child point at different addresses");
+            assert!(ScopeLocal::ptr_eq(a, p.b), "the two edges to the same child point at different addresses");
             assert_eq!(a.value, u64::try_from(i).expect("small") % CHILDREN);
         }
     });
@@ -905,19 +905,19 @@ fn young_collection_frees_only_young_garbage() {
     const YOUNG: usize = if cfg!(miri) { 120 } else { 20_000 };
     const OLD_DISCARD: usize = OLD / 4;
     let moves = Moves::default();
-    let mut heap = Heap::new(THREADS);
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
     let board = board(&heap);
     // Old nodes: one chain each on slots 0 and 2, all old after a full collection
-    heap.mutate(|m| {
-        let b = m.get(&board);
+    heap.scope_shared(|m| {
+        let b = m.scope_in(&board);
         for i in 0..OLD {
             Moves::push(m, &b.cells[if i % 2 == 0 { 0 } else { 2 }], m.alloc(Link { next: Slot::default(), tag: moves.ledger.tag() }));
         }
     });
     heap.collect();
     // Young nodes: of every 4, 1 hangs on slot 1, 1 goes after the old node heading slot 0, 1 goes after the (young) node heading slot 1, and 1 is discarded
-    let young_garbage = heap.mutate(|m| {
-        let b = m.get(&board);
+    let young_garbage = heap.scope_shared(|m| {
+        let b = m.scope_in(&board);
         let old_head = b.cells[0].get().expect("the old chain is not empty");
         let mut garbage = 0;
         for i in 0..YOUNG {
@@ -939,8 +939,8 @@ fn young_collection_frees_only_young_garbage() {
         garbage
     });
     // Old garbage: take OLD_DISCARD off slot 2 (all old nodes)
-    heap.mutate(|m| {
-        let b = m.get(&board);
+    heap.scope_shared(|m| {
+        let b = m.scope_in(&board);
         for _ in 0..OLD_DISCARD {
             Moves::pop(m, &b.cells[2]).expect("the old chain is long enough");
             moves.discarded.fetch_add(1, Ordering::Relaxed);
@@ -964,7 +964,7 @@ fn young_collection_frees_only_young_garbage() {
 #[test]
 fn young_collections_while_relinking() {
     let moves = Moves::default();
-    let mut heap = Heap::new(THREADS);
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
     let board = board(&heap);
     for round in 0..MARK_ROUNDS * 2 {
         match round % 3 {
@@ -989,19 +989,19 @@ fn young_collections_while_relinking() {
 
 /// Cycle test: every holder on the holder chain holds a two-node cycle.
 #[derive(Trace)]
-struct Holder<'gc> {
-    ring: Slot<'gc, Link<'gc>>,
-    next: Slot<'gc, Holder<'gc>>,
+struct Holder<'heap, 'scope> {
+    ring: Slot<'heap, 'scope, Link<'heap, 'scope>>,
+    next: Slot<'heap, 'scope, Holder<'heap, 'scope>>,
     tag: Counted,
 }
 
 #[derive(Trace)]
-struct Holders<'gc> {
-    head: Slot<'gc, Holder<'gc>>,
-    plain: Slot<'gc, Link<'gc>>,
+struct Holders<'heap, 'scope> {
+    head: Slot<'heap, 'scope, Holder<'heap, 'scope>>,
+    plain: Slot<'heap, 'scope, Link<'heap, 'scope>>,
 }
 
-brand!(HoldersB = for<'gc> Holders<'gc>);
+brand!(HoldersB = for<'heap, 'scope> Holders<'heap, 'scope>);
 
 /// Reference counting cannot reclaim cycles: PAIRS holders each hold a two-node cycle (a.next = c, c.next = a), plus PAIRS plain nodes;
 /// all old after a full collection. Then both the holder chain and the plain chain are taken off: holders and plain nodes drop to zero and the young collection (reference counting) reclaims them;
@@ -1010,10 +1010,10 @@ brand!(HoldersB = for<'gc> Holders<'gc>);
 fn reference_counting_leaves_cycles_to_tracing() {
     const PAIRS: usize = if cfg!(miri) { 20 } else { 500 };
     let moves = Moves::default();
-    let mut heap = Heap::new(THREADS);
-    let root: Root<HoldersB> = heap.mutate(|m| m.root(m.alloc(Holders { head: Slot::default(), plain: Slot::default() })));
-    heap.mutate(|m| {
-        let holders = m.get(&root);
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
+    let root: ScopeGlobal<'_, '_, HoldersB> = heap.scope_shared(|m| m.global(m.alloc(Holders { head: Slot::default(), plain: Slot::default() })));
+    heap.scope_shared(|m| {
+        let holders = m.scope_in(&root);
         for _ in 0..PAIRS {
             let first = m.alloc(Link { next: Slot::default(), tag: moves.ledger.tag() });
             let second = m.alloc(Link { next: Some(first).into(), tag: moves.ledger.tag() });
@@ -1027,8 +1027,8 @@ fn reference_counting_leaves_cycles_to_tracing() {
     heap.collect();
     let before = moves.ledger.dropped.load(Ordering::Relaxed);
     assert_eq!(before, 0);
-    heap.mutate(|m| {
-        let holders = m.get(&root);
+    heap.scope_shared(|m| {
+        let holders = m.scope_in(&root);
         holders.head.set(m, None);
         holders.plain.set(m, None);
     });
@@ -1046,19 +1046,19 @@ fn reference_counting_leaves_cycles_to_tracing() {
 fn background_release_while_mutating() {
     const CHAIN: usize = if cfg!(miri) { 60 } else { 20_000 };
     let moves = Moves::default();
-    let mut heap = Heap::new(THREADS);
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
     let board = board(&heap);
-    let spare: Root<BoardB> = heap.mutate(|m| m.root(m.alloc(Board { cells: vec![Slot::default()] })));
+    let spare: ScopeGlobal<'_, '_, BoardB> = heap.scope_shared(|m| m.global(m.alloc(Board { cells: vec![Slot::default()] })));
     // A long old chain hangs on another board, with trustworthy counts after a full collection
-    heap.mutate(|m| {
-        let cell = &m.get(&spare).cells[0];
+    heap.scope_shared(|m| {
+        let cell = &m.scope_in(&spare).cells[0];
         for _ in 0..CHAIN {
             Moves::push(m, cell, m.alloc(Link { next: Slot::default(), tag: moves.ledger.tag() }));
         }
     });
     heap.collect();
     // Discard it whole: only one slot on the board changes
-    heap.mutate(|m| m.get(&spare).cells[0].set(m, None));
+    heap.scope_shared(|m| m.scope_in(&spare).cells[0].set(m, None));
     moves.discarded.fetch_add(CHAIN, Ordering::Relaxed);
     let before = moves.ledger.dropped.load(Ordering::Relaxed);
     heap.finish_young();
@@ -1070,8 +1070,8 @@ fn background_release_while_mutating() {
     // The next pause recomputes lines; allocating as many nodes again reuses the freed lines (the block count barely grows)
     heap.collect_young();
     let blocks_after_release = heap.stats().blocks;
-    heap.mutate(|m| {
-        let cell = &m.get(&spare).cells[0];
+    heap.scope_shared(|m| {
+        let cell = &m.scope_in(&spare).cells[0];
         for _ in 0..CHAIN {
             Moves::push(m, cell, m.alloc(Link { next: Slot::default(), tag: moves.ledger.tag() }));
         }
@@ -1094,11 +1094,11 @@ fn concurrent_marking_recounts() {
     let moves = Moves::default();
     // The old chain is accounted separately (not on the main board, not in moves' ledger)
     let chain = Ledger::default();
-    let mut heap = Heap::new(THREADS);
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
     let board = board(&heap);
-    let spare: Root<BoardB> = heap.mutate(|m| m.root(m.alloc(Board { cells: vec![Slot::default()] })));
-    heap.mutate(|m| {
-        let cell = &m.get(&spare).cells[0];
+    let spare: ScopeGlobal<'_, '_, BoardB> = heap.scope_shared(|m| m.global(m.alloc(Board { cells: vec![Slot::default()] })));
+    heap.scope_shared(|m| {
+        let cell = &m.scope_in(&spare).cells[0];
         for _ in 0..CHAIN {
             Moves::push(m, cell, m.alloc(Link { next: Slot::default(), tag: chain.tag() }));
         }
@@ -1109,7 +1109,7 @@ fn concurrent_marking_recounts() {
     moves.check(&heap, &board, 0);
     assert_eq!(chain.dropped.load(Ordering::Relaxed), 0);
     // Counts should be trustworthy: discard the whole chain and the young collection releases it by count
-    heap.mutate(|m| m.get(&spare).cells[0].set(m, None));
+    heap.scope_shared(|m| m.scope_in(&spare).cells[0].set(m, None));
     heap.collect_young();
     assert_eq!(chain.dropped.load(Ordering::Relaxed), CHAIN, "counts untrustworthy after concurrent marking: the discarded chain was not released by the young collection");
     // A few more rounds: mutators move and young collections release by count, never touching what still hangs
@@ -1125,17 +1125,17 @@ fn concurrent_marking_recounts() {
 #[test]
 fn gc_from_raw_round_trip() {
     // Layout: one pointer in size, and so is the Option (repr(transparent) + NonNull)
-    assert_eq!(size_of::<Gc<'static, u64>>(), size_of::<*const u64>());
-    assert_eq!(size_of::<Option<Gc<'static, u64>>>(), size_of::<*const u64>());
-    let heap = Heap::new(THREADS);
-    heap.mutate(|m| {
+    assert_eq!(size_of::<ScopeLocal<'static, 'static, u64>>(), size_of::<*const u64>());
+    assert_eq!(size_of::<Option<ScopeLocal<'static, 'static, u64>>>(), size_of::<*const u64>());
+    let heap = unsafe { Heap::new_unchecked(THREADS) };
+    heap.scope_shared(|m| {
         let a = m.alloc(Node { value: 7, next: None });
         let b = m.alloc(Node { value: 8, next: Some(a) });
-        // Turn it into a raw address and back (within the same mutate)
+        // Turn it into a raw address and back (within the same scope)
         let raw = b.as_ptr();
-        // SAFETY: raw is b's data pointer from this mutate, and b is alive
-        let back: Gc<'_, Node<'_>> = unsafe { Gc::from_raw(raw) };
-        assert!(Gc::ptr_eq(back, b));
+        // SAFETY: raw is b's data pointer from this scope, and b is alive
+        let back: ScopeLocal<'_, '_, Node<'_, '_>> = unsafe { ScopeLocal::from_raw(raw) };
+        assert!(ScopeLocal::ptr_eq(back, b));
         assert_eq!(back.value, 8);
         assert_eq!(back.next.map(|n| n.value), Some(7));
     });
@@ -1145,18 +1145,18 @@ fn gc_from_raw_round_trip() {
 /// a holder promoted before the first full collection (counts still untrustworthy, promotion does not recount) keeps the young leaves written into it alive through the next young collection.
 #[test]
 fn promoted_slots_remember_young_values() {
-    let heap = &mut Heap::new(THREADS);
+    let heap = &mut unsafe { Heap::new_unchecked(THREADS) };
     let drops = Arc::new(AtomicUsize::new(0));
-    let holder: Root<TreeB> = heap.mutate(|m| m.root(m.alloc(Tree::Branch { left: Slot::default(), right: Slot::default() })));
+    let holder: ScopeGlobal<'_, '_, TreeB> = heap.scope_shared(|m| m.global(m.alloc(Tree::Branch { left: Slot::default(), right: Slot::default() })));
     heap.collect_young();
-    heap.mutate(|m| {
-        let Tree::Branch { left, .. } = &*m.get(&holder) else { unreachable!() };
+    heap.scope_shared(|m| {
+        let Tree::Branch { left, .. } = &*m.scope_in(&holder) else { unreachable!() };
         left.set(m, Some(m.alloc(Tree::Leaf(Counted(drops.clone())))));
     });
     heap.collect_young();
     assert_eq!(drops.load(Ordering::Relaxed), 0, "a young leaf held by a promoted holder was collected");
-    heap.mutate(|m| {
-        let Tree::Branch { left, .. } = &*m.get(&holder) else { unreachable!() };
+    heap.scope_shared(|m| {
+        let Tree::Branch { left, .. } = &*m.scope_in(&holder) else { unreachable!() };
         assert!(matches!(left.get().as_deref(), Some(Tree::Leaf(_))));
     });
     drop(holder);
@@ -1164,7 +1164,7 @@ fn promoted_slots_remember_young_values() {
     assert_eq!(drops.load(Ordering::Relaxed), 1);
 }
 
-/// Records on drop whether it ran on the thread that created the heap (no Gc, so it may have Drop).
+/// Records on drop whether it ran on the thread that created the heap (no ScopeLocal, so it may have Drop).
 struct Witness(Arc<(std::thread::ThreadId, AtomicUsize, AtomicUsize)>);
 
 impl Drop for Witness {
@@ -1177,20 +1177,20 @@ impl Drop for Witness {
     }
 }
 
-// SAFETY: no Gc
+// SAFETY: no ScopeLocal
 unsafe impl Trace for Witness {
     const NO_EDGES: bool = true;
     fn trace(&self, _: &mut Tracer<'_>) {}
 }
 
 #[derive(Trace)]
-struct Twig<'gc> {
-    left: Slot<'gc, Twig<'gc>>,
-    right: Slot<'gc, Twig<'gc>>,
+struct Twig<'heap, 'scope> {
+    left: Slot<'heap, 'scope, Twig<'heap, 'scope>>,
+    right: Slot<'heap, 'scope, Twig<'heap, 'scope>>,
     witness: Witness,
 }
 
-brand!(TwigB = for<'gc> Twig<'gc>);
+brand!(TwigB = for<'heap, 'scope> Twig<'heap, 'scope>);
 
 /// With parallel finalization off: background release by reference counting, parallel sweeping (young / full) and dropping the heap all finalize dead objects on the caller's thread only, none missing.
 #[test]
@@ -1198,26 +1198,26 @@ fn serial_drop_stays_on_the_caller() {
     const DEPTH: u32 = if cfg!(miri) { 6 } else { 15 };
     let nodes = (1usize << DEPTH) - 1;
     let ledger = Arc::new((std::thread::current().id(), AtomicUsize::new(0), AtomicUsize::new(0)));
-    let mut heap = Heap::new(THREADS);
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
     heap.set_parallel_drop(false);
-    let tree = |heap: &Heap| -> Root<TwigB> {
-        heap.mutate(|m| {
+    let tree = |heap: &Heap<'static>| -> ScopeGlobal<'static, 'static, TwigB> {
+        heap.scope_shared(|m| {
             let mut level: Vec<_> = (0..1usize << (DEPTH - 1)).map(|_| m.alloc(Twig { left: Slot::default(), right: Slot::default(), witness: Witness(ledger.clone()) })).collect();
             while level.len() > 1 {
                 level = level.chunks(2).map(|pair| m.alloc(Twig { left: pair[0].into(), right: pair[1].into(), witness: Witness(ledger.clone()) })).collect();
             }
-            m.root(level[0])
+            m.global(level[0])
         })
     };
-    let holder: Root<TwigB> = heap.mutate(|m| m.root(m.alloc(Twig { left: Slot::default(), right: Slot::default(), witness: Witness(ledger.clone()) })));
+    let holder: ScopeGlobal<'_, '_, TwigB> = heap.scope_shared(|m| m.global(m.alloc(Twig { left: Slot::default(), right: Slot::default(), witness: Witness(ledger.clone()) })));
     let first = tree(&heap);
-    heap.mutate(|m| m.get(&holder).left.set(m, Some(m.get(&first))));
+    heap.scope_shared(|m| m.scope_in(&holder).left.set(m, Some(m.scope_in(&first))));
     drop(first);
     heap.collect();
     heap.collect();
     assert_eq!(ledger.1.load(Ordering::Relaxed), 0);
     // The old tree is taken off: its count drops to zero and the background release after the young collection finalizes it
-    heap.mutate(|m| m.get(&holder).left.set(m, None));
+    heap.scope_shared(|m| m.scope_in(&holder).left.set(m, None));
     heap.collect_young();
     assert_eq!(ledger.1.load(Ordering::Relaxed), nodes, "reference counting should reclaim the whole old tree");
     // Young garbage: the young sweep; another tree made old and then discarded: the full collection's sweep
@@ -1255,11 +1255,11 @@ struct Medium {
 }
 
 #[derive(Trace)]
-struct Lines<'gc> {
-    kept: Vec<Slot<'gc, Line>>,
+struct Lines<'heap, 'scope> {
+    kept: Vec<Slot<'heap, 'scope, Line>>,
 }
 
-brand!(LinesB = for<'gc> Lines<'gc>);
+brand!(LinesB = for<'heap, 'scope> Lines<'heap, 'scope>);
 
 /// Overflow allocation: when blocks have only single-line holes left, alternating small and medium objects (medium ones do not fit a single-line hole) keeps filling the old holes with small objects
 /// while medium objects get overflow blocks — only enough new blocks for the medium objects (if medium objects took the main cursor away, every old hole would be wasted and small objects would need new blocks too).
@@ -1268,16 +1268,16 @@ fn medium_objects_overflow_without_wasting_holes() {
     const HOLES: usize = if cfg!(miri) { 300 } else { 6000 };
     /// Block size (paragc::layout::BLOCK)
     const BLOCK: usize = 32 * 1024;
-    let mut heap = Heap::new(THREADS);
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
     // Allocate line-sized objects back to back and discard one in three: after a full collection every dead one is a single-line hole (blocks 2/3 live, not evacuated)
-    let lines: Root<LinesB> = heap.mutate(|m| {
+    let lines: ScopeGlobal<'_, '_, LinesB> = heap.scope_shared(|m| {
         let all: Vec<_> = (0..3 * HOLES).map(|_| m.alloc(Line { fill: [0; 29] })).collect();
-        m.root(m.alloc(Lines { kept: all.iter().enumerate().filter(|(i, _)| i % 3 != 2).map(|(_, &l)| Slot::from(Some(l))).collect() }))
+        m.global(m.alloc(Lines { kept: all.iter().enumerate().filter(|(i, _)| i % 3 != 2).map(|(_, &l)| Slot::from(Some(l))).collect() }))
     });
     heap.collect();
     heap.collect();
     let before = heap.stats().blocks;
-    heap.mutate(|m| {
+    heap.scope_shared(|m| {
         for _ in 0..HOLES {
             for _ in 0..5 {
                 m.alloc(Small { _pad: [1; 3] });
@@ -1293,23 +1293,23 @@ fn medium_objects_overflow_without_wasting_holes() {
 
 /// A holder (which becomes old) and the young chain it holds.
 #[derive(Trace)]
-struct Anchor<'gc> {
-    head: Slot<'gc, Bead<'gc>>,
+struct Anchor<'heap, 'scope> {
+    head: Slot<'heap, 'scope, Bead<'heap, 'scope>>,
 }
 
-brand!(AnchorB = for<'gc> Anchor<'gc>);
+brand!(AnchorB = for<'heap, 'scope> Anchor<'heap, 'scope>);
 
 #[derive(Trace)]
-struct Bead<'gc> {
+struct Bead<'heap, 'scope> {
     value: u64,
-    next: Option<Gc<'gc, Bead<'gc>>>,
+    next: Option<ScopeLocal<'heap, 'scope, Bead<'heap, 'scope>>>,
     _counted: Counted,
 }
 
-brand!(BeadB = for<'gc> Bead<'gc>);
+brand!(BeadB = for<'heap, 'scope> Bead<'heap, 'scope>);
 
 /// (address, value) of every node on the chain.
-fn beads<'gc>(head: Option<Gc<'gc, Bead<'gc>>>) -> Vec<(usize, u64)> {
+fn beads<'heap, 'scope>(head: Option<ScopeLocal<'heap, 'scope, Bead<'heap, 'scope>>>) -> Vec<(usize, u64)> {
     let mut out = Vec::new();
     let mut cur = head;
     while let Some(b) = cur {
@@ -1320,7 +1320,7 @@ fn beads<'gc>(head: Option<Gc<'gc, Bead<'gc>>>) -> Vec<(usize, u64)> {
 }
 
 /// Make a chain of `len` nodes (values from `from` on) with garbage between the nodes (survivors scattered across blocks).
-fn chain<'gc>(m: &paragc::Mutator<'gc>, drops: &Arc<AtomicUsize>, from: u64, len: u64) -> Gc<'gc, Bead<'gc>> {
+fn chain<'heap, 'scope>(m: &'scope paragc::Scope<'heap, '_>, drops: &Arc<AtomicUsize>, from: u64, len: u64) -> ScopeLocal<'heap, 'scope, Bead<'heap, 'scope>> {
     let mut top = None;
     for value in from..from + len {
         m.alloc(Bead { value: u64::MAX, next: None, _counted: Counted(drops.clone()) });
@@ -1339,20 +1339,20 @@ fn young_evacuation_moves_survivors() {
     let n = usize::try_from(LEN).expect("chain length");
     for mode in [YoungEvacuation::Full, YoungEvacuation::SkipRemembered, YoungEvacuation::Off] {
         let drops = Arc::new(AtomicUsize::new(0));
-        let mut heap = Heap::new(THREADS);
+        let mut heap = unsafe { Heap::new_unchecked(THREADS) };
         heap.set_young_evacuation(mode);
-        let anchor: Root<AnchorB> = heap.mutate(|m| m.root(m.alloc(Anchor { head: Slot::default() })));
+        let anchor: ScopeGlobal<'_, '_, AnchorB> = heap.scope_shared(|m| m.global(m.alloc(Anchor { head: Slot::default() })));
         heap.collect();
         heap.collect();
-        let (rooted, before_slot, before_root): (Root<BeadB>, _, _) = heap.mutate(|m| {
-            let a = m.get(&anchor);
+        let (rooted, before_slot, before_root): (ScopeGlobal<'_, '_, BeadB>, _, _) = heap.scope_shared(|m| {
+            let a = m.scope_in(&anchor);
             a.head.set(m, Some(chain(m, &drops, 0, LEN)));
             let r = chain(m, &drops, LEN, LEN);
-            (m.root(r), beads(a.head.get()), beads(Some(r)))
+            (m.global(r), beads(a.head.get()), beads(Some(r)))
         });
         heap.collect_young();
         assert_eq!(drops.load(Ordering::Relaxed), 2 * n, "{mode:?}: the garbage in between should all be finalized");
-        let (after_slot, after_root) = heap.mutate(|m| (beads(m.get(&anchor).head.get()), beads(Some(m.get(&rooted)))));
+        let (after_slot, after_root) = heap.scope_shared(|m| (beads(m.scope_in(&anchor).head.get()), beads(Some(m.scope_in(&rooted)))));
         let values = |v: &[(usize, u64)]| v.iter().map(|&(_, x)| x).collect::<Vec<_>>();
         assert_eq!(values(&after_slot), values(&before_slot), "{mode:?}: the values of the chain on the slot changed");
         assert_eq!(values(&after_root), values(&before_root), "{mode:?}: the values of the chain on the root changed");
@@ -1369,7 +1369,7 @@ fn young_evacuation_moves_survivors() {
             YoungEvacuation::Off => assert_eq!((slot_moved, root_moved), (0, 0), "Off: nothing should move"),
         }
         // Take both chains off: reference counting (the slot's chain) and young / full collections (the root's chain) reclaim them, with an exact finalized count
-        heap.mutate(|m| m.get(&anchor).head.set(m, None));
+        heap.scope_shared(|m| m.scope_in(&anchor).head.set(m, None));
         drop(rooted);
         heap.collect_young();
         heap.collect();
@@ -1382,27 +1382,27 @@ fn young_evacuation_moves_survivors() {
 #[test]
 fn shrink_keeps_objects_and_reuses_lines() {
     const HOLES: usize = if cfg!(miri) { 100 } else { 3000 };
-    let mut heap = Heap::new(THREADS);
-    let lines: Root<LinesB> = heap.mutate(|m| {
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
+    let lines: ScopeGlobal<'_, '_, LinesB> = heap.scope_shared(|m| {
         let all: Vec<_> = (0..3 * HOLES).map(|i| m.alloc(Line { fill: [i as u64; 29] })).collect();
-        m.root(m.alloc(Lines { kept: all.iter().enumerate().filter(|(i, _)| i % 3 == 0).map(|(_, &l)| Slot::from(Some(l))).collect() }))
+        m.global(m.alloc(Lines { kept: all.iter().enumerate().filter(|(i, _)| i % 3 == 0).map(|(_, &l)| Slot::from(Some(l))).collect() }))
     });
     heap.shrink();
-    let check = |heap: &Heap| heap.mutate(|m| m.get(&lines).kept.iter().enumerate().all(|(k, s)| s.get().is_some_and(|l| l.fill.iter().all(|&x| x == 3 * k as u64))));
+    let check = |heap: &Heap<'static>| heap.scope_shared(|m| m.scope_in(&lines).kept.iter().enumerate().all(|(k, s)| s.get().is_some_and(|l| l.fill.iter().all(|&x| x == 3 * k as u64))));
     assert!(check(&heap), "live objects' contents changed after shrink");
     let drops = Arc::new(AtomicUsize::new(0));
     let fresh = build_tree(&heap, &drops, if cfg!(miri) { 8 } else { 14 });
     assert!(check(&heap));
-    assert_eq!(heap.mutate(|m| m.get(&fresh).count()), (1 << if cfg!(miri) { 8 } else { 14 }) - 1);
+    assert_eq!(heap.scope_shared(|m| m.scope_in(&fresh).count()), (1 << if cfg!(miri) { 8 } else { 14 }) - 1);
     drop(fresh);
     heap.shrink();
     assert!(check(&heap));
 }
 
-fn list_addrs(heap: &Heap, root: &Root<NodeB>) -> Vec<usize> {
-    heap.mutate(|m| {
+fn list_addrs<'h>(heap: &Heap<'h>, root: &ScopeGlobal<'h, 'h, NodeB>) -> Vec<usize> {
+    heap.scope_shared(|m| {
         let mut out = Vec::new();
-        let mut cur = Some(m.get(root));
+        let mut cur = Some(m.scope_in(root));
         while let Some(n) = cur {
             out.push(n.as_ptr().addr());
             cur = n.next;
@@ -1414,7 +1414,7 @@ fn list_addrs(heap: &Heap, root: &Root<NodeB>) -> Vec<usize> {
 /// When the last young collection kept nearly everything, this one does not move young objects (promotion in place); with low survival they move as usual.
 #[test]
 fn young_collection_promotes_in_place_when_most_survive() {
-    let mut heap = Heap::new(THREADS);
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
     let first = build_list(&heap, LIST_LEN);
     heap.collect_young();
     // All survived: the next one does not move
@@ -1425,7 +1425,7 @@ fn young_collection_promotes_in_place_when_most_survive() {
     assert_eq!(sum_list(&heap, &first), LIST_LEN * (LIST_LEN - 1) / 2);
     assert_eq!(sum_list(&heap, &second), LIST_LEN * (LIST_LEN - 1) / 2);
     // This round is nearly all garbage: low survival, so the round after moves as usual
-    heap.mutate(|m| {
+    heap.scope_shared(|m| {
         for value in 0..LIST_LEN * 8 {
             m.alloc(Node { value, next: None });
         }

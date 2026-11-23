@@ -29,11 +29,11 @@ cppgc::Persistent<Node> root(node);
 | --- | --- | --- |
 | `GarbageCollected<T>` | 堆对象的基类 | `#[derive(Trace)]` |
 | `Trace(Visitor*)` | 手写，报告每个指针字段 | 由派生生成 |
-| `Member<T>` | 堆对象里的指针字段，带写屏障 | `Slot<'gc, T>` |
+| `Member<T>` | 堆对象里的指针字段，带写屏障 | `Slot<'heap, 'scope, T>` |
 | `WeakMember<T>` | 弱字段 | 对象里的 `Weak` |
-| `Persistent<T>` | 从堆外持有的根 | `Root<B>` |
+| `Persistent<T>` | 从堆外持有的根 | `ScopeGlobal<'heap, 'heap, B>` |
 | `WeakPersistent<T>` | 弱根 | `Weak<B>` |
-| 栈上的裸 `T*` | 靠保守扫栈找到 | `Gc<'gc, T>`，只在 `mutate` 里安全 |
+| 栈上的裸 `T*` | 靠保守扫栈找到 | `ScopeLocal<'heap, 'scope, T>`，对所属 scope 的借用，任何一次回收前由借用检查器让它失效 |
 
 ## 怎么回收
 
@@ -57,7 +57,7 @@ cppgc::Persistent<Node> root(node);
 
 | | cppgc | paragc |
 | --- | --- | --- |
-| 栈 | 保守扫描 | 不扫；`Gc` 句柄被 Rust 生命周期限制在 `mutate` 里 |
+| 栈 | 保守扫描 | 不扫；`ScopeLocal` 被 Rust 生命周期限制在所属 scope 里，根（`ScopeGlobal`）是显式的 |
 | 全停 | 需要每个线程停在已知位置 | `&mut Heap`：借用检查器证明没人在里面 |
 | 搬动 | 普通对象从不搬 | 疏散和年轻复制，因为不存在收集器不知道的裸指针 |
 | 追踪代码 | 手写 `Trace` | 派生生成；编译期拒绝被追踪类型实现 `Drop` |

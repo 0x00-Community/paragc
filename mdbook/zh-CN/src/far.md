@@ -1,20 +1,20 @@
 # Far 引用与一起回收
 
-一个进程里可以有好几个私有堆：一个 isolate 一个，或者一个子系统一个。`Far<'a, B>` 让一个堆里的对象直接指向另一个堆里的
+一个进程里可以有好几个私有堆：一个 isolate 一个，或者一个子系统一个。`Far<'heap, 'scope, B>` 让一个堆里的对象直接指向另一个堆里的
 对象，不复制，也不经过间接层。
 
 ## 建立与读取
 
 ```rust
-// 同时在两个堆的 mutate 里
+// 同时在两个堆的 scope 里
 let far = Far::new(&holder_m, &target_m, target_gc);
 let holder = holder_m.alloc(Holder { far });
-// 之后读取要目标堆的 Mutator
+// 之后读取要目标堆的 Scope
 let t = holder.far.get(&target_m);
 ```
 
-- `Far` 带的是**持有方**堆的品牌，所以只能存在那个堆的对象里。
-- 读取要**目标**堆的 `Mutator`。手里有这个 mutator，就证明目标堆是打开的，而且它此刻没有在回收。
+- `Far` 带的是**持有方**堆的 Brand，所以只能存在那个堆的对象里。
+- 读取要**目标**堆的 `Scope`。手里有这个 mutator，就证明目标堆是打开的，而且它此刻没有在回收。
 - `Far` 建好后不变。要改指向，把它放进 `Slot` 后面的对象里，换掉那个对象。
 
 ## 入口：目标堆怎么看它

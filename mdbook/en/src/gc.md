@@ -21,7 +21,7 @@ A collector cannot know which objects the program will use in the future; that i
 approximation instead: **an object is live if the program could still reach it**.
 
 - **Roots** are the places the program reads directly: local variables on the stacks, registers, globals, and, in a
-  library like paragc, handles the program explicitly registers (`Root`).
+  library like paragc, handles the program explicitly registers (`ScopeGlobal`).
 - An object is **reachable** if a chain of pointers leads to it from a root.
 - Everything else is garbage. No chain of pointers leads to it, so the program cannot touch it again, and reusing its
   memory is safe.
@@ -136,7 +136,7 @@ everywhere.
 | **Throughput** | what fraction of time goes to the program rather than the collector? |
 | **Latency** | how long are the pauses, and how often? |
 | **Footprint** | how much memory beyond the live data does it need? |
-| **Mutator overhead** | what do barriers and allocation cost the program? |
+| **Scope overhead** | what do barriers and allocation cost the program? |
 | **Scalability** | does it use all the cores, for allocation and for collection? |
 
 No design wins on all five. Every collector in the next chapters makes a different trade between them.

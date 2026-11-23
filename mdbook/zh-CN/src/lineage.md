@@ -7,9 +7,9 @@ paragc 由前几章里的想法拼成，再加上一个只有 Rust 才做得到�
 
 | 想法 | 来源 | 在 paragc 里 |
 | --- | --- | --- |
-| 从根出发追踪 | McCarthy，1960 | 每次回收都从 `Root`、入口和记下的槽出发标记 |
+| 从根出发追踪 | McCarthy，1960 | 每次回收都从 `ScopeGlobal`、入口和记下的槽出发标记 |
 | 三色标记、SATB 屏障 | Dijkstra 等 1978；Yuasa 1990 | 并发标记，`Slot` 写入上的删除屏障加黑分配（[并发](concurrent.md)） |
-| 线程本地缓冲里递增分配 | 复制式收集器；JVM 的 TLAB | `Tlab`，`mutate` 里每线程一个（[分配](allocation.md)） |
+| 线程本地缓冲里递增分配 | 复制式收集器；JVM 的 TLAB | `Tlab`，`scope` 里每线程一个（[分配](allocation.md)） |
 | 标记-区域堆：块和行 | Immix，2008 | 32 KiB 块、256 B 行、溢出分配（[布局](layout.md)） |
 | 机会式疏散 | Immix | 标记时复制稀疏块（[疏散](evacuation.md)） |
 | 分代、记忆集 | Lieberman 与 Hewitt；Ungar | 粘性标记位的年轻回收、记录槽（[年轻回收](young.md)） |
@@ -22,8 +22,8 @@ paragc 由前几章里的想法拼成，再加上一个只有 Rust 才做得到�
 
 **借用检查器就是全停。** JVM 需要安全点和栈图，cppgc 需要保守扫栈。paragc 两样都不需要：
 
-- `Gc<'gc, T>` 离不开产生它的那次 `mutate`，所以 `mutate` 之外不存在没登记的指针；
-- 全停回收要 `&mut Heap`，所以编译器证明此时没有 `mutate` 在跑。
+- `ScopeLocal<'heap, 'scope, T>` 是对产生它的 scope 的借用，所以不会有没登记的指针活得比它久；
+- 全停回收要 `&mut` 堆或某个独占 scope，所以编译器证明回收时没有活着的直接指针。
 
 正因如此，paragc 作为一个普通的库，就能**搬**对象（疏散、年轻复制），既不需要读屏障，也不需要保守式钉住。
 

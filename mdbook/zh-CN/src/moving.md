@@ -1,19 +1,19 @@
 # 对象地址为什么会变
 
-从外面用 paragc，第一个意外是：同一个对象在下一次 `mutate` 里地址可能不同。本章从使用者的角度解释：你会看到什么、什么时候发生、paragc 为什么这样做、哪些东西能跨回收保存、哪些不能。
+从外面用 paragc，第一个意外是：同一个对象在一次回收之后地址可能不同。本章从使用者的角度解释：你会看到什么、什么时候发生、paragc 为什么这样做、哪些东西能跨回收保存、哪些不能。
 
 ## 你会看到什么
 
 ```rust
-let root = heap.mutate(|m| m.root(m.alloc(Node { value: 1, next: None })));
-let before = heap.mutate(|m| m.get(&root).as_ptr() as usize);
+let root = heap.scope(|m| m.global(m.alloc(Node { value: 1, next: None })));
+let before = heap.scope(|m| m.scope_in(&root).as_ptr() as usize);
 heap.collect_young();
-let after = heap.mutate(|m| m.get(&root).as_ptr() as usize);
+let after = heap.scope(|m| m.scope_in(&root).as_ptr() as usize);
 assert_ne!(before, after);            // 通常成立：存活者被复制走了
-assert_eq!(heap.mutate(|m| m.get(&root).value), 1);   // 对象还是那个对象
+assert_eq!(heap.scope(|m| m.scope_in(&root).value), 1);   // 对象还是那个对象
 ```
 
-`Root` 仍然找得到这个对象，值也没变，变的只是地址。
+`ScopeGlobal` 仍然找得到这个对象，值也没变，变的只是地址。
 
 ## 一个对象的一生
 
@@ -27,7 +27,7 @@ assert_eq!(heap.mutate(|m| m.get(&root).value), 1);   // 对象还是那个对�
 | 全停的完整回收 | 稀疏块（活数据不到一半）里的活对象 | 总是开启 |
 | 挂着跨堆时的年轻回收 | 可共享的存活者，搬进跨堆 | 只限 `alloc_shared` 的类型 |
 
-从不搬：`mutate` 期间的任何对象；并发标记、一起回收期间的任何对象；大对象（超过 16 KiB）；`Far` 的目标；已经在跨堆里的对象。
+从不搬：不回收的 scope 里的任何对象；并发标记、一起回收期间的任何对象；大对象（超过 16 KiB）；`Far` 的目标；已经在跨堆里的对象。
 
 ## 为什么要搬
 
@@ -44,8 +44,8 @@ assert_eq!(heap.mutate(|m| m.get(&root).value), 1);   // 对象还是那个对�
 
 <div class="dg"><div class="dg-cap">搬动之后的旧副本</div><div class="bf"><div class="k7" style="--w:4"><b>mark</b><small>置 FORWARDED</small><i>bit 31</i></div><div class="k2" style="--w:4"><b>info</b></div><div class="k3" style="--w:8"><b>visit</b></div><div class="k1" style="--w:8"><b>drop</b><small>→ 新地址</small></div><div class="dim" style="--w:20"><b>T</b><small>旧数据，不会再读</small></div></div></div>
 
-- **`Gc` 句柄**在搬动时不可能存在：它出不了 `mutate`，而会搬对象的回收要取 `&mut Heap`。
-- **对象里的边**（`Gc`、`Slot`、`WordSlot` 字段）经 `Trace::relocate` 改写，`#[derive(Trace)]` 会生成它。
+- **`ScopeLocal`** 在搬动时不可能存在：它是对所属 scope 的借用，而会搬对象的回收要取 `&mut` 堆或这个 scope。
+- **对象里的边**（`ScopeLocal`、`Slot`、`WordSlot` 字段）经 `Trace::relocate` 改写，`#[derive(Trace)]` 会生成它。
 - **根、弱引用、`Far` 入口**放在回收器自己的表里，在表里改写。
 - **老对象被记下的槽**在 `Full` 模式下改写；在 `SkipRemembered` 模式下，它们的目标干脆不搬。
 
@@ -53,25 +53,25 @@ assert_eq!(heap.mutate(|m| m.get(&root).value), 1);   // 对象还是那个对�
 
 | 保存 | 为什么仍然有效 |
 | --- | --- |
-| `Root<B>`、`Weak<B>` | 回收器改写它们的表槽 |
+| `ScopeGlobal<'heap, 'heap, B>`、`Weak<B>` | 回收器改写它们的表槽 |
 | 堆对象的字段 | 由 `Trace::relocate` 改写 |
 | `WordSlot` 字的标签位 | 只有低 48 位会变 |
-| `CrossHeapSlot`、`CrossHeapRoot::index`、`CrossHeapWeak`、`Signature` | 它们指的是跨堆对象，而跨堆对象从不搬 |
+| `CrossHeapSlot`、`CrossHeapGlobal::index`、`CrossHeapWeak`、`Signature` | 它们指的是跨堆对象，而跨堆对象从不搬 |
 | 从对象里复制出来的值 | 它们归你了 |
 
 ## 哪些会坏，该怎么做
 
 | 写法 | 为什么会坏 | 改成 |
 | --- | --- | --- |
-| 把 `as_ptr()` 存进 Rust 结构，下一次 `mutate` 再用 | 对象可能搬走了，旧地址上可能已经是别的对象 | 存 `Root`（或 `Weak`），用 `m.get` 取 |
+| 把 `as_ptr()` 存进 Rust 结构，回收之后再用 | 对象可能搬走了，旧地址上可能已经是别的对象 | 存 `ScopeGlobal`（或 `Weak`），用 `s.scope_in` 取 |
 | 按地址做键的哈希表 | 搬动后键就过期了 | 按内容或稳定的编号哈希；非用地址不可，就在 `relocate` 里重新哈希（见下） |
-| 比较两次不同 `mutate` 里拿到的地址 | 同一个对象可能有两个地址 | 在同一次 `mutate` 里比较，或比较稳定的编号 |
-| 把地址交给 C、操作系统，或活得比 `mutate` 久的线程 | 没有人会改写它 | 把字节复制出去；钉住空间在规划中（宗旨第 1 条：照样会被回收） |
+| 比较回收前后拿到的地址 | 同一个对象可能有两个地址 | 在两次回收之间比较，或比较稳定的编号（Handle） |
+| 把地址交给 C、操作系统，或活得比 scope 久的线程 | 没有人会改写它 | 把字节复制出去；钉住空间在规划中（宗旨第 1 条：照样会被回收） |
 | 把地址写死在生成的代码里 | 那段代码不是回收器认识的边 | 经 handle 引用目标、把 id 写进代码（j8 的 shape），或把代码做成被追踪的对象 |
 
 ## 在 j8 里
 
-- **对象的 `===`** 比较的是 NaN-boxing 的字。两个操作数在同一轮、同一次 `mutate` 里读出，结果一致。
+- **对象的 `===`** 比较的是 NaN-boxing 的字。两个操作数在同一轮、同一次 `scope` 里读出，结果一致。
 - **`Map` 和 `Set`** 按地址索引对象（`MapKey::Ref`）。`Collection::relocate` 在搬动后重算每个对象键并重新插入，就是上面说的「在 relocate 里重新哈希」。
 - **shape** 在内联缓存里被比较、被写死在 JIT 代码里。它们是经 [handle](handles.md) 引用的 GC 对象：shape 搬家只改写它的 handle 表项，缓存和机器码比较的 id 永远不变。
 - **字符串**随便搬：堆外没有谁记着它们的地址，它们的字节在尾巴里跟着走。

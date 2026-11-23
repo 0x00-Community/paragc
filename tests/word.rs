@@ -4,9 +4,9 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use paragc::{Gc, Heap, Root, Trace, Tracer, WORD_PAYLOAD, WordSlot, YoungEvacuation, brand, word_pointer};
+use paragc::{ScopeLocal, Heap, ScopeGlobal, Trace, Tracer, WORD_PAYLOAD, WordSlot, YoungEvacuation, brand, word_pointer};
 
-/// Counts on drop (no Gc, so it may have Drop).
+/// Counts on drop (no ScopeLocal, so it may have Drop).
 struct Counted(Arc<AtomicUsize>);
 
 impl Drop for Counted {
@@ -15,7 +15,7 @@ impl Drop for Counted {
     }
 }
 
-// SAFETY: no Gc
+// SAFETY: no ScopeLocal
 unsafe impl Trace for Counted {
     const NO_EDGES: bool = true;
     fn trace(&self, _: &mut Tracer<'_>) {}
@@ -23,13 +23,13 @@ unsafe impl Trace for Counted {
 
 /// A node of the chain: `next` is a pointer word (tag [`TAG`]) or a number word (the end of the chain); `n` is always a number word
 #[derive(Trace)]
-struct Node<'gc> {
-    next: WordSlot<'gc>,
-    n: WordSlot<'gc>,
+struct Node<'heap, 'scope> {
+    next: WordSlot<'heap, 'scope>,
+    n: WordSlot<'heap, 'scope>,
     tag: Counted,
 }
 
-brand!(NodeB = for<'gc> Node<'gc>);
+brand!(NodeB = for<'heap, 'scope> Node<'heap, 'scope>);
 
 /// The user's own pointer tag (in the pointer range, not paragc's `RAW_TAG`)
 const TAG: u64 = 0xFFF9 << 48;
@@ -39,16 +39,16 @@ const END: f64 = -1.5;
 const THREADS: NonZeroUsize = NonZeroUsize::new(if cfg!(miri) { 2 } else { 4 }).unwrap();
 const LEN: usize = if cfg!(miri) { 100 } else { 10_000 };
 
-fn pointer(n: Gc<'_, Node<'_>>) -> u64 {
+fn pointer(n: ScopeLocal<'_, '_, Node<'_, '_>>) -> u64 {
     TAG | n.as_ptr().expose_provenance() as u64
 }
 
 /// The node in a word (the tag must be unchanged)
-fn node<'gc>(word: u64) -> Option<Gc<'gc, Node<'gc>>> {
+fn node<'heap, 'scope>(word: u64) -> Option<ScopeLocal<'heap, 'scope, Node<'heap, 'scope>>> {
     let p = word_pointer(word)?;
     assert_eq!(word & !WORD_PAYLOAD, TAG, "the tag changed");
     // SAFETY: the word was made by `pointer`, and the node is pointed to by a reachable node of the chain
-    Some(unsafe { Gc::from_raw(p.cast::<Node<'gc>>()) })
+    Some(unsafe { ScopeLocal::from_raw(p.cast::<Node<'heap, 'scope>>()) })
 }
 
 fn number(n: f64) -> u64 {
@@ -56,22 +56,22 @@ fn number(n: f64) -> u64 {
 }
 
 /// One root for the head node, then `len` nodes; node i has `n` = i
-fn build(heap: &Heap, len: usize, drops: &Arc<AtomicUsize>) -> Root<NodeB> {
-    heap.mutate(|m| {
+fn build<'h>(heap: &Heap<'h>, len: usize, drops: &Arc<AtomicUsize>) -> ScopeGlobal<'h, 'h, NodeB> {
+    heap.scope_shared(|m| {
         let mut next = number(END);
         for i in (0..len).rev() {
             #[expect(clippy::cast_precision_loss, reason = "below 2^53")]
             let n = m.alloc(Node { next: WordSlot::new(next), n: WordSlot::new(number(i as f64)), tag: Counted(Arc::clone(drops)) });
             next = pointer(n);
         }
-        m.root(node(next).expect("len > 0"))
+        m.global(node(next).expect("len > 0"))
     })
 }
 
 /// Walk to the end of the chain: the node count; `n` increases in order and the end is END
-fn walk(heap: &Heap, root: &Root<NodeB>) -> usize {
-    heap.mutate(|m| {
-        let mut cur = Some(m.get(root));
+fn walk<'h>(heap: &Heap<'h>, root: &ScopeGlobal<'h, 'h, NodeB>) -> usize {
+    heap.scope_shared(|m| {
+        let mut cur = Some(m.scope_in(root));
         let mut count = 0;
         let mut last = -1.0;
         while let Some(n) = cur {
@@ -93,7 +93,7 @@ fn walk(heap: &Heap, root: &Root<NodeB>) -> usize {
 #[test]
 fn survives_full_collections_and_cut_frees_the_rest() {
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new(THREADS);
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
     let root = build(&heap, LEN, &drops);
     for _ in 0..3 {
         heap.collect();
@@ -101,8 +101,8 @@ fn survives_full_collections_and_cut_frees_the_rest() {
     }
     assert_eq!(drops.load(Ordering::Relaxed), 0, "a live node was finalized");
     // Cut at node LEN / 2: its next becomes a number word
-    heap.mutate(|m| {
-        let mut cur = m.get(&root);
+    heap.scope_shared(|m| {
+        let mut cur = m.scope_in(&root);
         for _ in 1..LEN / 2 {
             cur = node(cur.next.get()).expect("the chain is long enough");
         }
@@ -119,13 +119,13 @@ fn survives_full_collections_and_cut_frees_the_rest() {
 /// Young nodes hung in old nodes' words (remembered set) survive young collections (all three evacuation modes); discarded young nodes are reclaimed
 fn young(mode: YoungEvacuation) {
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new(THREADS);
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
     heap.set_young_evacuation(mode);
     let root = build(&heap, LEN, &drops);
     heap.collect();
     // Insert a young node after every old node; make as many again and discard them
-    heap.mutate(|m| {
-        let mut cur = Some(m.get(&root));
+    heap.scope_shared(|m| {
+        let mut cur = Some(m.scope_in(&root));
         while let Some(old) = cur {
             let next = old.next.get();
             let v = f64::from_bits(old.n.get());
@@ -162,14 +162,14 @@ fn young_collection_moving_remembered() {
 #[test]
 fn concurrent_marking_while_rewriting() {
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new(THREADS);
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
     let root = build(&heap, LEN, &drops);
     heap.collect();
     for round in 0..4 {
         assert!(heap.mark_concurrently());
         // Write each node's n as a pointer word (to the next node), then back to a number: the barrier runs in both directions
-        heap.mutate(|m| {
-            let mut cur = Some(m.get(&root));
+        heap.scope_shared(|m| {
+            let mut cur = Some(m.scope_in(&root));
             while let Some(n) = cur {
                 let v = n.n.get();
                 let next = n.next.get();
@@ -184,8 +184,8 @@ fn concurrent_marking_while_rewriting() {
         assert_eq!(walk(&heap, &root), LEN);
         assert_eq!(drops.load(Ordering::Relaxed), 0);
     }
-    heap.mutate(|m| {
-        m.get(&root).next.set(m, number(END));
+    heap.scope_shared(|m| {
+        m.scope_in(&root).next.set(m, number(END));
     });
     heap.collect();
     heap.collect();

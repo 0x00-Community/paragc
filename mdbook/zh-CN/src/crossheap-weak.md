@@ -14,7 +14,7 @@
 - 它不在目标堆里登记任何东西，也不让任何东西存活。
 - 没有回收会看它，所以跨进程时它也拖不住任何人。
 
-在目标堆的 `mutate` 里读它时，依次检查：
+在目标堆的 `scope` 里读它时，依次检查：
 
 1. 块已经开出来，块表里这一项有内存；
 2. 这个偏移上起点位是置位的，或者它是某个大对象第一块的起点；
@@ -28,20 +28,20 @@
 
 ```rust
 // 发送方
-let sig: Signature = cross.mutate(|cm| cm.sign(obj));
+let sig: Signature = cross.scope(|cm| cm.sign(obj));
 let bytes: [u8; SIGNATURE_BYTES] = sig.into();
 send(&bytes, cross.fd());                  // 例如经 Unix socket 带 SCM_RIGHTS 发出
 
 // 接收方
 let sig = Signature::from(&bytes);
 let heap = space.open_fd(fd, threads)?;
-let value = heap.mutate(|cm| cm.resolve::<NodeB>(&sig).map(|n| n.value));
+let value = heap.scope(|cm| cm.resolve::<NodeB>(&sig).map(|n| n.value));
 ```
 
 | 调用 | 用途 |
 | --- | --- |
 | `sign(gc)` | 给跨堆里的对象签名 |
-| `sign_promoted(gc)` | 不用品牌，直接凭私有 `Gc` 给晋升过去的对象签名 |
+| `sign_promoted(gc)` | 不用 Brand，直接凭私有 `ScopeLocal` 给晋升过去的对象签名 |
 | `resolve::<B>(&sig)` | 对象还活着且类型是 `B` 时返回它 |
 | `verify(&sig)` | 不知道类型时检查签名 |
 
@@ -51,12 +51,12 @@ let value = heap.mutate(|cm| cm.resolve::<NodeB>(&sig).map(|n| n.value));
 
 有些资源没法共享：文件描述符、`Box`，以及一切只属于主人进程的东西。别的进程请主人代办：
 
-1. `CrossHeapMutator::post(obj)` 领一个不归任何进程的入口，所以发信方死了请求也还在；
+1. `CrossHeapScope::post(obj)` 领一个不归任何进程的入口，所以发信方死了请求也还在；
 2. 把入口压进超级块里的信箱栈；
 3. 来信计数（一个 futex 字）加一，唤醒主人。
 
 主人查看 `CrossHeap::mail()`（到目前为止收到的信数），或者在 `wait_mail(seen, timeout)` 里睡到它变化。不要在这个堆自己的
-`mutate` 里等，否则回收会一直等你离开。`take_mail` 按发信先后取走全部；用 `find` 取出每个对象，处理完用 `release` 归还入口。
+`scope` 里等，否则回收会一直等你离开。`take_mail` 按发信先后取走全部；用 `find` 取出每个对象，处理完用 `release` 归还入口。
 
 ## 收缩与描述符
 

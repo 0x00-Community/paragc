@@ -4,9 +4,9 @@ paragc 和 j8 放进内存的每个字，必要处按比例画出。宽度和位
 
 ## 私有对象
 
-一个对象由 24 字节的头、数据和可选的尾巴组成，向上取整到 8 字节：`(HEADER + size_of::<T>() + tail).next_multiple_of(8)`。`Gc` 指向数据，不指向头。
+一个对象由 24 字节的头、数据和可选的尾巴组成，向上取整到 8 字节：`(HEADER + size_of::<T>() + tail).next_multiple_of(8)`。`ScopeLocal` 指向数据，不指向头。
 
-<div class="dg"><div class="dg-cap">一个私有对象的内存</div><div class="bf ruled"><div class="k1" style="--w:4"><b>mark</b><small>4 B</small><u>0</u></div><div class="k2" style="--w:4"><b>info</b><small>4 B</small><u>4</u></div><div class="k3" style="--w:8"><b>visit</b><small>追踪 / 改写 / 询问</small><u>8</u></div><div class="k4" style="--w:8"><b>drop</b><small>析构，搬走后存新地址</small><u>16</u></div><div class="k5" style="--w:14"><b>数据 <code>T</code></b><small>size_of::&lt;T&gt;()</small><u>24 ▲ Gc</u></div><div class="k6 dim" style="--w:8"><b>尾巴</b><small>纯字节，可选</small><u>24 + T</u><u class="end">end</u></div></div><div class="dg-note"><code>Gc</code> 指在这里 ↑ 偏移 24</div></div>
+<div class="dg"><div class="dg-cap">一个私有对象的内存</div><div class="bf ruled"><div class="k1" style="--w:4"><b>mark</b><small>4 B</small><u>0</u></div><div class="k2" style="--w:4"><b>info</b><small>4 B</small><u>4</u></div><div class="k3" style="--w:8"><b>visit</b><small>追踪 / 改写 / 询问</small><u>8</u></div><div class="k4" style="--w:8"><b>drop</b><small>析构，搬走后存新地址</small><u>16</u></div><div class="k5" style="--w:14"><b>数据 <code>T</code></b><small>size_of::&lt;T&gt;()</small><u>24 ▲ ScopeLocal</u></div><div class="k6 dim" style="--w:8"><b>尾巴</b><small>纯字节，可选</small><u>24 + T</u><u class="end">end</u></div></div><div class="dg-note"><code>ScopeLocal</code> 指在这里 ↑ 偏移 24</div></div>
 
 <div class="dg"><div class="dg-cap"><code>mark</code> · u32 · 第 31 位在最左</div><div class="bf"><div class="k7" style="--w:3"><b>FORWARDED</b><small>已搬走</small><i>31</i></div><div class="k3" style="--w:3"><b>BUSY</b><small>正在复制</small><i>30</i></div><div class="k1" style="--w:26"><b>epoch</b><small>最后一次标记的纪元 · 0 = 年轻</small><i>29 … 0</i></div></div><div class="dg-note">FORWARDED 和 BUSY 只在会搬对象的回收期间出现。纪元永远到不了它们：MAX_EPOCH = 2³⁰ − 1。</div></div>
 
@@ -38,7 +38,7 @@ paragc 和 j8 放进内存的每个字，必要处按比例画出。宽度和位
 
 ## 槽与字
 
-<div class="dg"><div class="dg-cap"><code>Slot&lt;'gc, T&gt;</code> · 两个字</div><div class="bf"><div class="k1" style="--w:1"><b>值</b><small>当前指针</small><i>8 B</i></div><div class="k2" style="--w:1"><b>上次计数的值</b><small>引用计数用</small><i>8 B</i></div></div></div>
+<div class="dg"><div class="dg-cap"><code>Slot&lt;'scope, T&gt;</code> · 两个字</div><div class="bf"><div class="k1" style="--w:1"><b>值</b><small>当前指针</small><i>8 B</i></div><div class="k2" style="--w:1"><b>上次计数的值</b><small>引用计数用</small><i>8 B</i></div></div></div>
 
 <div class="dg"><div class="dg-cap"><code>WordSlot</code> 的值字</div><div class="bf"><div class="k3" style="--w:16"><b>标签</b><small>≥ 0xFFF8 即指针</small><i>63 … 48</i></div><div class="k1" style="--w:48"><b>数据地址</b><small>低 48 位</small><i>47 … 0</i></div></div><div class="dg-note">小于 <code>0xFFF8 &lt;&lt; 48</code> 的字是普通数据。对象搬动时，指针字的标签原样保留。</div></div>
 

@@ -1,14 +1,14 @@
 //! `#[derive(Trace)]`: traces (`trace`) and relocates (`relocate`, rewriting edges during evacuating collections) field by field; `NO_EDGES` is the AND over all fields.
 //!
 //! By default it also checks that the type does not implement `Drop` (finalization order is unspecified, so `Drop` could touch an already finalized object);
-//! when you really need one, write `#[trace(unsafe_drop)]` and guarantee that `Drop` touches no `Gc`.
+//! when you really need one, write `#[trace(unsafe_drop)]` and guarantee that `Drop` touches no `ScopeLocal`.
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as Tokens};
 use quote::{format_ident, quote};
 use syn::{Data, DeriveInput, Fields, Ident, Type, parse_macro_input, parse_quote};
 
 /// `#[derive(Shared)]`: a type that can live in a public heap (on shared memory, possibly read and collected by other processes). Requires `#[repr(C)]` (so the layout agrees across processes and binaries);
-/// structs only. Generates the pointer map (the offset of every pointer-slot field, expanding nested types and fixed-size arrays). `CrossHeapMutator::alloc` checks at compile time that there is no destructor.
+/// structs only. Generates the pointer map (the offset of every pointer-slot field, expanding nested types and fixed-size arrays). `CrossHeapScope::alloc` checks at compile time that there is no destructor.
 #[proc_macro_derive(Shared)]
 pub fn derive_shared(input: TokenStream) -> TokenStream {
     SharedDerive::from(parse_macro_input!(input as DeriveInput)).expand().unwrap_or_else(syn::Error::into_compile_error).into()

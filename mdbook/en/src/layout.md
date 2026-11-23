@@ -24,7 +24,7 @@ Each block keeps, outside its data area:
 - a state (free, being allocated into, recyclable, full, swept) and counters used by evacuation.
 
 An allocation buffer collects the start bits of the objects it allocates in one bitmap word and publishes them with a
-single atomic OR. It does that when it moves to another word, adopts another block, or when the `mutate` returns.
+single atomic OR. It does that when it moves to another word, adopts another block, or when the `scope` returns.
 Nobody reads those bits earlier: the buffer owns its blocks until the next collection.
 
 ## Where blocks come from
