@@ -712,7 +712,18 @@ impl<'gc, T> Handle<'gc, T> {
     /// The identity: the address of the entry. Never changes while the object lives; after the object dies the entry (and the id) may be reused by a new object.
     #[inline]
     pub fn id(self) -> usize {
-        self.entry.as_ptr().addr()
+        self.entry.as_ptr().expose_provenance()
+    }
+
+    /// Turn an id back into a handle within the same kind of mutate, for ids stored as plain words (NaN-boxed values, constants in generated code).
+    ///
+    /// # Safety
+    /// `id` comes from [`Handle::id`] of a handle to a `T` in this heap, and the object is still alive: something the collector traces holds the handle
+    /// (the word itself is invisible to the collector, so the holder must also keep a traced [`Handle`] or report it from [`crate::Trace`]).
+    #[inline]
+    pub unsafe fn from_id(id: usize) -> Self {
+        // SAFETY: an id is the address of an entry (see above)
+        Self { entry: unsafe { NonNull::new_unchecked(core::ptr::with_exposed_provenance_mut(id)) }, _brand: PhantomData }
     }
 }
 

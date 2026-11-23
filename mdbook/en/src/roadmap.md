@@ -9,6 +9,7 @@
 | 0.6.0 | the `crossheap` feature (Linux only); the `Public*` API renamed to `CrossHeap*`; `CrossHeapWeak`, birth stamps and signatures; `open_fd`; the mailbox; shrinking cross-heaps; promotion into an attached cross-heap with owner-only collection; deferred promotion of private objects written into cross-heap slots; `sign_promoted` |
 | 0.6.1 | `alloc_tail` / `alloc_shared_tail` |
 | 0.6.2 | `Handle` / `HandleSlot` / `alloc_handle`: references through a handle table |
+| 0.6.3 | `Handle::from_id` |
 
 ## Next
 

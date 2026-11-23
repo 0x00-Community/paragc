@@ -9,6 +9,7 @@
 | 0.6.0 | `crossheap` feature（只在 Linux）；`Public*` 接口改名 `CrossHeap*`；`CrossHeapWeak`、出生戳与签名；`open_fd`；信箱；跨堆收缩；晋升进挂接的跨堆、只归主人回收；写进跨堆槽的私有对象延后晋升；`sign_promoted` |
 | 0.6.1 | `alloc_tail` / `alloc_shared_tail` |
 | 0.6.2 | `Handle` / `HandleSlot` / `alloc_handle`：经 handle 表的引用 |
+| 0.6.3 | `Handle::from_id` |
 
 ## 接下来
 

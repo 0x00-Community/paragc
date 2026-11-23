@@ -41,6 +41,8 @@ heap.mutate(|m| {
 - 经 handle 读对象比 `Gc` 多一次依赖加载（先表项，再对象）。一次 `mutate` 里对象不搬，所以用 `Handle::get` 解析一次，
   之后一直用那个 `Gc`。
 - 写 handle 不要 mutator、不走屏障：普通字段直接存，或者 `HandleSlot::set`。
+- id 可以当普通字长存起来（NaN-box 的值、生成代码里的常量），再用 unsafe 的 `Handle::from_id` 变回 handle，前提是还有被追踪的
+  地方持有这个 handle。
 
 回收器怎样在没有屏障的情况下保证正确：
 
