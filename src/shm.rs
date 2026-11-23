@@ -520,7 +520,7 @@ impl CrossHeapSpace {
         Ok(Self(Arc::new(Space { region: Region::reserve()?, fixed: false, used: AtomicU64::new(0) })))
     }
 
-    /// Reserve the public region at the fixed address ([`FIXED_BASE`], the same in every process): objects may store absolute addresses ([`crate::Gc`], [`crate::Slot`],
+    /// Reserve the public region at the fixed address ([`FIXED_BASE`], the same in every process): objects may store absolute addresses ([`crate::Gc`], [`crate::GcSlot`],
     /// [`crate::WordSlot`]) and other processes read them correctly. A private heap that promotes young objects into a public heap ([`crate::Heap::attach_cross_heap`]) needs such a region;
     /// a process can have only one. Fails if the address is taken.
     pub fn reserve_fixed() -> io::Result<Self> {
@@ -531,7 +531,7 @@ impl CrossHeapSpace {
     /// The file starts empty and is extended as it is used; mode 0600, so only processes with permission on the file can open it.
     ///
     /// Heap numbers are unique across processes within a directory: they are claimed under the lock of a `.paragc-<number>` marker file (reclaimed when the heap it names is dead).
-    /// This process owns the heap: when this handle (and every [`crate::CrossHeapRoot`] made from it) is dropped, or this process exits / is killed, the heap dies,
+    /// This process owns the heap: when this handle (and every [`crate::CrossHeapGlobal`] made from it) is dropped, or this process exits / is killed, the heap dies,
     /// unless [`CrossHeap::persist`] was called.
     pub fn create(&self, path: impl AsRef<Path>, threads: NonZeroUsize) -> io::Result<CrossHeap> {
         use std::os::unix::fs::OpenOptionsExt;

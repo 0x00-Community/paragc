@@ -1,22 +1,22 @@
-//! Pointers and handles: the private heap's [`Gc`] / [`Slot`] / [`Root`] / [`Weak`] / [`Far`], and the public heap's [`CrossHeapGc`] / [`CrossHeapSlot`] / [`CrossHeapRef`] / [`CrossHeapRoot`] with [`Shared`].
+//! Pointers and handles: the private heap's [`Gc`] / [`GcSlot`] / [`Global`] / [`Weak`] / [`Far`], and the public heap's [`CrossHeapGc`] / [`CrossHeapSlot`] / [`CrossHeapRef`] / [`CrossHeapGlobal`] with [`Shared`].
 //!
-//! The heap pointer [`Gc`] and the atomic pointer slot [`Slot`].
+//! The heap pointer [`Gc`] and the atomic pointer slot [`GcSlot`].
 //!
-//! Roots: a [`Root`] is a strong handle that can be held outside mutate (and across threads); collection starts from all roots.
-//! A weak reference [`Weak`] can likewise be held outside mutate but keeps nothing alive: every collection clears unmarked targets after marking.
+//! Roots: a [`Global`] is a strong handle that can be held outside a scope (and across threads); collection starts from all roots.
+//! A weak reference [`Weak`] can likewise be held outside a scope but keeps nothing alive: every collection clears unmarked targets after marking.
 //!
-//! The root table is an append-only array of slots: new roots take a slot inside mutate (reusing freed slots first), and dropping a handle clears its slot and returns the index.
-//! Free slots are compacted into a read-only array only during collection (no mutators), and mutate takes them with an atomic cursor, so it is lock free with no ABA.
+//! The root table is an append-only array of slots: new roots take a slot inside a scope (reusing freed slots first), and dropping a handle clears its slot and returns the index.
+//! Free slots are compacted into a read-only array only during collection (no mutators), and scopes take them with an atomic cursor, so it is lock free with no ABA.
 //!
 //! Cross-heap references [`Far`]: within one process, an object of one heap points directly at an object of another heap, with no copying and no indirection table.
 //!
 //! - Creating one takes a slot in the target heap's root table (also its entry table) and records the holder heap; the slot is returned when the holding object is finalized.
 //!   When the target heap collects on its own the entry is a root, and the block holding the entry object is not evacuated (the other heap stores a direct pointer that cannot be rewritten).
-//! - The brand `'a` is the holder heap's mutate brand: a `Far` can only be put into that heap's objects and cannot escape the mutate.
-//! - Reading takes the target heap's [`Mutator`]: proof of being inside the target heap's mutate right now (the object is neither swept nor moved).
+//! - The brand `'a` is the holder heap's scope brand: a `Far` can only be put into that heap's objects and cannot escape the scope.
+//! - Reading takes the target heap's [`Scope`]: proof of being inside the target heap's scope right now (the object is neither swept nor moved).
 //! - Cycles across heaps (A's object points to B through a Far and B's points back) cannot be reclaimed by single collections; collect them together with [`crate::Heap::collect_group`].
 //!
-//! Types and pointers in public heaps: object headers, [`Shared`] (types that can live in a public heap), [`CrossHeapGc`], [`CrossHeapSlot`], [`CrossHeapRoot`].
+//! Types and pointers in public heaps: object headers, [`Shared`] (types that can live in a public heap), [`CrossHeapGc`], [`CrossHeapSlot`], [`CrossHeapGlobal`].
 //!
 //! Public heap objects may be read by other processes and collected by processes that do not know the type, so: headers hold no code, only a type number; collection finds edges through the pointer maps in the type table;
 //! objects may not have destructors; pointers are stored as "offsets from the start of the public region", so the same value points at the same object in every process.
@@ -32,10 +32,10 @@ use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use core::sync::atomic::{AtomicBool, AtomicI16, AtomicI32, AtomicI64, AtomicI8, AtomicU16, AtomicU32, AtomicU8};
 use std::sync::Arc;
 
-use crate::{Heap, Mutator, Trace, Tracer};
-use crate::heap::{HeapInternal, MutatorInternal};
+use crate::{Heap, Scope, Trace, Tracer};
+use crate::heap::{HeapInternal, ScopeInternal};
 #[cfg(crossheap)]
-use crate::heap::{Inner, CrossHeap, CrossHeapInternal, CrossHeapMutator, CrossHeapMutatorInternal};
+use crate::heap::{Inner, CrossHeap, CrossHeapInternal, CrossHeapScope, CrossHeapScopeInternal};
 use crate::layout::Header;
 #[cfg(crossheap)]
 use crate::layout::{GRANULE, PHeader};
@@ -44,19 +44,19 @@ use crate::mark::TracerInternal;
 use crate::shm::{REGION, Region};
 use crate::sync::{PushList, SegVec};
 
-/// Brand: `'gc` is invariant, so a `Gc` cannot escape the [`crate::Heap::mutate`] closure.
-pub type Invariant<'gc> = PhantomData<Cell<&'gc ()>>;
+/// Brand: `'scope` is invariant, so a `Gc` cannot escape the [`crate::Heap::scope`] closure.
+pub type Invariant<'scope> = PhantomData<Cell<&'scope ()>>;
 
-/// The brand of a Gc: borrows `&'gc T`, plus invariance over `'gc`
-type GcBrand<'gc, T> = PhantomData<(&'gc T, fn(&'gc ()) -> &'gc ())>;
+/// The brand of a Gc: borrows `&'scope T`, plus invariance over `'scope`
+type GcBrand<'scope, T> = PhantomData<(&'scope T, fn(&'scope ()) -> &'scope ())>;
 
-/// A pointer to a heap object, valid only within one `mutate` (`'gc` is that call's brand). Objects may move only during stop-the-world collections (between two mutates).
+/// A pointer to a heap object, valid only within one scope (`'scope` is that call's brand). Objects may move only during stop-the-world collections (between two scopes).
 ///
 /// Its layout is guaranteed to be one `NonNull<T>` (`#[repr(transparent)]`), so `Option<Gc<'_, T>>` is also pointer sized.
 #[repr(transparent)]
-pub struct Gc<'gc, T> {
+pub struct Gc<'scope, T> {
     ptr: NonNull<T>,
-    _brand: GcBrand<'gc, T>,
+    _brand: GcBrand<'scope, T>,
 }
 
 // SAFETY: a Gc only gives out &T, and T: Trace requires Send + Sync
@@ -96,7 +96,7 @@ impl<T> GcInternal for Gc<'_, T> {
     }
 }
 
-impl<'gc, T> Gc<'gc, T> {
+impl<'scope, T> Gc<'scope, T> {
     pub fn as_ptr(self) -> *const T {
         self.ptr.as_ptr()
     }
@@ -104,8 +104,8 @@ impl<'gc, T> Gc<'gc, T> {
     /// Get a `Gc` back from a data pointer (the result of [`Gc::as_ptr`]), for example decoded from a NaN-boxed value.
     ///
     /// # Safety
-    /// `ptr` must be the data pointer of a live object in this heap, obtained from [`Gc::as_ptr`] within the current `mutate` (brand `'gc`):
-    /// stop-the-world collections move objects, so an address obtained in an earlier mutate may be stale now.
+    /// `ptr` must be the data pointer of a live object in this heap, obtained from [`Gc::as_ptr`] within the current scope (brand `'scope`):
+    /// stop-the-world collections move objects, so an address obtained in an earlier scope may be stale now.
     ///
     /// When such a raw address is stored in a heap object, the collector cannot see it: the object's [`crate::Trace`] impl must turn it back into a `Gc` with `from_raw` and report it to
     /// [`crate::Tracer::edge`] (tracing), and in `relocate` hand it to [`crate::Tracer::relocate`] and write the returned new address back (evacuation moves objects);
@@ -115,9 +115,9 @@ impl<'gc, T> Gc<'gc, T> {
         unsafe { Self::from_data(ptr.cast_mut()) }
     }
 
-    /// A reference valid for all of `'gc`.
-    pub fn get(self) -> &'gc T {
-        // SAFETY: collection happens only outside mutate, so the object stays alive and in place during 'gc
+    /// A reference valid for all of `'scope`.
+    pub fn get(self) -> &'scope T {
+        // SAFETY: collection happens only outside a scope, so the object stays alive and in place during 'scope
         unsafe { self.ptr.as_ref() }
     }
 
@@ -143,32 +143,32 @@ impl<T: fmt::Debug> fmt::Debug for Gc<'_, T> {
 
 /// An atomic nullable pointer slot: edges an object needs to change go here (`Trace` requires `Sync`, so `Cell<Gc>` will not do).
 ///
-/// Writes take a [`Mutator`]: during concurrent marking the overwritten old value goes to the collector through the write barrier (snapshot at the beginning);
+/// Writes take a [`Scope`]: during concurrent marking the overwritten old value goes to the collector through the write barrier (snapshot at the beginning);
 /// normally a slot in an old object is logged the first time it is written each round, and collection settles reference counts as "new value +1, last counted value −1".
 #[repr(C)]
-pub struct Slot<'gc, T> {
+pub struct GcSlot<'scope, T> {
     /// The pointer as a word (see [`word_pointer`])
     word: AtomicU64,
     /// The value last counted in the reference count (an address) | [`LOGGED`]; [`UNCOUNTED`] = not counted (a slot in a young object, counted only from promotion on)
     counted: AtomicUsize,
-    _brand: PhantomData<Gc<'gc, T>>,
+    _brand: PhantomData<Gc<'scope, T>>,
 }
 
-/// [`Slot::counted`]: this slot is not reference counted and its object is still young (the write barrier need not record it)
+/// [`GcSlot::counted`]: this slot is not reference counted and its object is still young (the write barrier need not record it)
 pub const UNCOUNTED: usize = usize::MAX;
-/// [`Slot::counted`]: this slot is not reference counted, but its object has been traced by a collection (it is old, so writing a young value must be recorded).
+/// [`GcSlot::counted`]: this slot is not reference counted, but its object has been traced by a collection (it is old, so writing a young value must be recorded).
 /// Every larger value also means uncounted (the lowest bit is [`LOGGED`], so it takes two values)
 pub const PROMOTED: usize = usize::MAX - 1;
-/// Lowest bit of [`Slot::counted`]: logged this round (addresses are granule aligned, so the lowest bit is free)
+/// Lowest bit of [`GcSlot::counted`]: logged this round (addresses are granule aligned, so the lowest bit is free)
 pub const LOGGED: usize = 1;
 
 /// A slot holds a "word": a word whose top 13 bits are all 1 (`>= WORD_POINTER_MIN`) is a GC pointer whose low 48 bits are the object data's address (user-space addresses fit);
 /// 0 is empty; every other word is not a pointer and is interpreted by the user (numbers, booleans…: NaN-boxed values can go into a [`WordSlot`] as they are).
-/// [`Slot`] tags its pointers with [`RAW_TAG`].
+/// [`GcSlot`] tags its pointers with [`RAW_TAG`].
 pub const WORD_POINTER_MIN: u64 = 0xFFF8 << 48;
 /// Low 48 bits of a word: the address in a pointer word
 pub const WORD_PAYLOAD: u64 = (1 << 48) - 1;
-/// The tag [`Slot`] puts on pointers (the highest one in the pointer range; the others are left to users to tell types apart)
+/// The tag [`GcSlot`] puts on pointers (the highest one in the pointer range; the others are left to users to tell types apart)
 pub const RAW_TAG: u64 = 0xFFFF << 48;
 
 /// The GC pointer in a word (object data address); `None` if it is not a pointer.
@@ -184,7 +184,7 @@ fn word_with_pointer(word: u64, data: *const u8) -> u64 {
     (word & !WORD_PAYLOAD) | data.expose_provenance() as u64
 }
 
-/// A type-erased slot: for logging by the write barrier and settling during collection (same layout as [`Slot`] and [`WordSlot`]).
+/// A type-erased slot: for logging by the write barrier and settling during collection (same layout as [`GcSlot`] and [`WordSlot`]).
 #[repr(C)]
 pub struct RawSlot {
     pub word: AtomicU64,
@@ -267,43 +267,43 @@ impl RawSlot {
     }
 }
 
-impl<T> Default for Slot<'_, T> {
+impl<T> Default for GcSlot<'_, T> {
     fn default() -> Self {
         Self { word: AtomicU64::new(0), counted: AtomicUsize::new(UNCOUNTED), _brand: PhantomData }
     }
 }
 
-impl<'gc, T> From<Option<Gc<'gc, T>>> for Slot<'gc, T> {
-    fn from(v: Option<Gc<'gc, T>>) -> Self {
+impl<'scope, T> From<Option<Gc<'scope, T>>> for GcSlot<'scope, T> {
+    fn from(v: Option<Gc<'scope, T>>) -> Self {
         Self { word: AtomicU64::new(Self::raw(v)), counted: AtomicUsize::new(UNCOUNTED), _brand: PhantomData }
     }
 }
 
-impl<'gc, T> From<Gc<'gc, T>> for Slot<'gc, T> {
-    fn from(v: Gc<'gc, T>) -> Self {
+impl<'scope, T> From<Gc<'scope, T>> for GcSlot<'scope, T> {
+    fn from(v: Gc<'scope, T>) -> Self {
         Some(v).into()
     }
 }
 
-impl<'gc, T> Slot<'gc, T> {
-    fn raw(v: Option<Gc<'gc, T>>) -> u64 {
+impl<'scope, T> GcSlot<'scope, T> {
+    fn raw(v: Option<Gc<'scope, T>>) -> u64 {
         v.map_or(0, |g| RAW_TAG | g.ptr.as_ptr().expose_provenance() as u64)
     }
 
-    fn wrap(word: u64) -> Option<Gc<'gc, T>> {
+    fn wrap(word: u64) -> Option<Gc<'scope, T>> {
         // SAFETY: the slot only ever held Gcs of the same brand, and the object is referenced by the slot's object
         word_pointer(word).map(|p| unsafe { Gc::from_data(p.cast()) })
     }
 
-    pub fn get(&self) -> Option<Gc<'gc, T>> {
+    pub fn get(&self) -> Option<Gc<'scope, T>> {
         Self::wrap(self.word.load(Ordering::Acquire))
     }
 
-    pub fn set(&self, m: &Mutator<'gc>, v: Option<Gc<'gc, T>>) {
+    pub fn set(&self, m: &Scope<'scope>, v: Option<Gc<'scope, T>>) {
         self.swap(m, v);
     }
 
-    pub fn swap(&self, m: &Mutator<'gc>, v: Option<Gc<'gc, T>>) -> Option<Gc<'gc, T>> {
+    pub fn swap(&self, m: &Scope<'scope>, v: Option<Gc<'scope, T>>) -> Option<Gc<'scope, T>> {
         let new = Self::raw(v);
         let old = self.word.swap(new, Ordering::AcqRel);
         m.written(self.raw_slot(), RawSlot::header(old), RawSlot::header(new));
@@ -311,7 +311,7 @@ impl<'gc, T> Slot<'gc, T> {
     }
 
     /// Swap in `new` only if the slot holds `current`; on failure returns the slot's value.
-    pub fn compare_exchange(&self, m: &Mutator<'gc>, current: Option<Gc<'gc, T>>, new: Option<Gc<'gc, T>>) -> Result<Option<Gc<'gc, T>>, Option<Gc<'gc, T>>> {
+    pub fn compare_exchange(&self, m: &Scope<'scope>, current: Option<Gc<'scope, T>>, new: Option<Gc<'scope, T>>) -> Result<Option<Gc<'scope, T>>, Option<Gc<'scope, T>>> {
         let new = Self::raw(new);
         let done = self.word.compare_exchange(Self::raw(current), new, Ordering::AcqRel, Ordering::Acquire);
         // Write barrier: the overwritten old value (concurrent marking's snapshot), the new value written (a young object ⇒ record this slot, young collections start from it),
@@ -324,14 +324,14 @@ impl<'gc, T> Slot<'gc, T> {
 }
 
 /// A slot holding any "word" (see [`word_pointer`]): the user's own value encoding (such as NaN-boxing) goes in as is, and GC pointers in the word are still traced,
-/// rewritten during evacuation and counted. As large as a [`Slot`] (the word + the last counted value), one word less than "a value word + a [`Slot`]".
+/// rewritten during evacuation and counted. As large as a [`GcSlot`] (the word + the last counted value), one word less than "a value word + a [`GcSlot`]".
 ///
 /// Writes come only from the one mutator holding its object (one slot is never written by two threads at once), so a write is a read and a store, not an atomic swap.
 #[repr(C)]
-pub struct WordSlot<'gc> {
+pub struct WordSlot<'scope> {
     word: AtomicU64,
     counted: AtomicUsize,
-    _brand: PhantomData<Gc<'gc, ()>>,
+    _brand: PhantomData<Gc<'scope, ()>>,
 }
 
 impl WordSlot<'_> {
@@ -345,9 +345,9 @@ impl WordSlot<'_> {
         self.word.load(Ordering::Acquire)
     }
 
-    /// Write `word`: goes through the write barrier (see [`Slot`]) when the old or new value holds a pointer (and they are not the same object).
+    /// Write `word`: goes through the write barrier (see [`GcSlot`]) when the old or new value holds a pointer (and they are not the same object).
     #[inline]
-    pub fn set(&self, m: &Mutator<'_>, word: u64) {
+    pub fn set(&self, m: &Scope<'_>, word: u64) {
         let old = self.word.load(Ordering::Relaxed);
         self.word.store(word, Ordering::Release);
         let (o, n) = (RawSlot::header(old), RawSlot::header(word));
@@ -384,36 +384,36 @@ impl WordSlotInternal for WordSlot<'_> {
     }
 }
 
-/// [`Slot`] operations for this crate only (as [`GcInternal`]).
-pub trait SlotInternal<'gc> {
+/// [`GcSlot`] operations for this crate only (as [`GcInternal`]).
+pub trait GcSlotInternal<'scope> {
     type Data;
 
     /// The type-erased view.
     fn raw_slot(&self) -> &RawSlot;
 }
 
-impl<'gc, T> SlotInternal<'gc> for Slot<'gc, T> {
+impl<'scope, T> GcSlotInternal<'scope> for GcSlot<'scope, T> {
     type Data = T;
 
     fn raw_slot(&self) -> &RawSlot {
-        // SAFETY: Slot and RawSlot are both repr(C) with fields of the same types in the same order
+        // SAFETY: GcSlot and RawSlot are both repr(C) with fields of the same types in the same order
         unsafe { &*(&raw const *self).cast::<RawSlot>() }
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for Slot<'_, T> {
+impl<T: fmt::Debug> fmt::Debug for GcSlot<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Slot").field(&self.get()).finish()
+        f.debug_tuple("GcSlot").field(&self.get()).finish()
     }
 }
 
-/// Rebrand a type carrying `'gc`: `Root<B>` has no lifetime, and the current mutate's `'gc` is put back on when reading it.
+/// Rebrand a type carrying `'scope`: `Global<B>` has no lifetime, and the current scope's `'scope` is put back on when reading it.
 /// Declare it with [`brand!`](crate::brand).
 pub trait Brand {
-    type Of<'gc>: Trace + 'gc;
+    type Of<'scope>: Trace + 'scope;
 }
 
-/// Declare a brand type: `brand!(pub NodeB = for<'gc> Node<'gc>);`
+/// Declare a brand type: `brand!(pub NodeB = for<'scope> Node<'scope>);`
 #[macro_export]
 macro_rules! brand {
     ($(#[$meta:meta])* $vis:vis $name:ident = for<$l:lifetime> $ty:ty) => {
@@ -429,11 +429,11 @@ macro_rules! brand {
 #[derive(Default)]
 pub struct Entry {
     ptr: AtomicPtr<Header>,
-    /// The heap holding this root (the identity of the heap the [`crate::Far`] lives in); [`NO_HOLDER`] for a plain [`Root`]
+    /// The heap holding this root (the identity of the heap the [`crate::Far`] lives in); [`NO_HOLDER`] for a plain [`Global`]
     holder: AtomicUsize,
 }
 
-/// [`Entry::holder`]: belongs to no heap (a plain [`Root`])
+/// [`Entry::holder`]: belongs to no heap (a plain [`Global`])
 pub const NO_HOLDER: usize = 0;
 
 impl Entry {
@@ -453,13 +453,13 @@ pub struct RootTable {
     slots: SegVec<Entry>,
     /// Slot indexes returned by dropped handles (merged into ready at the next collection)
     returned: PushList<usize>,
-    /// Reusable free slot indexes: changed only during collection, read only during mutate
+    /// Reusable free slot indexes: changed only during collection, read only during a scope
     ready: UnsafeCell<Vec<usize>>,
     /// Next index of ready not yet taken
     cursor: AtomicUsize,
 }
 
-// SAFETY: ready changes only during collection (heap held exclusively, no mutators) and is read only during mutate; the rest are atomics / lock-free structures
+// SAFETY: ready changes only during collection (heap held exclusively, no mutators) and is read only during a scope; the rest are atomics / lock-free structures
 unsafe impl Sync for RootTable {}
 // SAFETY: as above
 unsafe impl Send for RootTable {}
@@ -498,9 +498,9 @@ impl RootTable {
         }
     }
 
-    /// Take a slot for `header` (only inside this heap's mutate). `holder`: the holder heap, [`NO_HOLDER`] for a plain root.
+    /// Take a slot for `header` (only inside one of this heap's scopes). `holder`: the holder heap, [`NO_HOLDER`] for a plain root.
     pub fn claim(&self, header: *const Header, holder: usize) -> usize {
-        // SAFETY: ready does not change during mutate
+        // SAFETY: ready does not change during a scope
         let ready = unsafe { &*self.ready.get() };
         let i = self.cursor.fetch_add(1, Ordering::AcqRel);
         match ready.get(i).and_then(|&slot| self.slots.get(slot).map(|s| (slot, s))) {
@@ -640,18 +640,18 @@ impl RootTable {
     }
 }
 
-/// A reference to an object allocated with [`Mutator::alloc_handle`], pointing at the object's entry in the heap's handle table instead of at the object.
+/// A reference to an object allocated with [`Scope::alloc_handle`], pointing at the object's entry in the heap's handle table instead of at the object.
 ///
 /// - The handle never changes when the object moves: only the entry is rewritten. Equality, hashing and [`Handle::id`] use the entry, so they stay valid across collections
 ///   (hash tables keyed by handles need no rehashing, generated code may embed the id as a constant).
 /// - Stored in objects it is a strong edge, like [`Gc`]; writing it needs no barrier, so it can sit in plain fields and in [`HandleSlot`]s.
-/// - Reading costs one load more than a [`Gc`]: entry, then object. Within one mutate, resolve it once with [`Handle::get`] and keep the `Gc`.
+/// - Reading costs one load more than a [`Gc`]: entry, then object. Within one scope, resolve it once with [`Handle::get`] and keep the `Gc`.
 ///
-/// Like `Gc` it carries the mutate brand `'gc` and cannot escape the closure; outside, keep the object with a [`Root`].
+/// Like `Gc` it carries the scope brand `'scope` and cannot escape the closure; outside, keep the object with a [`Global`].
 #[repr(transparent)]
-pub struct Handle<'gc, T> {
+pub struct Handle<'scope, T> {
     entry: NonNull<Entry>,
-    _brand: GcBrand<'gc, T>,
+    _brand: GcBrand<'scope, T>,
 }
 
 // SAFETY: as Gc: only shared references to T are handed out, and the entry is an atomic
@@ -696,16 +696,16 @@ impl<T> HandleInternal for Handle<'_, T> {
     }
 
     fn header(self) -> *const Header {
-        // SAFETY: entries live as long as the heap, and the brand keeps this handle inside one of its mutates
+        // SAFETY: entries live as long as the heap, and the brand keeps this handle inside one of its scopes
         unsafe { self.entry.as_ref() }.load()
     }
 }
 
-impl<'gc, T> Handle<'gc, T> {
-    /// The object. Objects do not move within a mutate, so the `Gc` stays valid for the rest of it.
+impl<'scope, T> Handle<'scope, T> {
+    /// The object. Objects do not move within a scope, so the `Gc` stays valid for the rest of it.
     #[inline]
-    pub fn get(self) -> Gc<'gc, T> {
-        // SAFETY: a handle reachable inside a mutate keeps its entry filled with a live object of type T
+    pub fn get(self) -> Gc<'scope, T> {
+        // SAFETY: a handle reachable inside a scope keeps its entry filled with a live object of type T
         unsafe { Gc::from_data(Header::data(HandleInternal::header(self)).cast()) }
     }
 
@@ -715,7 +715,7 @@ impl<'gc, T> Handle<'gc, T> {
         self.entry.as_ptr().expose_provenance()
     }
 
-    /// Turn an id back into a handle within the same kind of mutate, for ids stored as plain words (NaN-boxed values, constants in generated code).
+    /// Turn an id back into a handle within the same kind of scope, for ids stored as plain words (NaN-boxed values, constants in generated code).
     ///
     /// # Safety
     /// `id` comes from [`Handle::id`] of a handle to a `T` in this heap, and the object is still alive: something the collector traces holds the handle
@@ -742,9 +742,9 @@ impl<T: fmt::Debug> fmt::Debug for Handle<'_, T> {
 }
 
 /// A rewritable field holding a [`Handle`] or nothing. Writing needs no mutator and no barrier.
-pub struct HandleSlot<'gc, T> {
+pub struct HandleSlot<'scope, T> {
     entry: AtomicPtr<Entry>,
-    _brand: GcBrand<'gc, T>,
+    _brand: GcBrand<'scope, T>,
 }
 
 impl<T> Default for HandleSlot<'_, T> {
@@ -753,28 +753,28 @@ impl<T> Default for HandleSlot<'_, T> {
     }
 }
 
-impl<'gc, T> From<Option<Handle<'gc, T>>> for HandleSlot<'gc, T> {
-    fn from(v: Option<Handle<'gc, T>>) -> Self {
+impl<'scope, T> From<Option<Handle<'scope, T>>> for HandleSlot<'scope, T> {
+    fn from(v: Option<Handle<'scope, T>>) -> Self {
         Self { entry: AtomicPtr::new(Self::raw(v)), _brand: PhantomData }
     }
 }
 
-impl<'gc, T> From<Handle<'gc, T>> for HandleSlot<'gc, T> {
-    fn from(v: Handle<'gc, T>) -> Self {
+impl<'scope, T> From<Handle<'scope, T>> for HandleSlot<'scope, T> {
+    fn from(v: Handle<'scope, T>) -> Self {
         Some(v).into()
     }
 }
 
-impl<'gc, T> HandleSlot<'gc, T> {
-    fn raw(v: Option<Handle<'gc, T>>) -> *mut Entry {
+impl<'scope, T> HandleSlot<'scope, T> {
+    fn raw(v: Option<Handle<'scope, T>>) -> *mut Entry {
         v.map_or(null_mut(), |h| h.entry.as_ptr())
     }
 
-    pub fn get(&self) -> Option<Handle<'gc, T>> {
+    pub fn get(&self) -> Option<Handle<'scope, T>> {
         NonNull::new(self.entry.load(Ordering::Acquire)).map(|entry| Handle { entry, _brand: PhantomData })
     }
 
-    pub fn set(&self, v: Option<Handle<'gc, T>>) {
+    pub fn set(&self, v: Option<Handle<'scope, T>>) {
         self.entry.store(Self::raw(v), Ordering::Release);
     }
 }
@@ -785,54 +785,54 @@ impl<T: fmt::Debug> fmt::Debug for HandleSlot<'_, T> {
     }
 }
 
-/// A strong handle: as long as it lives the object is not collected. Carries no `'gc`, so it can be stored anywhere and passed across threads.
-/// Create it with [`Mutator::root`] and read it with [`Mutator::get`].
-pub struct Root<B: Brand> {
+/// A strong handle: as long as it lives the object is not collected. Carries no `'scope`, so it can be stored anywhere and passed across threads.
+/// Create it with [`Scope::global`] and read it with [`Scope::get`].
+pub struct Global<B: Brand> {
     table: Arc<RootTable>,
     slot: usize,
     _brand: PhantomData<fn() -> B>,
 }
 
-impl<B: Brand> Drop for Root<B> {
+impl<B: Brand> Drop for Global<B> {
     fn drop(&mut self) {
         self.table.release(self.slot);
     }
 }
 
 // SAFETY: the handle itself holds no Gc; it is a root
-unsafe impl<B: Brand> Trace for Root<B> {
+unsafe impl<B: Brand> Trace for Global<B> {
     const NO_EDGES: bool = true;
     fn trace(&self, _: &mut crate::Tracer<'_>) {}
 }
 
-impl<'gc> Mutator<'gc> {
+impl<'scope> Scope<'scope> {
     /// Make a root for an object.
-    pub fn root<B: Brand>(&self, gc: Gc<'gc, B::Of<'gc>>) -> Root<B> {
+    pub fn global<B: Brand>(&self, gc: Gc<'scope, B::Of<'scope>>) -> Global<B> {
         let table = self.heap().roots().clone();
         let slot = table.claim(gc.header(), NO_HOLDER);
-        Root { table, slot, _brand: PhantomData }
+        Global { table, slot, _brand: PhantomData }
     }
 
     /// The object a root points at.
-    pub fn get<B: Brand>(&self, root: &Root<B>) -> Gc<'gc, B::Of<'gc>> {
-        assert!(Arc::ptr_eq(&root.table, self.heap().roots()), "this Root does not belong to this heap");
+    pub fn get<B: Brand>(&self, root: &Global<B>) -> Gc<'scope, B::Of<'scope>> {
+        assert!(Arc::ptr_eq(&root.table, self.heap().roots()), "this Global does not belong to this heap");
         let header = root.table.slot(root.slot).load();
         // SAFETY: the root slot holds an object made with the same B and kept alive by this root
         unsafe { Gc::from_data(Header::data(header).cast()) }
     }
 
     /// Point the root at another object.
-    pub fn set<B: Brand>(&self, root: &Root<B>, gc: Gc<'gc, B::Of<'gc>>) {
-        assert!(Arc::ptr_eq(&root.table, self.heap().roots()), "this Root does not belong to this heap");
+    pub fn set<B: Brand>(&self, root: &Global<B>, gc: Gc<'scope, B::Of<'scope>>) {
+        assert!(Arc::ptr_eq(&root.table, self.heap().roots()), "this Global does not belong to this heap");
         root.table.slot(root.slot).store(gc.header().cast_mut());
     }
 }
 
-/// A weak handle: keeps nothing alive; once the object is collected [`Mutator::upgrade`] gives None. Like [`Root`] it carries no `'gc`, so it can be stored anywhere
-/// (including inside heap objects) and passed across threads. Create it with [`Mutator::weak`].
+/// A weak handle: keeps nothing alive; once the object is collected [`Scope::upgrade`] gives None. Like [`Global`] it carries no `'scope`, so it can be stored anywhere
+/// (including inside heap objects) and passed across threads. Create it with [`Scope::weak`].
 ///
 /// Every collection (full, young, the end of concurrent marking, group) clears weak references to unmarked targets after marking and before sweeping, and rewrites moved ones to the new address;
-/// so within any mutate a weak reference is either empty or points at a live object.
+/// so within any scope a weak reference is either empty or points at a live object.
 /// A young object without strong references dies at the next young collection; an old one (its count stuck by the weak reference, see [`crate::Heap::collect_young`]) waits for a full collection.
 pub struct Weak<B: Brand> {
     /// The heap's weak table
@@ -842,7 +842,7 @@ pub struct Weak<B: Brand> {
 }
 
 impl<B: Brand> Weak<B> {
-    /// The target has been collected (and stays so). No mutate needed; when false the target may still die at the next collection.
+    /// The target has been collected (and stays so). No scope needed; when false the target may still die at the next collection.
     pub fn is_cleared(&self) -> bool {
         self.table.slot(self.slot).load().is_null()
     }
@@ -860,19 +860,19 @@ unsafe impl<B: Brand> Trace for Weak<B> {
     fn trace(&self, _: &mut crate::Tracer<'_>) {}
 }
 
-impl<'gc> Mutator<'gc> {
+impl<'scope> Scope<'scope> {
     /// Make a weak reference to an object.
     ///
     /// From the next collection on the target's reference count sticks (no more release by count, left to tracing): release by count runs in the background concurrently with mutators and could not clear
     /// weak references first. Counts stick when each pause processes the weak table, before the decrements computed in that pause, so it is not released by count before then.
-    pub fn weak<B: Brand>(&self, gc: Gc<'gc, B::Of<'gc>>) -> Weak<B> {
+    pub fn weak<B: Brand>(&self, gc: Gc<'scope, B::Of<'scope>>) -> Weak<B> {
         let table = self.heap().weaks().clone();
         let slot = table.claim(gc.header(), NO_HOLDER);
         Weak { table, slot, _brand: PhantomData }
     }
 
     /// The object a weak reference points at; None once collected. An object obtained during concurrent marking counts as referenced (it gets marked) and does not die this round.
-    pub fn upgrade<B: Brand>(&self, weak: &Weak<B>) -> Option<Gc<'gc, B::Of<'gc>>> {
+    pub fn upgrade<B: Brand>(&self, weak: &Weak<B>) -> Option<Gc<'scope, B::Of<'scope>>> {
         assert!(Arc::ptr_eq(&weak.table, self.heap().weaks()), "this Weak does not belong to this heap");
         let header = weak.table.slot(weak.slot).load();
         if header.is_null() {
@@ -901,9 +901,9 @@ unsafe impl<B: Brand> Send for Far<'_, B> {}
 unsafe impl<B: Brand> Sync for Far<'_, B> {}
 
 impl<'a, B: Brand> Far<'a, B> {
-    /// `holder`: the holder heap (this Far goes into one of its objects); `target`: the heap containing `gc`, which must differ (edges within a heap use [`crate::Slot`]).
-    pub fn new<'b>(holder: &Mutator<'a>, target: &Mutator<'b>, gc: Gc<'b, B::Of<'b>>) -> Self {
-        assert!(!core::ptr::eq(holder.heap(), target.heap()), "edges within one heap use Slot, not Far");
+    /// `holder`: the holder heap (this Far goes into one of its objects); `target`: the heap containing `gc`, which must differ (edges within a heap use [`crate::GcSlot`]).
+    pub fn new<'b>(holder: &Scope<'a>, target: &Scope<'b>, gc: Gc<'b, B::Of<'b>>) -> Self {
+        assert!(!core::ptr::eq(holder.heap(), target.heap()), "edges within one heap use GcSlot, not Far");
         let table = target.heap().roots().clone();
         let slot = table.claim(gc.header(), holder.heap().id());
         // SAFETY: a Gc's header is non-null
@@ -912,9 +912,9 @@ impl<'a, B: Brand> Far<'a, B> {
     }
 
     /// The target object; `m` must be the target heap's mutator.
-    pub fn get<'b>(&self, m: &Mutator<'b>) -> Gc<'b, B::Of<'b>> {
+    pub fn get<'b>(&self, m: &Scope<'b>) -> Gc<'b, B::Of<'b>> {
         assert!(Arc::ptr_eq(&self.table, m.heap().roots()), "this Far does not point into this heap");
-        // SAFETY: the slot keeps the object alive and entry objects do not move; m proves we are inside the target heap's mutate; B is the same as at creation
+        // SAFETY: the slot keeps the object alive and entry objects do not move; m proves we are inside the target heap's scope; B is the same as at creation
         unsafe { Gc::from_data(Header::data(self.ptr.as_ptr()).cast()) }
     }
 
@@ -962,7 +962,7 @@ pub unsafe trait Shared: Send + Sync {
 /// An offset in the pointer map with this bit is a [`CrossHeapRef`] (offset + target heap identity) pointing into another heap; without it, a [`CrossHeapSlot`] within the same heap
 #[cfg(crossheap)]
 pub const FAR_EDGE: u32 = 1 << 31;
-/// An offset in the pointer map with this bit is a word ([`Slot`], [`WordSlot`]: only what [`word_pointer`] recognizes is a pointer) holding the object data's absolute address
+/// An offset in the pointer map with this bit is a word ([`GcSlot`], [`WordSlot`]: only what [`word_pointer`] recognizes is a pointer) holding the object data's absolute address
 /// (in the fixed-address region, the same in every process; see [`crate::CrossHeapSpace::reserve_fixed`])
 #[cfg(crossheap)]
 pub const WORD_EDGE: u32 = 1 << 30;
@@ -989,7 +989,7 @@ impl EdgeMap {
         self.0.push(at | FAR_EDGE);
     }
 
-    /// A word holding an absolute address ([`Slot`], [`WordSlot`]).
+    /// A word holding an absolute address ([`GcSlot`], [`WordSlot`]).
     pub fn word(&mut self, at: u32) {
         self.0.push(at | WORD_EDGE);
     }
@@ -1028,7 +1028,7 @@ unsafe impl<T: Send + Sync> Shared for Option<Gc<'_, T>> {
 
 // SAFETY: repr(C), the word comes first
 #[cfg(crossheap)]
-unsafe impl<T: Send + Sync> Shared for Slot<'_, T> {
+unsafe impl<T: Send + Sync> Shared for GcSlot<'_, T> {
     fn edges(map: &mut EdgeMap, at: u32) {
         map.word(at);
     }
@@ -1081,11 +1081,11 @@ unsafe impl<T: Shared, const N: usize> Shared for [T; N] {
     }
 }
 
-/// An object in a public heap, valid only within one [`CrossHeap::mutate`] (`'p` is that call's brand). An absolute address in this process.
+/// An object in a public heap, valid only within one [`CrossHeap::scope`] (`'scope` is that call's brand). An absolute address in this process.
 #[cfg(crossheap)]
-pub struct CrossHeapGc<'p, T> {
+pub struct CrossHeapGc<'scope, T> {
     ptr: NonNull<T>,
-    _brand: PhantomData<(&'p T, Invariant<'p>)>,
+    _brand: PhantomData<(&'scope T, Invariant<'scope>)>,
 }
 
 // SAFETY: only &T is given out, and T: Shared requires Send + Sync
@@ -1106,15 +1106,15 @@ impl<T> Clone for CrossHeapGc<'_, T> {
 impl<T> Copy for CrossHeapGc<'_, T> {}
 
 #[cfg(crossheap)]
-impl<'p, T> CrossHeapGc<'p, T> {
+impl<'scope, T> CrossHeapGc<'scope, T> {
 
     pub fn as_ptr(self) -> *const T {
         self.ptr.as_ptr()
     }
 
-    /// A reference valid for all of `'p`.
-    pub fn get(self) -> &'p T {
-        // SAFETY: collection happens only with no mutators, so the object stays alive and in place during 'p
+    /// A reference valid for all of `'scope`.
+    pub fn get(self) -> &'scope T {
+        // SAFETY: collection happens only with no mutators, so the object stays alive and in place during 'scope
         unsafe { self.ptr.as_ref() }
     }
 
@@ -1127,7 +1127,7 @@ impl<'p, T> CrossHeapGc<'p, T> {
 /// Operations for this crate only: the trait lives in a private module and is not exported, so it is unreachable outside the crate.
 #[cfg(crossheap)]
 pub trait CrossHeapGcInternal {
-    /// SAFETY (caller): `ptr` is the data pointer of a live object in this public heap, with the correct brand `'p`.
+    /// SAFETY (caller): `ptr` is the data pointer of a live object in this public heap, with the correct brand `'scope`.
     unsafe fn from_data(ptr: *mut u8) -> Self;
 
     /// The public offset: relative to the start of the public region (the same in every process).
@@ -1166,12 +1166,12 @@ impl<T: fmt::Debug> fmt::Debug for CrossHeapGc<'_, T> {
 }
 
 /// An atomic pointer slot in a public heap object: holds the target's public offset (0 = empty), so the same value is right in every process mapping the heap.
-/// Reads and writes take a [`CrossHeapMutator`] (its region start converts to this process's address).
+/// Reads and writes take a [`CrossHeapScope`] (its region start converts to this process's address).
 #[repr(transparent)]
 #[cfg(crossheap)]
-pub struct CrossHeapSlot<'p, T> {
+pub struct CrossHeapSlot<'scope, T> {
     off: AtomicU64,
-    _brand: PhantomData<CrossHeapGc<'p, T>>,
+    _brand: PhantomData<CrossHeapGc<'scope, T>>,
 }
 
 #[cfg(crossheap)]
@@ -1182,44 +1182,44 @@ impl<T> Default for CrossHeapSlot<'_, T> {
 }
 
 #[cfg(crossheap)]
-impl<'p, T> From<Option<CrossHeapGc<'p, T>>> for CrossHeapSlot<'p, T> {
-    fn from(v: Option<CrossHeapGc<'p, T>>) -> Self {
+impl<'scope, T> From<Option<CrossHeapGc<'scope, T>>> for CrossHeapSlot<'scope, T> {
+    fn from(v: Option<CrossHeapGc<'scope, T>>) -> Self {
         Self { off: AtomicU64::new(Self::raw(v)), _brand: PhantomData }
     }
 }
 
 #[cfg(crossheap)]
-impl<'p, T> From<CrossHeapGc<'p, T>> for CrossHeapSlot<'p, T> {
-    fn from(v: CrossHeapGc<'p, T>) -> Self {
+impl<'scope, T> From<CrossHeapGc<'scope, T>> for CrossHeapSlot<'scope, T> {
+    fn from(v: CrossHeapGc<'scope, T>) -> Self {
         Some(v).into()
     }
 }
 
 #[cfg(crossheap)]
-impl<'p, T> CrossHeapSlot<'p, T> {
-    fn raw(v: Option<CrossHeapGc<'p, T>>) -> u64 {
+impl<'scope, T> CrossHeapSlot<'scope, T> {
+    fn raw(v: Option<CrossHeapGc<'scope, T>>) -> u64 {
         v.map_or(0, CrossHeapGc::offset)
     }
 
-    fn wrap(m: &CrossHeapMutator<'p>, off: u64) -> Option<CrossHeapGc<'p, T>> {
+    fn wrap(m: &CrossHeapScope<'scope>, off: u64) -> Option<CrossHeapGc<'scope, T>> {
         // SAFETY: the slot only ever held offsets of CrossHeapGcs of the same brand, and the object is referenced by the slot's object
         (off != 0).then(|| unsafe { CrossHeapGc::from_data(m.at(off)) })
     }
 
-    pub fn get(&self, m: &CrossHeapMutator<'p>) -> Option<CrossHeapGc<'p, T>> {
+    pub fn get(&self, m: &CrossHeapScope<'scope>) -> Option<CrossHeapGc<'scope, T>> {
         Self::wrap(m, self.off.load(Ordering::Acquire))
     }
 
-    pub fn set(&self, m: &CrossHeapMutator<'p>, v: Option<CrossHeapGc<'p, T>>) {
+    pub fn set(&self, m: &CrossHeapScope<'scope>, v: Option<CrossHeapGc<'scope, T>>) {
         self.swap(m, v);
     }
 
-    pub fn swap(&self, m: &CrossHeapMutator<'p>, v: Option<CrossHeapGc<'p, T>>) -> Option<CrossHeapGc<'p, T>> {
+    pub fn swap(&self, m: &CrossHeapScope<'scope>, v: Option<CrossHeapGc<'scope, T>>) -> Option<CrossHeapGc<'scope, T>> {
         Self::wrap(m, self.off.swap(Self::raw(v), Ordering::AcqRel))
     }
 
     /// Swap in `new` only if the slot holds `current`; on failure returns the slot's value.
-    pub fn compare_exchange(&self, m: &CrossHeapMutator<'p>, current: Option<CrossHeapGc<'p, T>>, new: Option<CrossHeapGc<'p, T>>) -> Result<Option<CrossHeapGc<'p, T>>, Option<CrossHeapGc<'p, T>>> {
+    pub fn compare_exchange(&self, m: &CrossHeapScope<'scope>, current: Option<CrossHeapGc<'scope, T>>, new: Option<CrossHeapGc<'scope, T>>) -> Result<Option<CrossHeapGc<'scope, T>>, Option<CrossHeapGc<'scope, T>>> {
         self.off
             .compare_exchange(Self::raw(current), Self::raw(new), Ordering::AcqRel, Ordering::Acquire)
             .map(|o| Self::wrap(m, o))
@@ -1265,14 +1265,14 @@ impl<B: CrossHeapBrand> Default for CrossHeapRef<'_, B> {
 #[cfg(crossheap)]
 impl<'a, B: CrossHeapBrand> CrossHeapRef<'a, B> {
     /// A new reference to `gc` (in heap `target`) to put into an object of heap `holder`.
-    pub fn to<'b>(holder: &CrossHeapMutator<'a>, target: &CrossHeapMutator<'b>, gc: CrossHeapGc<'b, B::Of<'b>>) -> Self {
+    pub fn to<'b>(holder: &CrossHeapScope<'a>, target: &CrossHeapScope<'b>, gc: CrossHeapGc<'b, B::Of<'b>>) -> Self {
         let r = Self::default();
         r.set(holder, target, Some(gc));
         r
     }
 
     /// Point elsewhere (`None` clears it). The old value's registration is returned at the next group collection.
-    pub fn set<'b>(&self, holder: &CrossHeapMutator<'a>, target: &CrossHeapMutator<'b>, v: Option<CrossHeapGc<'b, B::Of<'b>>>) {
+    pub fn set<'b>(&self, holder: &CrossHeapScope<'a>, target: &CrossHeapScope<'b>, v: Option<CrossHeapGc<'b, B::Of<'b>>>) {
         assert!(holder.index() != target.index(), "edges within one public heap use CrossHeapSlot");
         let off = v.map_or(0, CrossHeapGc::offset);
         if off != 0 {
@@ -1284,12 +1284,12 @@ impl<'a, B: CrossHeapBrand> CrossHeapRef<'a, B> {
     }
 
     /// The target object; `target` is the mutator of the heap it points into. Empty references, references into another heap, and references into an old heap that died (its number reused by `target`) are all None.
-    pub fn get<'b>(&self, target: &CrossHeapMutator<'b>) -> Option<CrossHeapGc<'b, B::Of<'b>>> {
+    pub fn get<'b>(&self, target: &CrossHeapScope<'b>) -> Option<CrossHeapGc<'b, B::Of<'b>>> {
         let off = self.off.load(Ordering::Acquire);
         if off == 0 || Inner::heap_of(off) != Some(target.index()) || self.incarnation.load(Ordering::Acquire) != target.incarnation() {
             return None;
         }
-        // SAFETY: the target heap's entry keeps it alive (registered on write, rebuilt in group collections), and public heaps do not move objects; target proves we are inside the target heap's mutate
+        // SAFETY: the target heap's entry keeps it alive (registered on write, rebuilt in group collections), and public heaps do not move objects; target proves we are inside the target heap's scope
         Some(unsafe { CrossHeapGc::from_data(target.at(off)) })
     }
 
@@ -1376,7 +1376,7 @@ impl WeakWord {
 
 /// A weak reference to an object in some public heap, stored in a public heap object (or anywhere): one word (offset + birth stamp). It registers nothing in the target heap, keeps nothing alive,
 /// and no collection looks at it, so even across heaps and processes it holds up nobody's collection. Once the target is collected it reads as None — also when a new object took its place
-/// (the birth stamp does not match). Reading takes the target heap's mutator (inside its mutate the target cannot be collected right now).
+/// (the birth stamp does not match). Reading takes the target heap's mutator (inside its scope the target cannot be collected right now).
 ///
 /// Reads and writes are single atomic operations without locks: when several processes change it at once, a read returns one of the values written.
 #[repr(transparent)]
@@ -1416,9 +1416,9 @@ impl<B: CrossHeapBrand> CrossHeapWeak<B> {
 
     /// The target object; `target` is the mutator of the heap it lives in. Empty references, references into another heap, targets already collected (the place is empty or taken by a new object)
     /// and type mismatches are all None.
-    pub fn get<'b>(&self, target: &CrossHeapMutator<'b>) -> Option<CrossHeapGc<'b, B::Of<'b>>> {
+    pub fn get<'b>(&self, target: &CrossHeapScope<'b>) -> Option<CrossHeapGc<'b, B::Of<'b>>> {
         let data = target.locate(self.word.load(Ordering::Acquire).into())?;
-        // SAFETY: checked by locate: the data of an object alive in the target heap right now; it cannot be collected inside target's mutate
+        // SAFETY: checked by locate: the data of an object alive in the target heap right now; it cannot be collected inside target's scope
         target.is_type::<B::Of<'b>>(data).then(|| unsafe { CrossHeapGc::from_data(data) })
     }
 
@@ -1455,7 +1455,7 @@ unsafe impl<B: CrossHeapBrand> Trace for CrossHeapWeak<B> {
 /// It holds the weak reference word (offset + birth stamp), the target heap's identity and the object's type key (a hash of the type name, size and pointer map): 32 bytes.
 ///
 /// A signature keeps nothing alive (as [`CrossHeapWeak`]): once the sender stops referencing the object it dies at the next collection, and looking it up by signature gives None.
-/// The receiver can check it without knowing the Rust type ([`CrossHeapMutator::verify`]); to get it by type use [`CrossHeapMutator::resolve`].
+/// The receiver can check it without knowing the Rust type ([`CrossHeapScope::verify`]); to get it by type use [`CrossHeapScope::resolve`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg(crossheap)]
 pub struct Signature {
@@ -1520,13 +1520,13 @@ impl From<&[u8; SIGNATURE_BYTES]> for Signature {
     }
 }
 
-/// Rebrand a public heap type carrying `'p`: [`CrossHeapRoot<B>`] has no lifetime, and the current mutate's `'p` is put back on when reading it. Declare it with [`cross_heap_brand!`](crate::cross_heap_brand).
+/// Rebrand a public heap type carrying `'scope`: [`CrossHeapGlobal<B>`] has no lifetime, and the current scope's `'scope` is put back on when reading it. Declare it with [`cross_heap_brand!`](crate::cross_heap_brand).
 #[cfg(crossheap)]
 pub trait CrossHeapBrand {
-    type Of<'p>: Shared + 'p;
+    type Of<'scope>: Shared + 'scope;
 }
 
-/// Declare a public heap brand type: `cross_heap_brand!(pub NodeB = for<'p> Node<'p>);`
+/// Declare a public heap brand type: `cross_heap_brand!(pub NodeB = for<'scope> Node<'scope>);`
 #[cfg(crossheap)]
 #[macro_export]
 macro_rules! cross_heap_brand {
@@ -1540,9 +1540,9 @@ macro_rules! cross_heap_brand {
 }
 
 /// A handle to a public heap object: it takes an entry in the entry table, and the object is not collected while it lives. Carries no lifetime, so it can go into private heap objects and across threads.
-/// Create it with [`CrossHeapMutator::root`] and read it with [`CrossHeapRoot::get`].
+/// Create it with [`CrossHeapScope::global`] and read it with [`CrossHeapGlobal::get`].
 #[cfg(crossheap)]
-pub struct CrossHeapRoot<B: CrossHeapBrand> {
+pub struct CrossHeapGlobal<B: CrossHeapBrand> {
     /// This process's side of the heap: the Arc keeps the window mapped while handles exist
     heap: Arc<Inner>,
     entry: u32,
@@ -1553,18 +1553,18 @@ pub struct CrossHeapRoot<B: CrossHeapBrand> {
 
 // SAFETY: only shared references to B::Of are given out (Shared: Send + Sync); the entry table is atomic
 #[cfg(crossheap)]
-unsafe impl<B: CrossHeapBrand> Send for CrossHeapRoot<B> {}
+unsafe impl<B: CrossHeapBrand> Send for CrossHeapGlobal<B> {}
 // SAFETY: as above
 #[cfg(crossheap)]
-unsafe impl<B: CrossHeapBrand> Sync for CrossHeapRoot<B> {}
+unsafe impl<B: CrossHeapBrand> Sync for CrossHeapGlobal<B> {}
 
 #[cfg(crossheap)]
-impl<B: CrossHeapBrand> CrossHeapRoot<B> {
+impl<B: CrossHeapBrand> CrossHeapGlobal<B> {
 
     /// The target object; `m` must be the target heap's mutator.
-    pub fn get<'p>(&self, m: &CrossHeapMutator<'p>) -> CrossHeapGc<'p, B::Of<'p>> {
-        assert!(m.is(&self.heap), "this CrossHeapRoot does not point into this heap");
-        // SAFETY: the entry keeps the object alive and public heaps do not move objects; m proves we are inside this heap's mutate
+    pub fn get<'scope>(&self, m: &CrossHeapScope<'scope>) -> CrossHeapGc<'scope, B::Of<'scope>> {
+        assert!(m.is(&self.heap), "this CrossHeapGlobal does not point into this heap");
+        // SAFETY: the entry keeps the object alive and public heaps do not move objects; m proves we are inside one of this heap's scopes
         unsafe { CrossHeapGc::from_data(self.data.as_ptr()) }
     }
 
@@ -1573,13 +1573,13 @@ impl<B: CrossHeapBrand> CrossHeapRoot<B> {
         heap.is(&self.heap)
     }
 
-    /// The entry number: the same wherever the heap is mapped, so elsewhere [`CrossHeapMutator::find`] gets the same object with it.
+    /// The entry number: the same wherever the heap is mapped, so elsewhere [`CrossHeapScope::find`] gets the same object with it.
     pub fn index(&self) -> u32 {
         self.entry
     }
 
     /// Turn this entry into a root owned by no process and return the entry number: it is not returned when this process exits (or is killed), and after a restart the main process
-    /// continues with the entry number ([`CrossHeapMutator::find`]); return it with [`CrossHeapMutator::release`] when no longer needed.
+    /// continues with the entry number ([`CrossHeapScope::find`]); return it with [`CrossHeapScope::release`] when no longer needed.
     pub fn persist(self) -> u32 {
         let me = core::mem::ManuallyDrop::new(self);
         me.heap.disown_entry(me.entry);
@@ -1592,12 +1592,12 @@ impl<B: CrossHeapBrand> CrossHeapRoot<B> {
 
 /// Operations for this crate only: the trait lives in a private module and is not exported, so it is unreachable outside the crate.
 #[cfg(crossheap)]
-pub trait CrossHeapRootInternal {
+pub trait CrossHeapGlobalInternal {
     fn new(heap: Arc<Inner>, entry: u32, data: NonNull<u8>) -> Self;
 }
 
 #[cfg(crossheap)]
-impl<B: CrossHeapBrand> CrossHeapRootInternal for CrossHeapRoot<B> {
+impl<B: CrossHeapBrand> CrossHeapGlobalInternal for CrossHeapGlobal<B> {
     fn new(heap: Arc<Inner>, entry: u32, data: NonNull<u8>) -> Self {
         Self { heap, entry, data, _brand: PhantomData }
     }
@@ -1605,7 +1605,7 @@ impl<B: CrossHeapBrand> CrossHeapRootInternal for CrossHeapRoot<B> {
 
 
 #[cfg(crossheap)]
-impl<B: CrossHeapBrand> Drop for CrossHeapRoot<B> {
+impl<B: CrossHeapBrand> Drop for CrossHeapGlobal<B> {
     fn drop(&mut self) {
         self.heap.release_entry(self.entry);
     }
@@ -1613,7 +1613,7 @@ impl<B: CrossHeapBrand> Drop for CrossHeapRoot<B> {
 
 // SAFETY: the handle has no edges into the private heap (it is itself a root of the public heap)
 #[cfg(crossheap)]
-unsafe impl<B: CrossHeapBrand> Trace for CrossHeapRoot<B> {
+unsafe impl<B: CrossHeapBrand> Trace for CrossHeapGlobal<B> {
     const NO_EDGES: bool = true;
     fn trace(&self, _: &mut Tracer<'_>) {}
 }

@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use paragc::{Gc, Heap, Root, Trace, Tracer, WORD_PAYLOAD, WordSlot, YoungEvacuation, brand, word_pointer};
+use paragc::{Gc, Heap, Global, Trace, Tracer, WORD_PAYLOAD, WordSlot, YoungEvacuation, brand, word_pointer};
 
 /// Counts on drop (no Gc, so it may have Drop).
 struct Counted(Arc<AtomicUsize>);
@@ -23,13 +23,13 @@ unsafe impl Trace for Counted {
 
 /// A node of the chain: `next` is a pointer word (tag [`TAG`]) or a number word (the end of the chain); `n` is always a number word
 #[derive(Trace)]
-struct Node<'gc> {
-    next: WordSlot<'gc>,
-    n: WordSlot<'gc>,
+struct Node<'scope> {
+    next: WordSlot<'scope>,
+    n: WordSlot<'scope>,
     tag: Counted,
 }
 
-brand!(NodeB = for<'gc> Node<'gc>);
+brand!(NodeB = for<'scope> Node<'scope>);
 
 /// The user's own pointer tag (in the pointer range, not paragc's `RAW_TAG`)
 const TAG: u64 = 0xFFF9 << 48;
@@ -44,11 +44,11 @@ fn pointer(n: Gc<'_, Node<'_>>) -> u64 {
 }
 
 /// The node in a word (the tag must be unchanged)
-fn node<'gc>(word: u64) -> Option<Gc<'gc, Node<'gc>>> {
+fn node<'scope>(word: u64) -> Option<Gc<'scope, Node<'scope>>> {
     let p = word_pointer(word)?;
     assert_eq!(word & !WORD_PAYLOAD, TAG, "the tag changed");
     // SAFETY: the word was made by `pointer`, and the node is pointed to by a reachable node of the chain
-    Some(unsafe { Gc::from_raw(p.cast::<Node<'gc>>()) })
+    Some(unsafe { Gc::from_raw(p.cast::<Node<'scope>>()) })
 }
 
 fn number(n: f64) -> u64 {
@@ -56,21 +56,21 @@ fn number(n: f64) -> u64 {
 }
 
 /// One root for the head node, then `len` nodes; node i has `n` = i
-fn build(heap: &Heap, len: usize, drops: &Arc<AtomicUsize>) -> Root<NodeB> {
-    heap.mutate(|m| {
+fn build(heap: &Heap, len: usize, drops: &Arc<AtomicUsize>) -> Global<NodeB> {
+    heap.scope(|m| {
         let mut next = number(END);
         for i in (0..len).rev() {
             #[expect(clippy::cast_precision_loss, reason = "below 2^53")]
             let n = m.alloc(Node { next: WordSlot::new(next), n: WordSlot::new(number(i as f64)), tag: Counted(Arc::clone(drops)) });
             next = pointer(n);
         }
-        m.root(node(next).expect("len > 0"))
+        m.global(node(next).expect("len > 0"))
     })
 }
 
 /// Walk to the end of the chain: the node count; `n` increases in order and the end is END
-fn walk(heap: &Heap, root: &Root<NodeB>) -> usize {
-    heap.mutate(|m| {
+fn walk(heap: &Heap, root: &Global<NodeB>) -> usize {
+    heap.scope(|m| {
         let mut cur = Some(m.get(root));
         let mut count = 0;
         let mut last = -1.0;
@@ -101,7 +101,7 @@ fn survives_full_collections_and_cut_frees_the_rest() {
     }
     assert_eq!(drops.load(Ordering::Relaxed), 0, "a live node was finalized");
     // Cut at node LEN / 2: its next becomes a number word
-    heap.mutate(|m| {
+    heap.scope(|m| {
         let mut cur = m.get(&root);
         for _ in 1..LEN / 2 {
             cur = node(cur.next.get()).expect("the chain is long enough");
@@ -124,7 +124,7 @@ fn young(mode: YoungEvacuation) {
     let root = build(&heap, LEN, &drops);
     heap.collect();
     // Insert a young node after every old node; make as many again and discard them
-    heap.mutate(|m| {
+    heap.scope(|m| {
         let mut cur = Some(m.get(&root));
         while let Some(old) = cur {
             let next = old.next.get();
@@ -168,7 +168,7 @@ fn concurrent_marking_while_rewriting() {
     for round in 0..4 {
         assert!(heap.mark_concurrently());
         // Write each node's n as a pointer word (to the next node), then back to a number: the barrier runs in both directions
-        heap.mutate(|m| {
+        heap.scope(|m| {
             let mut cur = Some(m.get(&root));
             while let Some(n) = cur {
                 let v = n.n.get();
@@ -184,7 +184,7 @@ fn concurrent_marking_while_rewriting() {
         assert_eq!(walk(&heap, &root), LEN);
         assert_eq!(drops.load(Ordering::Relaxed), 0);
     }
-    heap.mutate(|m| {
+    heap.scope(|m| {
         m.get(&root).next.set(m, number(END));
     });
     heap.collect();

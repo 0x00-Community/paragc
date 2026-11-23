@@ -30,8 +30,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_utils::{Backoff, CachePadded};
 
-use crate::{Gc, Handle, HandleSlot, Slot, WordSlot};
-use crate::handle::{GcInternal, HandleInternal, RawSlot, RootTable, SlotInternal, WordSlotInternal};
+use crate::{Gc, Handle, HandleSlot, GcSlot, WordSlot};
+use crate::handle::{GcInternal, HandleInternal, RawSlot, RootTable, GcSlotInternal, WordSlotInternal};
 #[cfg(crossheap)]
 use crate::handle::{EDGE_KINDS, FAR_EDGE, PTR_EDGE, WORD_EDGE, word_pointer};
 #[cfg(crossheap)]
@@ -52,7 +52,7 @@ use crate::sync::{Pool, SegVec};
 /// - types with `Gc` fields must not implement `Drop` (finalization order is unspecified, so `Drop` could touch an already finalized object); the derive checks this
 ///
 /// # Safety
-/// `trace` must call [`Tracer::edge`] once for every directly held `Gc` / `Slot` (or call `trace` on the field); a missed one is a dangling pointer;
+/// `trace` must call [`Tracer::edge`] once for every directly held `Gc` / `GcSlot` (or call `trace` on the field); a missed one is a dangling pointer;
 /// `relocate` likewise calls [`Tracer::relocate`] once per edge (or `relocate` on the field), and the collector rewrites moved objects to their new address.
 /// `NO_EDGES` may be true only when the type really holds no `Gc`.
 pub unsafe trait Trace: Send + Sync {
@@ -145,7 +145,7 @@ impl Tracer<'_> {
     }
 
     /// Mark (moving if needed) and return the object's current location; no counting.
-    fn forward_gc<'gc, T: Trace>(&mut self, gc: Gc<'gc, T>) -> Gc<'gc, T> {
+    fn forward_gc<'scope, T: Trace>(&mut self, gc: Gc<'scope, T>) -> Gc<'scope, T> {
         let old = gc.header();
         let new = self.forward(old, T::NO_EDGES);
         // SAFETY: new is the same object (or its moved header), with the same brand and type
@@ -237,12 +237,12 @@ pub trait TracerInternal<'t> {
     fn relocating(&self) -> bool;
 
     /// A slot (read only): normally just an edge; in counting mode it switches to counting the current value and increments it; in release mode it hands over the last counted value for a decrement.
-    fn slot<T: Trace>(&mut self, slot: &Slot<'_, T>);
+    fn slot<T: Trace>(&mut self, slot: &GcSlot<'_, T>);
 
     /// A rewritable slot (evacuating collections): rewritten to the new address if moved; in counting mode counts the new value and increments it.
-    fn slot_mut<T: Trace>(&mut self, slot: &mut Slot<'_, T>);
+    fn slot_mut<T: Trace>(&mut self, slot: &mut GcSlot<'_, T>);
 
-    /// A type-erased slot ([`Slot`], [`crate::WordSlot`]), read only; `no_edges`: the target has no edges
+    /// A type-erased slot ([`GcSlot`], [`crate::WordSlot`]), read only; `no_edges`: the target has no edges
     fn raw(&mut self, raw: &RawSlot, no_edges: bool);
 
     /// A type-erased slot, rewritable (evacuating collections)
@@ -317,11 +317,11 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
         self.copier.is_some()
     }
 
-    fn slot<T: Trace>(&mut self, slot: &Slot<'_, T>) {
+    fn slot<T: Trace>(&mut self, slot: &GcSlot<'_, T>) {
         self.raw(slot.raw_slot(), T::NO_EDGES);
     }
 
-    fn slot_mut<T: Trace>(&mut self, slot: &mut Slot<'_, T>) {
+    fn slot_mut<T: Trace>(&mut self, slot: &mut GcSlot<'_, T>) {
         self.raw_mut(slot.raw_slot(), T::NO_EDGES);
     }
 
@@ -468,7 +468,7 @@ unsafe impl<T: Trace> Trace for Gc<'_, T> {
 }
 
 // SAFETY: the value in the slot is an edge
-unsafe impl<T: Trace> Trace for Slot<'_, T> {
+unsafe impl<T: Trace> Trace for GcSlot<'_, T> {
     fn trace(&self, t: &mut Tracer<'_>) {
         t.slot(self);
     }
@@ -800,7 +800,7 @@ impl<'g> Marking<'g> {
         let seed = Worker::new_lifo();
         let mut t = Tracer::new(&seed, epoch, None);
         for &slot in slots {
-            // SAFETY: the slot lives in the object written to; that object was reachable when written and is not freed before this collection (see Mutator::written)
+            // SAFETY: the slot lives in the object written to; that object was reachable when written and is not freed before this collection (see Scope::written)
             let slot = unsafe { &*core::ptr::with_exposed_provenance::<RawSlot>(slot) };
             if let Some(h) = slot.current() {
                 t.visit(h, false);
@@ -839,7 +839,7 @@ impl<'g> Marking<'g> {
                 }
             }
             for &slot in self.slots {
-                // SAFETY: the slot lives in the old object written to and is not freed before this collection (see Mutator::written); no mutator writes it during the pause
+                // SAFETY: the slot lives in the old object written to and is not freed before this collection (see Scope::written); no mutator writes it during the pause
                 let slot = unsafe { &*core::ptr::with_exposed_provenance::<RawSlot>(slot) };
                 if let Some(old) = slot.current() {
                     // A remembered slot inside a cross-heap object must end up pointing into the cross-heap

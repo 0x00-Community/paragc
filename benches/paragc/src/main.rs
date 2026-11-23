@@ -2,16 +2,16 @@
 use std::num::NonZeroUsize;
 
 use bench_common::{Args, Bench, Clock, FRAG_PER_ROUND, FRAG_ROUNDS, Footprint, Frag, GcBench, LONG_LIVED_DEPTH, MT_DEPTH, MT_ROUNDS, MT_TREES, PAUSE_DEPTH, STRETCH_DEPTH, Size, Took, Tree};
-use paragc::{Gc, Heap, Mutator, Root, Slot, Tlab, Trace, brand};
+use paragc::{Gc, Heap, Scope, Global, GcSlot, Tlab, Trace, brand};
 
 #[derive(Trace)]
-struct Node<'gc> {
-    left: Option<Gc<'gc, Node<'gc>>>,
-    right: Option<Gc<'gc, Node<'gc>>>,
+struct Node<'scope> {
+    left: Option<Gc<'scope, Node<'scope>>>,
+    right: Option<Gc<'scope, Node<'scope>>>,
     value: u64,
 }
 
-brand!(NodeB = for<'gc> Node<'gc>);
+brand!(NodeB = for<'scope> Node<'scope>);
 
 /// An object of the fragmentation load: `N` u64s of data
 #[derive(Trace)]
@@ -21,26 +21,26 @@ struct Blob<const N: usize> {
 
 /// The holder of the fragmentation load: one group of slots per size
 #[derive(Trace)]
-struct Holder<'gc> {
-    small: Vec<Slot<'gc, Blob<3>>>,
-    medium: Vec<Slot<'gc, Blob<30>>>,
-    large: Vec<Slot<'gc, Blob<200>>>,
-    huge: Vec<Slot<'gc, Blob<1500>>>,
+struct Holder<'scope> {
+    small: Vec<GcSlot<'scope, Blob<3>>>,
+    medium: Vec<GcSlot<'scope, Blob<30>>>,
+    large: Vec<GcSlot<'scope, Blob<200>>>,
+    huge: Vec<GcSlot<'scope, Blob<1500>>>,
 }
 
-brand!(HolderB = for<'gc> Holder<'gc>);
+brand!(HolderB = for<'scope> Holder<'scope>);
 
-impl<'gc> Holder<'gc> {
+impl<'scope> Holder<'scope> {
     fn new() -> Self {
-        fn slots<'gc, const N: usize>(size: Size) -> Vec<Slot<'gc, Blob<N>>> {
-            (0..size.slots()).map(|_| Slot::default()).collect()
+        fn slots<'scope, const N: usize>(size: Size) -> Vec<GcSlot<'scope, Blob<N>>> {
+            (0..size.slots()).map(|_| GcSlot::default()).collect()
         }
         Self { small: slots(Size::Small), medium: slots(Size::Medium), large: slots(Size::Large), huge: slots(Size::Huge) }
     }
 
     /// Allocate an object and put it in a slot if needed (the old object overwritten becomes garbage).
-    fn place(&self, m: &Mutator<'gc>, frag: &mut Frag) {
-        fn put<'gc, const N: usize>(m: &Mutator<'gc>, slots: &[Slot<'gc, Blob<N>>], slot: Option<usize>) {
+    fn place(&self, m: &Scope<'scope>, frag: &mut Frag) {
+        fn put<'scope, const N: usize>(m: &Scope<'scope>, slots: &[GcSlot<'scope, Blob<N>>], slot: Option<usize>) {
             let blob = m.alloc(Blob { _data: [0; N] });
             if let Some(i) = slot {
                 slots[i].set(m, Some(blob));
@@ -61,13 +61,13 @@ struct Paragc {
 }
 
 impl Paragc {
-    fn tree<'gc>(m: &Mutator<'gc>, depth: u32) -> Gc<'gc, Node<'gc>> {
+    fn tree<'scope>(m: &Scope<'scope>, depth: u32) -> Gc<'scope, Node<'scope>> {
         let (left, right) = if depth > 1 { (Some(Self::tree(m, depth - 1)), Some(Self::tree(m, depth - 1))) } else { (None, None) };
         m.alloc(Node { left, right, value: depth.into() })
     }
 
-    fn rooted(heap: &Heap, depth: u32) -> Root<NodeB> {
-        heap.mutate(|m| m.root(Self::tree(m, depth)))
+    fn rooted(heap: &Heap, depth: u32) -> Global<NodeB> {
+        heap.scope(|m| m.global(Self::tree(m, depth)))
     }
 
     /// A live tree + a garbage tree, timing only the part that stops mutators:
@@ -75,7 +75,7 @@ impl Paragc {
     fn timed_pause(&self, concurrent_mark: bool, concurrent_sweep: bool) -> Took {
         let mut heap = Heap::new(self.threads);
         let live = Self::rooted(&heap, PAUSE_DEPTH);
-        heap.mutate(|m| {
+        heap.scope(|m| {
             Self::tree(m, PAUSE_DEPTH);
         });
         if concurrent_mark {
@@ -93,8 +93,8 @@ impl Paragc {
         took
     }
 
-    fn count(heap: &Heap, root: &Root<NodeB>) -> usize {
-        heap.mutate(|m| {
+    fn count(heap: &Heap, root: &Global<NodeB>) -> usize {
+        heap.scope(|m| {
             let mut stack = vec![m.get(root)];
             let mut n = 0;
             while let Some(x) = stack.pop() {
@@ -113,7 +113,7 @@ impl Bench for Paragc {
     fn pause(&self) -> Option<Took> {
         let mut heap = Heap::new(self.threads);
         let live = Self::rooted(&heap, PAUSE_DEPTH);
-        heap.mutate(|m| {
+        heap.scope(|m| {
             Self::tree(m, PAUSE_DEPTH);
         });
         let start = Clock::start();
@@ -126,14 +126,14 @@ impl Bench for Paragc {
     fn gcbench(&self) -> Option<Took> {
         let start = Clock::start();
         let mut heap = Heap::new(self.threads);
-        heap.mutate(|m| {
+        heap.scope(|m| {
             Self::tree(m, STRETCH_DEPTH);
         });
         heap.collect_if_needed();
         let long = Self::rooted(&heap, LONG_LIVED_DEPTH);
         for (depth, iters) in GcBench::rounds() {
             for _ in 0..iters {
-                heap.mutate(|m| {
+                heap.scope(|m| {
                     Self::tree(m, depth);
                 });
                 heap.collect_if_needed();
@@ -148,11 +148,11 @@ impl Bench for Paragc {
         let base = Footprint::rss();
         let start = Clock::start();
         let mut heap = Heap::new(self.threads);
-        let holder: Root<HolderB> = heap.mutate(|m| m.root(m.alloc(Holder::new())));
+        let holder: Global<HolderB> = heap.scope(|m| m.global(m.alloc(Holder::new())));
         let mut frag = Frag::default();
         let mut peak = 0;
         for _ in 0..FRAG_ROUNDS {
-            heap.mutate(|m| {
+            heap.scope(|m| {
                 let h = m.get(&holder);
                 for _ in 0..FRAG_PER_ROUND {
                     h.place(m, &mut frag);
@@ -192,7 +192,7 @@ impl Bench for Paragc {
                     s.spawn(move || {
                         let mut tlab = Tlab::default();
                         for _ in 0..per_thread {
-                            heap.mutate_in(&mut tlab, |m| {
+                            heap.scope_in(&mut tlab, |m| {
                                 Self::tree(m, MT_DEPTH);
                             });
                         }

@@ -4,17 +4,17 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use bench_common::{Args, Bench, Clock, GcBench, LONG_LIVED_DEPTH, PAUSE_DEPTH, STRETCH_DEPTH, Took, Tree};
-use paragc::{CrossHeapRoot, CrossHeapGc, CrossHeap, CrossHeapMutator, CrossHeapSlot, CrossHeapSpace, Shared, cross_heap_brand};
+use paragc::{CrossHeapGlobal, CrossHeapGc, CrossHeap, CrossHeapScope, CrossHeapSlot, CrossHeapSpace, Shared, cross_heap_brand};
 
 #[repr(C)]
 #[derive(Shared)]
-struct Node<'p> {
-    left: CrossHeapSlot<'p, Node<'p>>,
-    right: CrossHeapSlot<'p, Node<'p>>,
+struct Node<'scope> {
+    left: CrossHeapSlot<'scope, Node<'scope>>,
+    right: CrossHeapSlot<'scope, Node<'scope>>,
     value: u64,
 }
 
-cross_heap_brand!(NodeB = for<'p> Node<'p>);
+cross_heap_brand!(NodeB = for<'scope> Node<'scope>);
 
 /// Collection trigger floor and factor (as for the private heap): collect once newly taken bytes exceed "last live × GROWTH" and at least MIN_TRIGGER
 const MIN_TRIGGER: usize = 4 * 1024 * 1024;
@@ -31,17 +31,17 @@ impl ParagcPublic {
         self.space.create(path, self.threads).expect("create a public heap")
     }
 
-    fn tree<'p>(m: &CrossHeapMutator<'p>, depth: u32) -> CrossHeapGc<'p, Node<'p>> {
+    fn tree<'scope>(m: &CrossHeapScope<'scope>, depth: u32) -> CrossHeapGc<'scope, Node<'scope>> {
         let (left, right) = if depth > 1 { (Some(Self::tree(m, depth - 1)), Some(Self::tree(m, depth - 1))) } else { (None, None) };
         m.alloc(Node { left: left.into(), right: right.into(), value: depth.into() })
     }
 
-    fn rooted(heap: &CrossHeap, depth: u32) -> CrossHeapRoot<NodeB> {
-        heap.mutate(|m| m.root(Self::tree(m, depth)))
+    fn rooted(heap: &CrossHeap, depth: u32) -> CrossHeapGlobal<NodeB> {
+        heap.scope(|m| m.global(Self::tree(m, depth)))
     }
 
-    fn count(heap: &CrossHeap, root: &CrossHeapRoot<NodeB>) -> usize {
-        heap.mutate(|m| {
+    fn count(heap: &CrossHeap, root: &CrossHeapGlobal<NodeB>) -> usize {
+        heap.scope(|m| {
             let mut stack = vec![root.get(m)];
             let mut n = 0;
             while let Some(x) = stack.pop() {
@@ -67,7 +67,7 @@ impl Bench for ParagcPublic {
     fn pause(&self) -> Option<Took> {
         let heap = self.heap();
         let live = Self::rooted(&heap, PAUSE_DEPTH);
-        heap.mutate(|m| {
+        heap.scope(|m| {
             Self::tree(m, PAUSE_DEPTH);
         });
         let start = Clock::start();
@@ -80,14 +80,14 @@ impl Bench for ParagcPublic {
     fn gcbench(&self) -> Option<Took> {
         let start = Clock::start();
         let heap = self.heap();
-        heap.mutate(|m| {
+        heap.scope(|m| {
             Self::tree(m, STRETCH_DEPTH);
         });
         Self::collect_if_needed(&heap);
         let long = Self::rooted(&heap, LONG_LIVED_DEPTH);
         for (depth, iters) in GcBench::rounds() {
             for _ in 0..iters {
-                heap.mutate(|m| {
+                heap.scope(|m| {
                     Self::tree(m, depth);
                 });
                 Self::collect_if_needed(&heap);

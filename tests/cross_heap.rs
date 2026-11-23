@@ -5,7 +5,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use paragc::{HeapDead, Heap, CrossHeapRoot, CrossHeapGc, CrossHeap, CrossHeapRef, CrossHeapSlot, CrossHeapSpace, CrossHeapWeak, Root, SIGNATURE_BYTES, Shared, Signature, Trace, brand, cross_heap_brand};
+use paragc::{HeapDead, Heap, CrossHeapGlobal, CrossHeapGc, CrossHeap, CrossHeapRef, CrossHeapSlot, CrossHeapSpace, CrossHeapWeak, Global, SIGNATURE_BYTES, Shared, Signature, Trace, brand, cross_heap_brand};
 
 /// Collector threads per heap (fewer under Miri)
 const THREADS: NonZeroUsize = NonZeroUsize::new(if cfg!(miri) { 2 } else { 4 }).unwrap();
@@ -14,29 +14,29 @@ const HEADER: usize = 16;
 
 #[repr(C)]
 #[derive(Shared)]
-struct Node<'p> {
+struct Node<'scope> {
     value: u64,
-    next: CrossHeapSlot<'p, Node<'p>>,
+    next: CrossHeapSlot<'scope, Node<'scope>>,
 }
 
-cross_heap_brand!(NodeB = for<'p> Node<'p>);
+cross_heap_brand!(NodeB = for<'scope> Node<'scope>);
 
 /// Bytes taken by one Node (header + data, rounded to 8 bytes)
 const NODE: usize = (HEADER + size_of::<Node<'static>>()).next_multiple_of(8);
 
 /// Make a chain of `len` nodes (values 0..len) and return a handle to its head.
-fn list(heap: &CrossHeap, len: u64) -> CrossHeapRoot<NodeB> {
-    heap.mutate(|m| {
+fn list(heap: &CrossHeap, len: u64) -> CrossHeapGlobal<NodeB> {
+    heap.scope(|m| {
         let mut top = None;
         for value in 0..len {
             top = Some(m.alloc(Node { value, next: top.into() }));
         }
-        m.root(top.expect("len > 0"))
+        m.global(top.expect("len > 0"))
     })
 }
 
-fn sum(heap: &CrossHeap, root: &CrossHeapRoot<NodeB>) -> u64 {
-    heap.mutate(|m| {
+fn sum(heap: &CrossHeap, root: &CrossHeapGlobal<NodeB>) -> u64 {
+    heap.scope(|m| {
         let (mut sum, mut cur) = (0, Some(root.get(m)));
         while let Some(n) = cur {
             sum += n.value;
@@ -77,36 +77,36 @@ fn cross_heap_list_survives_and_garbage_is_reclaimed() {
 /// Pointer slots in nested types and fixed-size arrays must all be in the pointer map
 #[repr(C)]
 #[derive(Shared)]
-struct Inner<'p> {
+struct Inner<'scope> {
     tag: u32,
-    slot: CrossHeapSlot<'p, Node<'p>>,
+    slot: CrossHeapSlot<'scope, Node<'scope>>,
 }
 
 #[repr(C)]
 #[derive(Shared)]
-struct Holder<'p> {
-    many: [CrossHeapSlot<'p, Node<'p>>; 3],
+struct Holder<'scope> {
+    many: [CrossHeapSlot<'scope, Node<'scope>>; 3],
     bytes: [u8; 5],
-    inner: Inner<'p>,
+    inner: Inner<'scope>,
 }
 
-cross_heap_brand!(HolderB = for<'p> Holder<'p>);
+cross_heap_brand!(HolderB = for<'scope> Holder<'scope>);
 
 #[test]
 fn pointer_map_covers_nested_fields_and_arrays() {
     let space = CrossHeapSpace::reserve().unwrap();
     let heap = space.create_anonymous(THREADS).unwrap();
-    let holder: CrossHeapRoot<HolderB> = heap.mutate(|m| {
+    let holder: CrossHeapGlobal<HolderB> = heap.scope(|m| {
         let leaf = |value| m.alloc(Node { value, next: CrossHeapSlot::default() });
         let h = m.alloc(Holder { many: [leaf(1).into(), leaf(2).into(), leaf(3).into()], bytes: [7; 5], inner: Inner { tag: 9, slot: leaf(4).into() } });
         // One not attached: it will be collected
         leaf(100);
-        m.root(h)
+        m.global(h)
     });
     heap.collect();
     let holder_bytes = (HEADER + size_of::<Holder<'static>>()).next_multiple_of(8);
     assert_eq!(heap.stats().live, holder_bytes + 4 * NODE, "the four attached leaves live, the unattached one died");
-    heap.mutate(|m| {
+    heap.scope(|m| {
         let h = holder.get(m);
         let values: Vec<u64> = h.many.iter().chain([&h.inner.slot]).map(|s| s.get(m).expect("attached").value).collect();
         assert_eq!(values, [1, 2, 3, 4]);
@@ -122,25 +122,25 @@ fn pointer_map_covers_nested_fields_and_arrays() {
 /// A large object (above half a block): takes a run of blocks of its own
 #[repr(C)]
 #[derive(Shared)]
-struct Big<'p> {
+struct Big<'scope> {
     data: [u64; 2048],
-    next: CrossHeapSlot<'p, Big<'p>>,
+    next: CrossHeapSlot<'scope, Big<'scope>>,
 }
 
-cross_heap_brand!(BigB = for<'p> Big<'p>);
+cross_heap_brand!(BigB = for<'scope> Big<'scope>);
 
 #[test]
 fn large_public_objects() {
     const COUNT: u64 = if cfg!(miri) { 3 } else { 40 };
     let space = CrossHeapSpace::reserve().unwrap();
     let heap = space.create_anonymous(THREADS).unwrap();
-    let chain = |seed: u64| -> CrossHeapRoot<BigB> {
-        heap.mutate(|m| {
+    let chain = |seed: u64| -> CrossHeapGlobal<BigB> {
+        heap.scope(|m| {
             let mut top = None;
             for i in 0..COUNT {
                 top = Some(m.alloc(Big { data: core::array::from_fn(|k| seed + i + k as u64), next: top.into() }));
             }
-            m.root(top.expect("COUNT > 0"))
+            m.global(top.expect("COUNT > 0"))
         })
     };
     let kept = chain(1_000);
@@ -148,7 +148,7 @@ fn large_public_objects() {
     heap.collect();
     let big = (HEADER + size_of::<Big<'static>>()).next_multiple_of(8);
     assert_eq!(heap.stats().live, big * usize::try_from(COUNT).unwrap());
-    heap.mutate(|m| {
+    heap.scope(|m| {
         let (mut cur, mut i) = (Some(kept.get(m)), COUNT);
         while let Some(b) = cur {
             i -= 1;
@@ -189,15 +189,15 @@ fn file_starts_empty_and_grows() {
 /// Each thread's own chain hangs here
 #[repr(C)]
 #[derive(Shared)]
-struct Anchor<'p> {
-    heads: [CrossHeapSlot<'p, Node<'p>>; 8],
+struct Anchor<'scope> {
+    heads: [CrossHeapSlot<'scope, Node<'scope>>; 8],
 }
 
-cross_heap_brand!(AnchorB = for<'p> Anchor<'p>);
+cross_heap_brand!(AnchorB = for<'scope> Anchor<'scope>);
 
 /// Chain `t`: push `push` nodes at the head (value = current length), then pop `pop` from the head; returns the new length.
-fn churn(heap: &CrossHeap, anchor: &CrossHeapRoot<AnchorB>, t: usize, len: u64, push: u64, pop: u64) -> u64 {
-    heap.mutate(|m| {
+fn churn(heap: &CrossHeap, anchor: &CrossHeapGlobal<AnchorB>, t: usize, len: u64, push: u64, pop: u64) -> u64 {
+    heap.scope(|m| {
         let top = &anchor.get(m).heads[t];
         for v in len..len + push {
             let n = m.alloc(Node { value: v, next: top.get(m).into() });
@@ -212,8 +212,8 @@ fn churn(heap: &CrossHeap, anchor: &CrossHeapRoot<AnchorB>, t: usize, len: u64, 
 }
 
 /// The values of chain `t` from head to tail must be len-1, len-2, …, 0.
-fn check(heap: &CrossHeap, anchor: &CrossHeapRoot<AnchorB>, t: usize, len: u64) {
-    heap.mutate(|m| {
+fn check(heap: &CrossHeap, anchor: &CrossHeapGlobal<AnchorB>, t: usize, len: u64) {
+    heap.scope(|m| {
         let (mut cur, mut expect) = (anchor.get(m).heads[t].get(m), len);
         while let Some(n) = cur {
             expect -= 1;
@@ -245,15 +245,15 @@ fn two_mappings_of_one_heap() {
     let b = sb.open(&path, THREADS).unwrap();
     assert_eq!(a.id(), b.id());
     let root = list(&a, LEN);
-    let rb: CrossHeapRoot<NodeB> = b.mutate(|m| m.find(root.index())).expect("found by entry number");
-    assert!(b.mutate(|m| m.find::<HolderB>(root.index())).is_none(), "not found when the type does not match");
-    let pa = a.mutate(|m| root.get(m).as_ptr().addr());
-    let pb = b.mutate(|m| rb.get(m).as_ptr().addr());
+    let rb: CrossHeapGlobal<NodeB> = b.scope(|m| m.find(root.index())).expect("found by entry number");
+    assert!(b.scope(|m| m.find::<HolderB>(root.index())).is_none(), "not found when the type does not match");
+    let pa = a.scope(|m| root.get(m).as_ptr().addr());
+    let pb = b.scope(|m| rb.get(m).as_ptr().addr());
     assert_ne!(pa, pb, "the two mappings have different addresses");
     assert_eq!(sum(&b, &rb), triangle(LEN));
     // 4 threads on each side change their own chains while another thread collects from either side in turn: the handshake word is in the superblock, so they exclude each other across mappings
-    let anchor = a.mutate(|m| m.root::<AnchorB>(m.alloc(Anchor { heads: Default::default() })));
-    let anchor_b: CrossHeapRoot<AnchorB> = b.mutate(|m| m.find(anchor.index())).expect("found by entry number");
+    let anchor = a.scope(|m| m.global::<AnchorB>(m.alloc(Anchor { heads: Default::default() })));
+    let anchor_b: CrossHeapGlobal<AnchorB> = b.scope(|m| m.find(anchor.index())).expect("found by entry number");
     let done = AtomicUsize::new(0);
     std::thread::scope(|s| {
         for t in 0..8 {
@@ -286,11 +286,11 @@ fn two_mappings_of_one_heap() {
 /// A private heap object holding a handle to a public heap
 #[derive(Trace)]
 struct Card {
-    public: CrossHeapRoot<NodeB>,
+    public: CrossHeapGlobal<NodeB>,
     _drops: Counted,
 }
 
-brand!(CardB = for<'gc> Card);
+brand!(CardB = for<'scope> Card);
 
 struct Counted(Arc<AtomicUsize>);
 
@@ -313,13 +313,13 @@ fn private_heap_holds_public_handles() {
     let public = space.create_anonymous(THREADS).unwrap();
     let mut private = Heap::new(THREADS);
     let drops = Arc::new(AtomicUsize::new(0));
-    let card: Root<CardB> = {
+    let card: Global<CardB> = {
         let handle = list(&public, LEN);
-        private.mutate(|m| m.root(m.alloc(Card { public: handle, _drops: Counted(drops.clone()) })))
+        private.scope(|m| m.global(m.alloc(Card { public: handle, _drops: Counted(drops.clone()) })))
     };
     public.collect();
     assert_eq!(public.stats().live, NODE * usize::try_from(LEN).unwrap(), "handles in the private heap are roots of the public heap");
-    let total = private.mutate(|m| public.mutate(|pm| {
+    let total = private.scope(|m| public.scope(|pm| {
         let (mut s, mut cur) = (0, Some(m.get(&card).public.get(pm)));
         while let Some(n) = cur {
             s += n.value;
@@ -342,7 +342,7 @@ fn eight_threads_churn_public_heap() {
     const PUSH: u64 = if cfg!(miri) { 20 } else { 500 };
     let space = CrossHeapSpace::reserve().unwrap();
     let heap = space.create_anonymous(THREADS).unwrap();
-    let anchor = heap.mutate(|m| m.root::<AnchorB>(m.alloc(Anchor { heads: Default::default() })));
+    let anchor = heap.scope(|m| m.global::<AnchorB>(m.alloc(Anchor { heads: Default::default() })));
     let lens: Vec<AtomicU64> = (0..8).map(|_| AtomicU64::new(0)).collect();
     for round in 0..ROUNDS {
         std::thread::scope(|s| {
@@ -354,7 +354,7 @@ fn eight_threads_churn_public_heap() {
                     check(heap, anchor, t, now);
                 });
             }
-            // Collecting while threads mutate: wait for them to leave, collect, then let them in again
+            // Collecting while threads scope: wait for them to leave, collect, then let them in again
             s.spawn(|| heap.collect());
         });
         heap.collect();
@@ -381,30 +381,30 @@ fn collect_fresh_file_heap_without_roots() {
 /// An object pointing into another public heap
 #[repr(C)]
 #[derive(Shared)]
-struct Link<'p> {
+struct Link<'scope> {
     heap: u64,
-    next: CrossHeapRef<'p, LinkB>,
+    next: CrossHeapRef<'scope, LinkB>,
 }
 
-cross_heap_brand!(LinkB = for<'p> Link<'p>);
+cross_heap_brand!(LinkB = for<'scope> Link<'scope>);
 
 const LINK: usize = (HEADER + size_of::<Link<'static>>()).next_multiple_of(8);
 
 /// Make a Link in each heap of `heaps`, the i-th pointing at the (i+1)-th (with `ring`, the last back to the first). Returns each heap's Link handle.
-fn links(heaps: &[CrossHeap], ring: bool) -> Vec<CrossHeapRoot<LinkB>> {
-    let handles: Vec<CrossHeapRoot<LinkB>> = heaps.iter().enumerate().map(|(i, h)| h.mutate(|m| m.root(m.alloc(Link { heap: i as u64, next: CrossHeapRef::default() })))).collect();
+fn links(heaps: &[CrossHeap], ring: bool) -> Vec<CrossHeapGlobal<LinkB>> {
+    let handles: Vec<CrossHeapGlobal<LinkB>> = heaps.iter().enumerate().map(|(i, h)| h.scope(|m| m.global(m.alloc(Link { heap: i as u64, next: CrossHeapRef::default() })))).collect();
     let n = if ring { heaps.len() } else { heaps.len() - 1 };
     for i in 0..n {
         let j = (i + 1) % heaps.len();
-        heaps[i].mutate(|ma| heaps[j].mutate(|mb| handles[i].get(ma).next.set(ma, mb, Some(handles[j].get(mb)))));
+        heaps[i].scope(|ma| heaps[j].scope(|mb| handles[i].get(ma).next.set(ma, mb, Some(handles[j].get(mb)))));
     }
     handles
 }
 
-/// The next of Link i is Link i+1 (read inside the mutates of both heaps at once).
-fn linked(heaps: &[CrossHeap], handles: &[CrossHeapRoot<LinkB>], i: usize) -> bool {
+/// The next of Link i is Link i+1 (read inside the scopes of both heaps at once).
+fn linked(heaps: &[CrossHeap], handles: &[CrossHeapGlobal<LinkB>], i: usize) -> bool {
     let j = (i + 1) % heaps.len();
-    heaps[i].mutate(|mi| heaps[j].mutate(|mj| handles[i].get(mi).next.get(mj).is_some_and(|n| CrossHeapGc::ptr_eq(n, handles[j].get(mj)) && n.heap == j as u64)))
+    heaps[i].scope(|mi| heaps[j].scope(|mj| handles[i].get(mi).next.get(mj).is_some_and(|n| CrossHeapGc::ptr_eq(n, handles[j].get(mj)) && n.heap == j as u64)))
 }
 
 impl Link<'_> {
@@ -442,7 +442,7 @@ fn cross_heap_ref_keeps_target_until_group_collection() {
     drop(handles.pop());
     collect_each(&heaps);
     assert_eq!(live(&heaps), [LINK, LINK], "when B collects on its own, the registration held by A is a root");
-    let target = heaps[0].mutate(|ma| heaps[1].mutate(|mb| handles[0].get(ma).next.get(mb).map(|n| n.heap)));
+    let target = heaps[0].scope(|ma| heaps[1].scope(|mb| handles[0].get(ma).next.get(mb).map(|n| n.heap)));
     assert_eq!(target, Some(1));
     // A's object is no longer wanted either: A's own collection reclaims it, but A does not touch B's registration, so B's own collection still treats it as a root
     drop(handles);
@@ -453,11 +453,11 @@ fn cross_heap_ref_keeps_target_until_group_collection() {
     assert_eq!(live(&heaps), [0, 0]);
 }
 
-/// From the Link in the first heap, go once around the three heaps: 0 → 1 → 2 → back to the same object in 0 (reading inside three nested mutates).
-fn ring_intact(heaps: &[CrossHeap], first: &CrossHeapRoot<LinkB>) -> bool {
-    heaps[0].mutate(|m0| {
-        heaps[1].mutate(|m1| {
-            heaps[2].mutate(|m2| {
+/// From the Link in the first heap, go once around the three heaps: 0 → 1 → 2 → back to the same object in 0 (reading inside three nested scopes).
+fn ring_intact(heaps: &[CrossHeap], first: &CrossHeapGlobal<LinkB>) -> bool {
+    heaps[0].scope(|m0| {
+        heaps[1].scope(|m1| {
+            heaps[2].scope(|m2| {
                 let a = first.get(m0);
                 let Some(b) = a.next.get(m1) else { return false };
                 let Some(c) = b.next.get(m2) else { return false };
@@ -501,16 +501,16 @@ fn group_collection_returns_stale_registrations() {
     const SETS: u64 = if cfg!(miri) { 20 } else { 2_000 };
     let space = CrossHeapSpace::reserve().unwrap();
     let heaps = anonymous_heaps(&space, 2);
-    let holder = heaps[0].mutate(|m| m.root::<LinkB>(m.alloc(Link { heap: 0, next: CrossHeapRef::default() })));
+    let holder = heaps[0].scope(|m| m.global::<LinkB>(m.alloc(Link { heap: 0, next: CrossHeapRef::default() })));
     // Repoint it at new objects in B over and over: every write registers an entry in B, and old registrations are returned only by a group collection
     for i in 0..SETS {
-        heaps[0].mutate(|ma| heaps[1].mutate(|mb| holder.get(ma).next.set(ma, mb, Some(mb.alloc(Link { heap: i, next: CrossHeapRef::default() })))));
+        heaps[0].scope(|ma| heaps[1].scope(|mb| holder.get(ma).next.set(ma, mb, Some(mb.alloc(Link { heap: i, next: CrossHeapRef::default() })))));
     }
     collect_each(&heaps);
     assert_eq!(live(&heaps), [LINK, LINK * usize::try_from(SETS).unwrap()], "old registrations are still roots in single collections");
     collect_all(&heaps);
     assert_eq!(live(&heaps), [LINK, LINK], "after the group collection only the current target remains");
-    let last = heaps[0].mutate(|ma| heaps[1].mutate(|mb| holder.get(ma).next.get(mb).expect("points somewhere").heap));
+    let last = heaps[0].scope(|ma| heaps[1].scope(|mb| holder.get(ma).next.get(mb).expect("points somewhere").heap));
     assert_eq!(last, SETS - 1);
     // Rebuilt registrations still keep things alive: collect B on its own again
     heaps[1].collect();
@@ -529,8 +529,8 @@ fn nested_mutates_with_collectors_do_not_deadlock() {
             let (heaps, handles) = (&heaps, &handles);
             s.spawn(move || {
                 for _ in 0..ROUNDS {
-                    heaps[outer].mutate(|mo| {
-                        heaps[inner].mutate(|mi| {
+                    heaps[outer].scope(|mo| {
+                        heaps[inner].scope(|mi| {
                             let fresh = mi.alloc(Link { heap: inner as u64, next: CrossHeapRef::default() });
                             handles[outer].get(mo).next.set(mo, mi, Some(fresh));
                             handles[outer].get(mo).next.set(mo, mi, Some(handles[inner].get(mi)));
@@ -587,9 +587,9 @@ fn references_to_a_dead_heap_do_not_crash() {
     let x = space.create(dir.file("x"), THREADS).unwrap();
     let y = space.create(dir.file("y"), THREADS).unwrap();
     // y_link (in y, with a handle) → x_link (in x) → y_only (in y, pointed to only by x_link: the registration's holder is x)
-    let x_link = x.mutate(|m| m.root::<LinkB>(m.alloc(Link::alone(0))));
-    let y_link = y.mutate(|m| m.root::<LinkB>(m.alloc(Link::alone(1))));
-    x.mutate(|mx| y.mutate(|my| {
+    let x_link = x.scope(|m| m.global::<LinkB>(m.alloc(Link::alone(0))));
+    let y_link = y.scope(|m| m.global::<LinkB>(m.alloc(Link::alone(1))));
+    x.scope(|mx| y.scope(|my| {
         y_link.get(my).next.set(my, mx, Some(x_link.get(mx)));
         x_link.get(mx).next.set(mx, my, Some(my.alloc(Link::alone(2))));
     }));
@@ -597,7 +597,7 @@ fn references_to_a_dead_heap_do_not_crash() {
     // Another region in the same process also maps x
     let other = CrossHeapSpace::reserve().unwrap();
     let x2 = other.open(dir.file("x"), THREADS).unwrap();
-    let held: CrossHeapRoot<LinkB> = x2.mutate(|m| m.find(x_link.index())).expect("found by entry number");
+    let held: CrossHeapGlobal<LinkB> = x2.scope(|m| m.find(x_link.index())).expect("found by entry number");
     // x's owner (the creating handle and the handles it made) lets go: x dies with it and the file is deleted
     drop(x_link);
     drop(x);
@@ -605,14 +605,14 @@ fn references_to_a_dead_heap_do_not_crash() {
     assert!(!x2.is_alive());
     assert_eq!(x2.try_mutate(|_| ()), Err(HeapDead));
     // The side still mapping it can still use and drop its handles (memory returns only when the last mapping lets go)
-    assert_eq!(x2.mutate(|m| held.get(m).heap), 0);
+    assert_eq!(x2.scope(|m| held.get(m).heap), 0);
     drop(held);
     drop(x2);
     // x's number is taken by the new heap z: the identity of y_link's reference into x does not match, so it reads None
     let z = space.create(dir.file("z"), THREADS).unwrap();
     assert_eq!(z.id(), x_number, "the dead heap's number is reclaimed and reused");
-    let z_obj: CrossHeapRoot<LinkB> = z.mutate(|m| m.root(m.alloc(Link::alone(7))));
-    let (points, read) = y.mutate(|my| z.mutate(|mz| (y_link.get(my).next.points_into(&z), y_link.get(my).next.get(mz).is_some())));
+    let z_obj: CrossHeapGlobal<LinkB> = z.scope(|m| m.global(m.alloc(Link::alone(7))));
+    let (points, read) = y.scope(|my| z.scope(|mz| (y_link.get(my).next.points_into(&z), y_link.get(my).next.get(mz).is_some())));
     assert!(!points && !read, "a reference into a dead heap must not read as an object of the new heap");
     // The group collection does not follow this old reference (otherwise it would mark whatever sits at the same offset in z as an object)
     CrossHeap::collect_group(&[&y, &z]);
@@ -630,15 +630,15 @@ struct Watcher {
     target: CrossHeapWeak<NodeB>,
 }
 
-cross_heap_brand!(WatcherB = for<'p> Watcher);
+cross_heap_brand!(WatcherB = for<'scope> Watcher);
 
 #[test]
 fn weak_reference_across_heaps_does_not_keep_target() {
     let space = CrossHeapSpace::reserve().unwrap();
     let (a, b) = (space.create_anonymous(THREADS).unwrap(), space.create_anonymous(THREADS).unwrap());
-    let target = b.mutate(|m| m.root::<NodeB>(m.alloc(Node { value: 7, next: None.into() })));
-    let watcher = a.mutate_with(&b, |ma, mb| ma.root::<WatcherB>(ma.alloc(Watcher { target: target.get(mb).into() })));
-    let read = || a.mutate_with(&b, |ma, mb| watcher.get(ma).target.get(mb).map(|n| n.value));
+    let target = b.scope(|m| m.global::<NodeB>(m.alloc(Node { value: 7, next: None.into() })));
+    let watcher = a.scope_with(&b, |ma, mb| ma.global::<WatcherB>(ma.alloc(Watcher { target: target.get(mb).into() })));
+    let read = || a.scope_with(&b, |ma, mb| watcher.get(ma).target.get(mb).map(|n| n.value));
     assert_eq!(read(), Some(7));
     b.collect();
     assert_eq!(read(), Some(7), "the target still has a root");
@@ -649,7 +649,7 @@ fn weak_reference_across_heaps_does_not_keep_target() {
     // Even with a new object in its place it is recognized as not the original
     let fresh = list(&b, 1000);
     assert_eq!(read(), None);
-    assert_eq!(a.mutate(|m| watcher.get(m).target.heap()), Some(b.id()));
+    assert_eq!(a.scope(|m| watcher.get(m).target.heap()), Some(b.id()));
     drop(fresh);
 }
 
@@ -665,12 +665,12 @@ fn signature_round_trip_and_forgeries() {
     let space = CrossHeapSpace::reserve().unwrap();
     let heap = space.create_anonymous(THREADS).unwrap();
     let root = list(&heap, LEN);
-    let sig = heap.mutate(|m| m.sign(root.get(m)));
+    let sig = heap.scope(|m| m.sign(root.get(m)));
     let bytes: [u8; SIGNATURE_BYTES] = sig.into();
     let back = Signature::from(&bytes);
     assert_eq!(back, sig);
     assert_eq!(back.heap(), Some(heap.id()));
-    heap.mutate(|m| {
+    heap.scope(|m| {
         assert!(m.verify(&back));
         assert_eq!(m.resolve::<NodeB>(&back).map(|n| n.value), Some(LEN - 1));
         assert!(m.resolve::<HolderB>(&back).is_none(), "wrong type");
@@ -680,14 +680,14 @@ fn signature_round_trip_and_forgeries() {
         f(&mut b);
         Signature::from(&b)
     };
-    heap.mutate(|m| {
+    heap.scope(|m| {
         assert!(!m.verify(&forged(&|b| b[0] ^= 1)), "wrong birth stamp");
         assert!(!m.verify(&forged(&|b| b[8] ^= 1)), "wrong heap identity");
         assert!(!m.verify(&forged(&|b| b[16] ^= 1)), "wrong type key");
     });
-    // Move the offset in the word to every granule nearby: only data starts of live objects pass (objects allocated in the same mutate share the stamp); the rest neither crash nor pass
+    // Move the offset in the word to every granule nearby: only data starts of live objects pass (objects allocated in the same scope share the stamp); the rest neither crash nor pass
     let word = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-    let hits = heap.mutate(|m| {
+    let hits = heap.scope(|m| {
         let mut hits = 0;
         for delta in -4096_i64..4096 {
             let w = word.wrapping_add_signed(delta << OFFSET_SHIFT);
@@ -699,7 +699,7 @@ fn signature_round_trip_and_forgeries() {
     assert!((1..=NEARBY / NODE + 1).contains(&hits), "the original signature passes and only object starts pass: {hits}");
     drop(root);
     heap.collect();
-    heap.mutate(|m| assert!(!m.verify(&sig), "the signature fails once the object is dead"));
+    heap.scope(|m| assert!(!m.verify(&sig), "the signature fails once the object is dead"));
 }
 
 #[test]
@@ -707,7 +707,7 @@ fn mailbox_delivers_in_order() {
     let space = CrossHeapSpace::reserve().unwrap();
     let heap = space.create_anonymous(THREADS).unwrap();
     let seen = heap.mail();
-    heap.mutate(|m| {
+    heap.scope(|m| {
         for value in 0..3 {
             m.post(m.alloc(Node { value, next: None.into() }));
         }
@@ -715,7 +715,7 @@ fn mailbox_delivers_in_order() {
     assert_eq!(heap.mail(), seen + 3);
     heap.wait_mail(seen, std::time::Duration::ZERO);
     heap.collect();
-    let got = heap.mutate(|m| {
+    let got = heap.scope(|m| {
         let mail = m.take_mail();
         let values: Vec<u64> = mail.iter().map(|&i| m.find::<NodeB>(i).expect("the letter is there").get(m).value).collect();
         for i in mail {
@@ -746,8 +746,8 @@ fn shrink_returns_empty_blocks_and_open_by_fd() {
     let shrunk = std::fs::metadata(&path).unwrap().blocks();
     assert!(collected <= full);
     assert!(shrunk * 4 < full, "shrinking returned the empty blocks ({full} ⇒ {collected} ⇒ {shrunk} units of 512 bytes)");
-    let sig = a.mutate(|m| m.sign(kept.get(m)));
-    assert_eq!(b.mutate(|m| m.resolve::<NodeB>(&sig).map(|n| n.value)), Some(99), "a mapping opened from the fd recognizes the signature");
+    let sig = a.scope(|m| m.sign(kept.get(m)));
+    assert_eq!(b.scope(|m| m.resolve::<NodeB>(&sig).map(|n| n.value)), Some(99), "a mapping opened from the fd recognizes the signature");
     assert_eq!(sum(&a, &kept), triangle(100));
     let again = list(&a, 400_000);
     assert_eq!(sum(&a, &again), triangle(400_000), "returned blocks are used again");
@@ -758,24 +758,24 @@ fn shrink_returns_empty_blocks_and_open_by_fd() {
 /// A node allocated in a private heap that can be promoted into the cross-heap
 #[repr(C)]
 #[derive(Trace, Shared)]
-struct SNode<'gc> {
+struct SNode<'scope> {
     value: u64,
-    next: paragc::Slot<'gc, SNode<'gc>>,
+    next: paragc::GcSlot<'scope, SNode<'scope>>,
 }
 
-brand!(SNodeB = for<'gc> SNode<'gc>);
-cross_heap_brand!(SNodeX = for<'p> SNode<'p>);
+brand!(SNodeB = for<'scope> SNode<'scope>);
+cross_heap_brand!(SNodeX = for<'scope> SNode<'scope>);
 
 /// A plain object in a private heap, pointing at a shareable node
 #[derive(Trace)]
-struct Keeper<'gc> {
-    node: paragc::Slot<'gc, SNode<'gc>>,
+struct Keeper<'scope> {
+    node: paragc::GcSlot<'scope, SNode<'scope>>,
 }
 
-brand!(KeeperB = for<'gc> Keeper<'gc>);
+brand!(KeeperB = for<'scope> Keeper<'scope>);
 
-fn snode_sum(heap: &Heap, root: &Root<SNodeB>) -> (u64, bool) {
-    heap.mutate(|m| {
+fn snode_sum(heap: &Heap, root: &Global<SNodeB>) -> (u64, bool) {
+    heap.scope(|m| {
         let (mut sum, mut all_crossed, mut cur) = (0, true, Some(m.get(root)));
         while let Some(n) = cur {
             sum += n.value;
@@ -809,30 +809,30 @@ fn young_survivors_promote_into_attached_cross_heap() {
     let cross = space.create_anonymous(THREADS).unwrap();
     let mut heap = Heap::new(THREADS);
     heap.attach_cross_heap(&cross).unwrap();
-    let (root, keeper, weak) = heap.mutate(|m| {
+    let (root, keeper, weak) = heap.scope(|m| {
         let mut top: Option<paragc::Gc<'_, SNode<'_>>> = None;
         for value in 0..LEN {
             top = Some(m.alloc_shared(SNode { value, next: top.into() }));
         }
         let top = top.unwrap();
         let keeper = m.alloc(Keeper { node: top.next.get().into() });
-        (m.root::<SNodeB>(top), m.root::<KeeperB>(keeper), m.weak::<SNodeB>(top))
+        (m.global::<SNodeB>(top), m.global::<KeeperB>(keeper), m.weak::<SNodeB>(top))
     });
     assert_eq!(snode_sum(&heap, &root), (triangle(LEN), false));
     heap.collect_young();
     assert_eq!(snode_sum(&heap, &root), (triangle(LEN), true), "the whole chain was promoted into the cross-heap with values intact");
     let node_bytes = (HEADER + size_of::<SNode<'static>>()).next_multiple_of(8);
-    let sig = heap.mutate(|m| {
+    let sig = heap.scope(|m| {
         let keeper = m.get(&keeper);
         assert!(!in_fixed(keeper.as_ptr().addr()), "a non-shareable object stays in the private heap");
         assert_eq!(keeper.node.get().map(|n| n.value), Some(LEN - 2), "the slot in the private object was rewritten to the new address");
         assert!(m.upgrade(&weak).is_some_and(|n| in_fixed(n.as_ptr().addr())), "the weak reference followed the move");
-        let sig = cross.mutate(|cm| cm.sign(cm.adopt::<SNodeX, _>(m.get(&root)).expect("in the cross-heap")));
-        assert_eq!(cross.mutate(|cm| cm.sign_promoted(m.get(&root))), Some(sig), "signing without a brand gives the same signature");
-        assert_eq!(cross.mutate(|cm| cm.sign_promoted(keeper)), None, "a private object has no signature");
+        let sig = cross.scope(|cm| cm.sign(cm.adopt::<SNodeX, _>(m.get(&root)).expect("in the cross-heap")));
+        assert_eq!(cross.scope(|cm| cm.sign_promoted(m.get(&root))), Some(sig), "signing without a brand gives the same signature");
+        assert_eq!(cross.scope(|cm| cm.sign_promoted(keeper)), None, "a private object has no signature");
         sig
     });
-    assert_eq!(cross.mutate(|cm| cm.resolve::<SNodeX>(&sig).map(|n| n.value)), Some(LEN - 1), "the signature finds the promoted object");
+    assert_eq!(cross.scope(|cm| cm.resolve::<SNodeX>(&sig).map(|n| n.value)), Some(LEN - 1), "the signature finds the promoted object");
     // Only the owner collects the cross-heap: collecting it on its own does nothing
     cross.collect();
     assert_eq!(cross.stats().collections, 0);
@@ -844,8 +844,8 @@ fn young_survivors_promote_into_attached_cross_heap() {
     drop(root);
     heap.collect();
     assert_eq!(cross.stats().live, node_bytes * usize::try_from(LEN - 1).unwrap());
-    assert!(heap.mutate(|m| m.upgrade(&weak).is_none()), "the cross-heap object died, so the private weak reference is cleared");
-    assert!(cross.mutate(|cm| cm.resolve::<SNodeX>(&sig).is_none()));
+    assert!(heap.scope(|m| m.upgrade(&weak).is_none()), "the cross-heap object died, so the private weak reference is cleared");
+    assert!(cross.scope(|cm| cm.resolve::<SNodeX>(&sig).is_none()));
     drop(keeper);
     heap.collect();
     assert_eq!(cross.stats().live, 0);
@@ -856,27 +856,27 @@ fn private_writes_into_cross_heap_objects_wait_for_the_next_young_collection() {
     let cross = space.create_anonymous(THREADS).unwrap();
     let mut heap = Heap::new(THREADS);
     heap.attach_cross_heap(&cross).unwrap();
-    let root = heap.mutate(|m| m.root::<SNodeB>(m.alloc_shared(SNode { value: 1, next: None.into() })));
+    let root = heap.scope(|m| m.global::<SNodeB>(m.alloc_shared(SNode { value: 1, next: None.into() })));
     heap.collect_young();
     assert!(!heap.promotion_pending());
-    heap.mutate(|m| {
+    heap.scope(|m| {
         let fresh = m.alloc_shared(SNode { value: 2, next: None.into() });
         m.get(&root).next.set(m, Some(fresh));
     });
     assert!(heap.promotion_pending(), "a private object was written into a cross-heap object");
-    heap.mutate(|m| {
+    heap.scope(|m| {
         let next = m.get(&root).next.get().expect("just written");
         assert_eq!(next.value, 2, "the owner reads the private object as usual");
         assert!(!in_fixed(next.as_ptr().addr()), "still private until the next young collection");
-        assert!(cross.mutate(|cm| cm.adopt::<SNodeX, _>(next).is_none()), "other processes cannot see it yet");
+        assert!(cross.scope(|cm| cm.adopt::<SNodeX, _>(next).is_none()), "other processes cannot see it yet");
     });
     heap.collect_young();
     assert!(!heap.promotion_pending());
-    heap.mutate(|m| {
+    heap.scope(|m| {
         let next = m.get(&root).next.get().expect("still there");
         assert_eq!(next.value, 2);
         assert!(in_fixed(next.as_ptr().addr()), "the young collection promoted it and rewrote the cross-heap slot");
-        assert!(cross.mutate(|cm| cm.adopt::<SNodeX, _>(next).is_some()));
+        assert!(cross.scope(|cm| cm.adopt::<SNodeX, _>(next).is_some()));
     });
     let node_bytes = (HEADER + size_of::<SNode<'static>>()).next_multiple_of(8);
     heap.collect();
@@ -893,7 +893,7 @@ struct Bytes {
     len: u64,
 }
 
-brand!(BytesB = for<'gc> Bytes);
+brand!(BytesB = for<'scope> Bytes);
 
 impl Bytes {
     fn tail(&self) -> &[u8] {
@@ -922,17 +922,17 @@ fn tails_travel_with_their_objects() {
     let cross = space.create_anonymous(THREADS).unwrap();
     let mut heap = Heap::new(THREADS);
     heap.attach_cross_heap(&cross).unwrap();
-    let roots = heap.mutate(|m| {
+    let roots = heap.scope(|m| {
         let len = |n: usize| u64::try_from(n).unwrap();
         [
-            m.root::<BytesB>(m.alloc_shared_tail(Bytes { len: len(SMALL) }, SMALL, Bytes::fill(SMALL))),
-            m.root::<BytesB>(m.alloc_shared_tail(Bytes { len: len(BIG) }, BIG, Bytes::fill(BIG))),
-            m.root::<BytesB>(m.alloc_tail(Bytes { len: len(SMALL) }, SMALL, Bytes::fill(SMALL))),
+            m.global::<BytesB>(m.alloc_shared_tail(Bytes { len: len(SMALL) }, SMALL, Bytes::fill(SMALL))),
+            m.global::<BytesB>(m.alloc_shared_tail(Bytes { len: len(BIG) }, BIG, Bytes::fill(BIG))),
+            m.global::<BytesB>(m.alloc_tail(Bytes { len: len(SMALL) }, SMALL, Bytes::fill(SMALL))),
         ]
     });
     heap.collect_young();
     heap.collect();
-    heap.mutate(|m| {
+    heap.scope(|m| {
         let [small, big, private] = roots.each_ref().map(|r| m.get(r));
         assert!(in_fixed(small.as_ptr().addr()) && in_fixed(big.as_ptr().addr()), "shareable tails were promoted");
         assert!(!in_fixed(private.as_ptr().addr()));

@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use paragc::{Handle, HandleSlot, Heap, Root, Trace, Tracer, YoungEvacuation, brand};
+use paragc::{Handle, HandleSlot, Heap, Global, Trace, Tracer, YoungEvacuation, brand};
 
 /// Collector threads per heap; 2 under Miri
 const THREADS: NonZeroUsize = NonZeroUsize::new(if cfg!(miri) { 2 } else { 4 }).unwrap();
@@ -31,26 +31,26 @@ struct Item {
 }
 
 #[derive(Trace)]
-struct Keep<'gc> {
-    items: Vec<Handle<'gc, Item>>,
+struct Keep<'scope> {
+    items: Vec<Handle<'scope, Item>>,
 }
 
-brand!(KeepB = for<'gc> Keep<'gc>);
+brand!(KeepB = for<'scope> Keep<'scope>);
 
 #[derive(Trace)]
-struct Holder<'gc> {
-    item: HandleSlot<'gc, Item>,
+struct Holder<'scope> {
+    item: HandleSlot<'scope, Item>,
 }
 
-brand!(HolderB = for<'gc> Holder<'gc>);
+brand!(HolderB = for<'scope> Holder<'scope>);
 
 fn count(n: u64) -> usize {
     usize::try_from(n).expect("small")
 }
 
 /// Ids and values of the kept handles, and the addresses of their objects
-fn kept(heap: &Heap, keep: &Root<KeepB>) -> (Vec<usize>, Vec<u64>, Vec<usize>) {
-    heap.mutate(|m| {
+fn kept(heap: &Heap, keep: &Global<KeepB>) -> (Vec<usize>, Vec<u64>, Vec<usize>) {
+    heap.scope(|m| {
         let items = &m.get(keep).items;
         (items.iter().map(|h| h.id()).collect(), items.iter().map(|h| h.value).collect(), items.iter().map(|h| h.get().as_ptr().addr()).collect())
     })
@@ -65,9 +65,9 @@ fn handles_stay_while_objects_move() {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut heap = Heap::new(THREADS);
         heap.set_young_evacuation(mode);
-        let keep = heap.mutate(|m| {
+        let keep = heap.scope(|m| {
             let items = (0..N).map(|value| m.alloc_handle(Item { value, tag: Counted(drops.clone()) })).filter(|h| h.value.is_multiple_of(KEEP_EVERY)).collect();
-            m.root(m.alloc(Keep { items }))
+            m.global(m.alloc(Keep { items }))
         });
         let (ids, values, born) = kept(&heap, &keep);
         heap.collect_young();
@@ -94,13 +94,13 @@ fn old_objects_hold_young_handles_without_barrier() {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut heap = Heap::new(THREADS);
         heap.set_young_evacuation(mode);
-        let holder: Root<HolderB> = heap.mutate(|m| m.root(m.alloc(Holder { item: HandleSlot::default() })));
+        let holder: Global<HolderB> = heap.scope(|m| m.global(m.alloc(Holder { item: HandleSlot::default() })));
         heap.collect();
-        heap.mutate(|m| m.get(&holder).item.set(Some(m.alloc_handle(Item { value: 7, tag: Counted(drops.clone()) }))));
+        heap.scope(|m| m.get(&holder).item.set(Some(m.alloc_handle(Item { value: 7, tag: Counted(drops.clone()) }))));
         heap.collect_young();
         heap.collect_young();
-        assert_eq!(heap.mutate(|m| m.get(&holder).item.get().map(|h| h.value)), Some(7), "{mode:?}");
-        heap.mutate(|m| m.get(&holder).item.set(None));
+        assert_eq!(heap.scope(|m| m.get(&holder).item.get().map(|h| h.value)), Some(7), "{mode:?}");
+        heap.scope(|m| m.get(&holder).item.set(None));
         heap.collect();
         assert_eq!(drops.load(Ordering::Relaxed), 1, "{mode:?}");
     }
@@ -112,11 +112,11 @@ fn dead_entries_are_reused() {
     const N: u64 = 1_000;
     let drops = Arc::new(AtomicUsize::new(0));
     let mut heap = Heap::new(THREADS);
-    let ids = |heap: &Heap| -> (Root<KeepB>, HashSet<usize>) {
-        heap.mutate(|m| {
+    let ids = |heap: &Heap| -> (Global<KeepB>, HashSet<usize>) {
+        heap.scope(|m| {
             let items: Vec<_> = (0..N).map(|value| m.alloc_handle(Item { value, tag: Counted(drops.clone()) })).collect();
             let ids = items.iter().map(|h| h.id()).collect();
-            (m.root(m.alloc(Keep { items })), ids)
+            (m.global(m.alloc(Keep { items })), ids)
         })
     };
     let (keep, first) = ids(&heap);
@@ -132,13 +132,13 @@ fn dead_entries_are_reused() {
 fn concurrent_marking_keeps_moved_handles() {
     let drops = Arc::new(AtomicUsize::new(0));
     let mut heap = Heap::new(THREADS);
-    let (a, b): (Root<HolderB>, Root<HolderB>) = heap.mutate(|m| {
+    let (a, b): (Global<HolderB>, Global<HolderB>) = heap.scope(|m| {
         let item = m.alloc_handle(Item { value: 5, tag: Counted(drops.clone()) });
-        (m.root(m.alloc(Holder { item: item.into() })), m.root(m.alloc(Holder { item: HandleSlot::default() })))
+        (m.global(m.alloc(Holder { item: item.into() })), m.global(m.alloc(Holder { item: HandleSlot::default() })))
     });
     heap.collect();
     assert!(heap.mark_concurrently());
-    heap.mutate(|m| {
+    heap.scope(|m| {
         let (a, b) = (m.get(&a), m.get(&b));
         b.item.set(a.item.get());
         a.item.set(None);
@@ -146,8 +146,8 @@ fn concurrent_marking_keeps_moved_handles() {
     heap.finish_marking();
     heap.sweep_concurrently();
     assert_eq!(drops.load(Ordering::Relaxed), 0);
-    assert_eq!(heap.mutate(|m| m.get(&b).item.get().map(|h| h.value)), Some(5));
-    heap.mutate(|m| m.get(&b).item.set(None));
+    assert_eq!(heap.scope(|m| m.get(&b).item.get().map(|h| h.value)), Some(5));
+    heap.scope(|m| m.get(&b).item.set(None));
     heap.collect();
     assert_eq!(drops.load(Ordering::Relaxed), 1);
 }
@@ -157,13 +157,13 @@ fn concurrent_marking_keeps_moved_handles() {
 fn ids_turn_back_into_handles() {
     let drops = Arc::new(AtomicUsize::new(0));
     let mut heap = Heap::new(THREADS);
-    let (keep, id): (Root<KeepB>, usize) = heap.mutate(|m| {
+    let (keep, id): (Global<KeepB>, usize) = heap.scope(|m| {
         let h = m.alloc_handle(Item { value: 9, tag: Counted(drops.clone()) });
-        (m.root(m.alloc(Keep { items: vec![h] })), h.id())
+        (m.global(m.alloc(Keep { items: vec![h] })), h.id())
     });
     heap.collect();
     heap.collect();
-    heap.mutate(|m| {
+    heap.scope(|m| {
         // SAFETY: the id came from a handle that the rooted Keep still holds
         let h: Handle<'_, Item> = unsafe { Handle::from_id(id) };
         assert!(h == m.get(&keep).items[0]);

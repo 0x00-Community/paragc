@@ -10,12 +10,12 @@ mod shm;
 mod sweep;
 mod sync;
 
-pub use handle::{Brand, Far, Gc, Handle, HandleSlot, Root, Slot, Weak, WordSlot, word_pointer, RAW_TAG, WORD_PAYLOAD, WORD_POINTER_MIN};
+pub use handle::{Brand, Far, Gc, Handle, HandleSlot, Global, GcSlot, Weak, WordSlot, word_pointer, RAW_TAG, WORD_PAYLOAD, WORD_POINTER_MIN};
 #[cfg(crossheap)]
-pub use handle::{EdgeMap, CrossHeapRoot, CrossHeapBrand, CrossHeapGc, CrossHeapRef, CrossHeapSlot, CrossHeapWeak, SIGNATURE_BYTES, Shared, Signature};
-pub use heap::{Heap, Mutator, Stats, Tlab, YoungEvacuation};
+pub use handle::{EdgeMap, CrossHeapGlobal, CrossHeapBrand, CrossHeapGc, CrossHeapRef, CrossHeapSlot, CrossHeapWeak, SIGNATURE_BYTES, Shared, Signature};
+pub use heap::{Heap, Scope, Stats, Tlab, YoungEvacuation};
 #[cfg(crossheap)]
-pub use heap::{HeapDead, CrossHeap, CrossHeapMutator, CrossHeapStats};
+pub use heap::{HeapDead, CrossHeap, CrossHeapScope, CrossHeapStats};
 pub use mark::{Trace, Tracer};
 pub use paragc_macros::{Shared, Trace};
 #[cfg(crossheap)]
