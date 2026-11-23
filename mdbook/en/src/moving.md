@@ -67,11 +67,11 @@ The collector leaves a forwarding address in the old copy and rewrites every ref
 | a hash map keyed by address | the key is stale after a move | hash the content or a stable id; if it must be the address, rehash in `relocate` (below) |
 | comparing addresses from two different `mutate`s | the same object can have two addresses | compare inside one `mutate`, or compare a stable id |
 | handing an address to C, the OS or another thread that outlives `mutate` | nobody rewrites it | copy the bytes out; a pinned space is planned (principle 1: it will still be collected) |
-| addresses baked into generated code | the code is not an edge the collector knows | keep the target out of moving spaces (j8's shapes), or make the code a traced object |
+| addresses baked into generated code | the code is not an edge the collector knows | refer to the target through a handle and bake its id (j8's shapes), or make the code a traced object |
 
 ## In j8
 
 - **`===` on objects** compares the NaN-boxed words. Both operands are read in the same turn, inside one `mutate`, so they agree.
 - **`Map` and `Set`** index objects by address (`MapKey::Ref`). `Collection::relocate` recomputes the key of every object entry after a move and re-inserts it. That is the "rehash in relocate" pattern above.
-- **Shapes** are compared by address in inline caches and baked into JIT code, so they live outside the moving heap today. Principle 1 rules out making them immortal; the plan is a space that does not move but is still collected.
+- **Shapes** are compared in inline caches and baked into JIT code. They are GC objects referenced through [handles](handles.md): moving a shape rewrites only its handle entry, so the id that caches and machine code compare never changes.
 - **Strings** move freely: nothing outside the heap keeps their address, and their bytes travel in the tail.

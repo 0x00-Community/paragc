@@ -35,35 +35,37 @@ Still missing:
 | `Object` shell (prototype, call target, class bits) | GC heap | depends on the rows below |
 | `Props.inline` (first 4 property values) | inside the object, one NaN-boxed word each | ✓ |
 | `Props.store` (properties 5 and up) | GC heap | ✓ |
-| `Props.shape` | **a raw pointer to malloc'd memory**, invisible to the collector | ✗ |
-| `Props.anchor`, a prototype's `shape_root` | GC objects holding an `Arc<Shape>` | ✗ (they have a destructor) |
-| the `Shape` itself: property names, attributes, transitions, hash index | `Arc` outside the heap; names are `SmallStr` (short ones inline, long ones `Arc<str>`) | ✗ |
+| `Props.shape` | a `HandleSlot`: the shape's handle id, a strong edge | ✗ (handles belong to one private heap) |
+| a prototype's `shape_root` | a `HandleSlot` to the root shape of objects with that prototype | ✗ |
+| the `Shape` itself: property names, attributes, transitions, hash index | a GC object from `alloc_handle`; names are `SmallStr`; transitions are paragc `Weak`s | ✗ (it has a destructor) |
 | dictionary-mode properties | GC objects holding `Vec` and `HashMap` | ✗ |
 | strings | GC heap, text in the object's tail | ✓ |
-| functions | bytecode and `FunctionInfo` outside the heap | ✗ |
+| functions | bytecode, inline caches and literal shapes in a GC object per function (`Loaded`) | ✗ |
 | host objects | `Box<dyn Any>` | ✗; the owner acts for others through the mailbox |
 
 A shape is the object's layout: which property name sits in which slot, with which attributes. Objects with the same
 properties added in the same order share one shape.
 
-## Why shapes are outside the heap
+## How shapes live in the heap
 
-1. **Identity is the address, and paragc moves objects.** The executor's inline caches compare shape addresses, and
-   the JIT bakes them into machine code (`CheckShape`). paragc's young collections and evacuation change object
-   addresses. A malloc'd `Arc` never moves, so its address is a stable identity.
-2. **A shape is a shared cache that grows.** Adding a property appends a child to the shape tree, lock-free, through
-   `&self` (`Chain`, `Prefix`). A shape with many properties builds a hash index lazily (`OnceBox<HashMap>`). Both need
-   growable malloc'd memory, at moments where no allocation context (`mc`) is at hand. As GC objects they would need
-   `Box`es and destructors, and types with destructors cannot be shared.
-3. **The GC still decides when they die.** A prototype's `shape_root`, and the `anchor` of an object whose shape is not
-   in its prototype's tree, are GC objects that hold the `Arc`. When they die the count drops and the shapes go.
-4. **History (inferred).** When j8 moved its heap to paragc (11-17, eb308d0), shapes kept their earlier `Arc`-based
-   design. Sharing across processes was not a requirement then.
+1. **Identity is the handle id.** Inline caches compare shape identities, and the JIT bakes them into machine code
+   (`CheckShape`). A shape is allocated with [`alloc_handle`](handles.md), and the object's shape word holds its handle
+   id. When paragc moves the shape it rewrites only the handle entry, so the id, the caches and the machine code stay
+   valid. The JIT never dereferences the word; it only compares it.
+2. **Who keeps a shape alive.** Objects (through `Props.shape`), prototypes (`shape_root`), and the inline caches,
+   literal caches and JIT code of a function, all held in that function's `Loaded` object. Transitions from a shape to
+   its children are weak: a child nobody uses is collected, and adding the same property later makes a new one.
+3. **Growth.** Transitions sit in a `Vec` that drops cleared entries whenever a child is added; the hash index is built
+   lazily; property names are shared with the parent through an `Arc<Prefix>`. All of this is malloc'd memory that the
+   shape's destructor frees when the shape dies.
+4. **Compiled code is collected too.** Each function's `Loaded` is a handle object; closures, module records and
+   paused frames hold it as a traced `Code`, and the functions of one module hang from one `Unit`. The executor's table
+   from function ids to code holds only weak references.
 
 ## What that means for sharing
 
-When an object is promoted into a cross-heap, its values and strings arrive intact, but `Props.shape` still points into
-the sending process's malloc heap. Another process sees the values in each slot without knowing which property name each
-slot belongs to. The `Anchor` also carries a destructor, so it cannot be promoted at all. That is why stage 3 of the
-cross-process work, shapes, has to come before ordinary objects can be shared. The candidate designs are listed in
+Shapes are GC objects now, but still private: handles exist only in private heaps, and a `Shape` has a destructor.
+When an object is promoted into a cross-heap, its values and strings arrive intact while its shape word still names an
+entry of the sending process's handle table. The next stage gives promoted objects a shape that lives in the
+cross-heap, so that another process can tell which property each slot holds. See
 [Limits and open problems](limits.md).
