@@ -601,11 +601,11 @@ struct Pair {
     mine: CrossHeap,
     chain: CrossHeapGlobal<NodeB>,
     hub: CrossHeapGlobal<HubB>,
-    private: Heap,
-    beads: Global<BeadB>,
+    private: Heap<'static>,
+    beads: Global<'static, BeadB>,
     /// The other processes' public heaps (dead ones dropped)
     peers: Vec<Option<CrossHeap>>,
-    cards: Vec<Option<Global<CardB>>>,
+    cards: Vec<Option<Global<'static, CardB>>>,
 }
 
 impl Pair {
@@ -639,7 +639,7 @@ impl Pair {
             })
             .collect();
         let peers: Vec<Option<CrossHeap>> = infos.iter().enumerate().map(|(j, (p, _, _))| (j != me).then(|| space.open(p, THREADS).unwrap())).collect();
-        let mut private = Heap::new(THREADS);
+        let mut private = Heap::new_static(THREADS);
         let beads = private.scope(|m| {
             let mut top = None;
             for value in 0..PAIR_NODES {

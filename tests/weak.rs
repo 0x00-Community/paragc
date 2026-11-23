@@ -43,13 +43,13 @@ brand!(KeepB = for<'scope> Keep<'scope>);
 #[derive(Trace)]
 struct Holder<'scope> {
     item: GcSlot<'scope, Item>,
-    weak: Vec<Weak<ItemB>>,
+    weak: Vec<Weak<'static, ItemB>>,
 }
 
 brand!(HolderB = for<'scope> Holder<'scope>);
 
 /// Make `n` objects (values 0..n) and keep weak references to them; with `keep` they also hang from a root
-fn items(heap: &Heap, drops: &Arc<AtomicUsize>, n: u64, keep: impl Fn(u64) -> bool) -> (Global<KeepB>, Vec<Weak<ItemB>>) {
+fn items<'h>(heap: &Heap<'h>, drops: &Arc<AtomicUsize>, n: u64, keep: impl Fn(u64) -> bool) -> (Global<'h, KeepB>, Vec<Weak<'h, ItemB>>) {
     heap.scope(|m| {
         let mut kept = Vec::new();
         let mut weak = Vec::new();
@@ -65,7 +65,7 @@ fn items(heap: &Heap, drops: &Arc<AtomicUsize>, n: u64, keep: impl Fn(u64) -> bo
 }
 
 /// The current value of every weak reference (None once cleared)
-fn values(heap: &Heap, weak: &[Weak<ItemB>]) -> Vec<Option<u64>> {
+fn values<'h>(heap: &Heap<'h>, weak: &[Weak<'h, ItemB>]) -> Vec<Option<u64>> {
     heap.scope(|m| weak.iter().map(|w| m.upgrade(w).map(|x| x.value)).collect())
 }
 
@@ -77,7 +77,7 @@ fn count(n: u64) -> usize {
 fn weak_does_not_keep_alive() {
     const N: u64 = if cfg!(miri) { 200 } else { 20_000 };
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new(THREADS);
+    let mut heap = Heap::new_static(THREADS);
     let (keep, weak) = items(&heap, &drops, N, |v| v % 2 == 0);
     heap.collect();
     assert_eq!(drops.load(Ordering::Relaxed), count(N / 2));
@@ -96,12 +96,12 @@ fn weak_follows_evacuation() {
     const N: u64 = if cfg!(miri) { 4_000 } else { 64_000 };
     const KEEP_EVERY: u64 = 16;
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new(THREADS);
+    let mut heap = Heap::new_static(THREADS);
     let (keep, weak) = items(&heap, &drops, N, |v| v.is_multiple_of(KEEP_EVERY));
     heap.collect();
     let discarded = count(N - N / KEEP_EVERY);
     assert_eq!(drops.load(Ordering::Relaxed), discarded);
-    let addr = |heap: &Heap| -> Vec<usize> { heap.scope(|m| weak.iter().step_by(count(KEEP_EVERY)).map(|w| m.upgrade(w).expect("alive").as_ptr().addr()).collect()) };
+    let addr = |heap: &Heap<'static>| -> Vec<usize> { heap.scope(|m| weak.iter().step_by(count(KEEP_EVERY)).map(|w| m.upgrade(w).expect("alive").as_ptr().addr()).collect()) };
     let before = addr(&heap);
     heap.collect();
     assert!(heap.stats().evacuated_blocks > 0, "sparse blocks were not evacuated: {:?}", heap.stats());
@@ -125,7 +125,7 @@ fn young_collection_clears_young_targets() {
     const N: u64 = if cfg!(miri) { 300 } else { 30_000 };
     for mode in [YoungEvacuation::Off, YoungEvacuation::SkipRemembered, YoungEvacuation::Full] {
         let drops = Arc::new(AtomicUsize::new(0));
-        let mut heap = Heap::new(THREADS);
+        let mut heap = Heap::new_static(THREADS);
         heap.set_young_evacuation(mode);
         let (old_keep, old_weak) = items(&heap, &drops, N, |_| true);
         heap.collect();
@@ -148,8 +148,8 @@ fn young_collection_clears_young_targets() {
 fn weak_targets_wait_for_tracing() {
     let drops = Arc::new(AtomicUsize::new(0));
     let other = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new(THREADS);
-    let holders: [Global<HolderB>; 2] = heap.scope(|m| {
+    let mut heap = Heap::new_static(THREADS);
+    let holders: [Global<'_, HolderB>; 2] = heap.scope(|m| {
         [&drops, &other].map(|d| {
             let item = m.alloc(Item { value: 7, tag: Counted(d.clone()) });
             m.global(m.alloc(Holder { item: Some(item).into(), weak: Vec::new() }))
@@ -177,9 +177,9 @@ fn weak_targets_wait_for_tracing() {
 #[test]
 fn upgrade_during_concurrent_marking_keeps_target() {
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new(THREADS);
+    let mut heap = Heap::new_static(THREADS);
     let (keep, weak) = items(&heap, &drops, 2, |_| true);
-    let holder: Global<HolderB> = heap.scope(|m| m.global(m.alloc(Holder { item: GcSlot::default(), weak: Vec::new() })));
+    let holder: Global<'_, HolderB> = heap.scope(|m| m.global(m.alloc(Holder { item: GcSlot::default(), weak: Vec::new() })));
     heap.collect();
     drop(keep);
     assert!(heap.mark_concurrently());
@@ -204,11 +204,11 @@ fn weak_inside_heap_objects() {
     const N: u64 = if cfg!(miri) { 100 } else { 5_000 };
     const ROUNDS: usize = if cfg!(miri) { 2 } else { 10 };
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new(THREADS);
+    let mut heap = Heap::new_static(THREADS);
     let (keep, outside) = items(&heap, &drops, N, |v| v % 2 == 0);
     let total = || -> u64 { (0..N).filter(|v| v % 2 == 0).sum() };
     for _ in 0..ROUNDS {
-        let holder: Global<HolderB> = heap.scope(|m| {
+        let holder: Global<'_, HolderB> = heap.scope(|m| {
             let weak = m.get(&keep).items.iter().map(|&x| m.weak::<ItemB>(x)).collect();
             m.global(m.alloc(Holder { item: GcSlot::default(), weak }))
         });
@@ -234,9 +234,9 @@ fn group_collection_clears_weak() {
     }
     brand!(PinB = for<'a> Pin<'a>);
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut a = Heap::new(THREADS);
-    let mut b = Heap::new(THREADS);
-    let (weak, pin): (Weak<ItemB>, Global<PinB>) = a.scope(|ma| {
+    let mut a = Heap::new_static(THREADS);
+    let mut b = Heap::new_static(THREADS);
+    let (weak, pin): (Weak<'_, ItemB>, Global<'_, PinB>) = a.scope(|ma| {
         let x = ma.alloc(Item { value: 5, tag: Counted(drops.clone()) });
         let pin = b.scope(|mb| mb.global(mb.alloc(Pin { far: Far::new(mb, ma, x) })));
         (ma.weak(x), pin)
@@ -259,9 +259,9 @@ fn weak_churn_while_marking_concurrently() {
     const PER_ROUND: u64 = if cfg!(miri) { 50 } else { 3_000 };
     const ROUNDS: usize = if cfg!(miri) { 2 } else { 8 };
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new(THREADS);
-    let holders: Vec<Global<HolderB>> = heap.scope(|m| (0..THREADS_M).map(|_| m.global(m.alloc(Holder { item: GcSlot::default(), weak: Vec::new() }))).collect());
-    let mut weak: Vec<Vec<(u64, Weak<ItemB>)>> = (0..THREADS_M).map(|_| Vec::new()).collect();
+    let mut heap = Heap::new_static(THREADS);
+    let holders: Vec<Global<'_, HolderB>> = heap.scope(|m| (0..THREADS_M).map(|_| m.global(m.alloc(Holder { item: GcSlot::default(), weak: Vec::new() }))).collect());
+    let mut weak: Vec<Vec<(u64, Weak<'_, ItemB>)>> = (0..THREADS_M).map(|_| Vec::new()).collect();
     let mut made = 0usize;
     for round in 0..ROUNDS {
         std::thread::scope(|s| {
@@ -291,7 +291,7 @@ fn weak_churn_while_marking_concurrently() {
         });
         made += THREADS_M * count(PER_ROUND);
         // Concurrent marking finished: objects made during marking are black and survive this round; every weak reference not cleared upgrades to its value
-        let check = |heap: &Heap| -> usize {
+        let check = |heap: &Heap<'static>| -> usize {
             heap.scope(|m| weak.iter().flatten().filter(|(value, w)| m.upgrade(w).inspect(|x| assert_eq!(x.value, *value)).is_some()).count())
         };
         heap.collect();

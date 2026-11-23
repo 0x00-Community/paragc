@@ -13,7 +13,7 @@ mod sync;
 pub use handle::{Brand, Far, Gc, Handle, HandleSlot, Global, GcSlot, Weak, WordSlot, word_pointer, RAW_TAG, WORD_PAYLOAD, WORD_POINTER_MIN};
 #[cfg(crossheap)]
 pub use handle::{EdgeMap, CrossHeapGlobal, CrossHeapBrand, CrossHeapGc, CrossHeapRef, CrossHeapSlot, CrossHeapWeak, SIGNATURE_BYTES, Shared, Signature};
-pub use heap::{Heap, Scope, Stats, Tlab, YoungEvacuation};
+pub use heap::{GroupMember, Heap, Scope, Stats, Tlab, YoungEvacuation};
 #[cfg(crossheap)]
 pub use heap::{HeapDead, CrossHeap, CrossHeapScope, CrossHeapStats};
 pub use mark::{Trace, Tracer};

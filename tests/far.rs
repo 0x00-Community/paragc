@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use paragc::{Far, Gc, Heap, Global, GcSlot, Trace, Tracer, YoungEvacuation, brand};
+use paragc::{GroupMember, Far, Gc, Heap, Global, GcSlot, Trace, Tracer, YoungEvacuation, brand};
 
 /// Collector threads per heap (fewer under Miri)
 const THREADS: NonZeroUsize = NonZeroUsize::new(if cfg!(miri) { 2 } else { 4 }).unwrap();
@@ -56,22 +56,22 @@ struct Hop<'scope> {
 
 brand!(LinkB = for<'scope> Link<'scope>);
 
-fn heaps(n: usize) -> Vec<Heap> {
-    (0..n).map(|_| Heap::new(THREADS)).collect()
+fn heaps(n: usize) -> Vec<Heap<'static>> {
+    (0..n).map(|_| Heap::new_static(THREADS)).collect()
 }
 
 /// Make an Item and return its root.
-fn item(heap: &Heap, value: u64, drops: &Arc<AtomicUsize>) -> Global<ItemB> {
+fn item<'h>(heap: &Heap<'h>, value: u64, drops: &Arc<AtomicUsize>) -> Global<'h, ItemB> {
     heap.scope(|m| m.global(m.alloc(Item { value, _counted: Counted(drops.clone()) })))
 }
 
 /// Make a Holder in heap `holder`, pointing directly at the object of `root` in heap `target`.
-fn hold(holder: &Heap, target: &Heap, root: &Global<ItemB>, value: u64) -> Global<HolderB> {
+fn hold<'h, 't>(holder: &Heap<'h>, target: &Heap<'t>, root: &Global<'t, ItemB>, value: u64) -> Global<'h, HolderB> {
     holder.scope(|ma| target.scope(|mb| ma.global(ma.alloc(Holder { value, far: Far::new(ma, mb, mb.get(root)) }))))
 }
 
 /// Read the target Item's value through the Holder's Far.
-fn far_value(holder: &Heap, target: &Heap, root: &Global<HolderB>) -> u64 {
+fn far_value<'h>(holder: &Heap<'h>, target: &Heap<'h>, root: &Global<'h, HolderB>) -> u64 {
     holder.scope(|ma| target.scope(|mb| ma.get(root).far.get(mb).value))
 }
 
@@ -80,10 +80,10 @@ fn far_targets_are_pinned_during_evacuation() {
     // The first quarter of the Items is pointed to directly from A (cannot move); the rest have only roots (can move). Keep one in KEEP and let the rest die ⇒ every block is sparse and an evacuation candidate
     const ITEMS: u64 = if cfg!(miri) { 5_600 } else { 40_000 };
     const KEEP: u64 = 40;
-    let mut a = Heap::new(THREADS);
-    let mut b = Heap::new(THREADS);
+    let mut a = Heap::new_static(THREADS);
+    let mut b = Heap::new_static(THREADS);
     let drops = Arc::new(AtomicUsize::new(0));
-    let roots: Vec<(u64, Global<ItemB>)> = b.scope(|m| {
+    let roots: Vec<(u64, Global<'_, ItemB>)> = b.scope(|m| {
         let mut kept = Vec::new();
         for value in 0..ITEMS {
             let gc = m.alloc(Item { value, _counted: Counted(drops.clone()) });
@@ -93,7 +93,7 @@ fn far_targets_are_pinned_during_evacuation() {
         }
         kept
     });
-    let held: Vec<(u64, Global<HolderB>)> = roots.iter().filter(|(v, _)| *v < ITEMS / 4).map(|(v, r)| (*v, hold(&a, &b, r, *v))).collect();
+    let held: Vec<(u64, Global<'_, HolderB>)> = roots.iter().filter(|(v, _)| *v < ITEMS / 4).map(|(v, r)| (*v, hold(&a, &b, r, *v))).collect();
     // First pass: the sweep records each block's live bytes; second pass: evacuate the sparse blocks
     b.collect();
     b.collect();
@@ -119,8 +119,8 @@ fn far_targets_are_pinned_during_evacuation() {
 
 #[test]
 fn far_keeps_target_until_holder_dies() {
-    let mut a = Heap::new(THREADS);
-    let mut b = Heap::new(THREADS);
+    let mut a = Heap::new_static(THREADS);
+    let mut b = Heap::new_static(THREADS);
     let drops = Arc::new(AtomicUsize::new(0));
     let target = item(&b, 7, &drops);
     let holder = hold(&a, &b, &target, 1);
@@ -142,8 +142,8 @@ fn far_keeps_target_until_holder_dies() {
 #[test]
 fn far_survives_holder_heap_drop_order() {
     // The target heap is dropped first: the Holder returns its slot when it is finalized later; the root table lives on through its Arc
-    let a = Heap::new(THREADS);
-    let b = Heap::new(THREADS);
+    let a = Heap::new_static(THREADS);
+    let b = Heap::new_static(THREADS);
     let drops = Arc::new(AtomicUsize::new(0));
     let target = item(&b, 3, &drops);
     let holder = hold(&a, &b, &target, 1);
@@ -155,8 +155,8 @@ fn far_survives_holder_heap_drop_order() {
 }
 
 /// Make a cycle: one Link per heap in `heaps`, the i-th pointing through a Hop directly at the (i+1)-th, the last back to the first. Returns the root of the first Link.
-fn ring(heaps: &[Heap], drops: &Arc<AtomicUsize>) -> Global<LinkB> {
-    let links: Vec<Global<LinkB>> = heaps.iter().enumerate().map(|(i, h)| h.scope(|m| m.global(m.alloc(Link { heap: i, _counted: Counted(drops.clone()), out: GcSlot::default() })))).collect();
+fn ring(heaps: &[Heap<'static>], drops: &Arc<AtomicUsize>) -> Global<'static, LinkB> {
+    let links: Vec<Global<'_, LinkB>> = heaps.iter().enumerate().map(|(i, h)| h.scope(|m| m.global(m.alloc(Link { heap: i, _counted: Counted(drops.clone()), out: GcSlot::default() })))).collect();
     for i in 0..heaps.len() {
         let j = (i + 1) % heaps.len();
         heaps[i].scope(|ma| {
@@ -170,8 +170,8 @@ fn ring(heaps: &[Heap], drops: &Arc<AtomicUsize>) -> Global<LinkB> {
 }
 
 /// Walk once around the cycle from the first Link and return the heap ids passed.
-fn walk(heaps: &[Heap], first: &Global<LinkB>) -> Vec<usize> {
-    fn step<'a>(heaps: &[Heap], at: usize, link: Gc<'a, Link<'a>>, seen: &mut Vec<usize>) {
+fn walk(heaps: &[Heap<'static>], first: &Global<'static, LinkB>) -> Vec<usize> {
+    fn step<'a>(heaps: &[Heap<'static>], at: usize, link: Gc<'a, Link<'a>>, seen: &mut Vec<usize>) {
         seen.push(link.heap);
         let next = (at + 1) % heaps.len();
         if next == 0 {
@@ -199,7 +199,7 @@ fn cross_heap_cycle_needs_group_collection() {
         }
     }
     assert_eq!(drops.load(Ordering::Relaxed), 0);
-    let mut group: Vec<&mut Heap> = hs.iter_mut().collect();
+    let mut group: Vec<&mut dyn GroupMember> = hs.iter_mut().map(|h| h as &mut dyn GroupMember).collect();
     Heap::collect_group(&mut group);
     assert_eq!(drops.load(Ordering::Relaxed), 2);
     // Cleared entries and Fars finalized later never touch reclaimed objects
@@ -214,17 +214,17 @@ fn rings_over_eight_heaps() {
     const RINGS: usize = if cfg!(miri) { 2 } else { 64 };
     let mut hs = heaps(8);
     let drops = Arc::new(AtomicUsize::new(0));
-    let rings: Vec<Global<LinkB>> = (0..RINGS).map(|_| ring(&hs, &drops)).collect();
+    let rings: Vec<Global<'_, LinkB>> = (0..RINGS).map(|_| ring(&hs, &drops)).collect();
     // Keep half
-    let kept: Vec<Global<LinkB>> = rings.into_iter().step_by(2).collect();
+    let kept: Vec<Global<'_, LinkB>> = rings.into_iter().step_by(2).collect();
     let dead = (RINGS - kept.len()) * hs.len();
     // Put only the first 4 heaps in a group: the cycle spans 8 heaps and entries held from outside the group are roots ⇒ nothing is reclaimed
     {
-        let mut group: Vec<&mut Heap> = hs.iter_mut().take(4).collect();
+        let mut group: Vec<&mut dyn GroupMember> = hs.iter_mut().take(4).map(|h| h as &mut dyn GroupMember).collect();
         Heap::collect_group(&mut group);
     }
     assert_eq!(drops.load(Ordering::Relaxed), 0);
-    let mut group: Vec<&mut Heap> = hs.iter_mut().collect();
+    let mut group: Vec<&mut dyn GroupMember> = hs.iter_mut().map(|h| h as &mut dyn GroupMember).collect();
     Heap::collect_group(&mut group);
     assert_eq!(drops.load(Ordering::Relaxed), dead);
     for first in &kept {
@@ -235,13 +235,13 @@ fn rings_over_eight_heaps() {
         h.collect();
         h.collect_young();
     }
-    let mut group: Vec<&mut Heap> = hs.iter_mut().collect();
+    let mut group: Vec<&mut dyn GroupMember> = hs.iter_mut().map(|h| h as &mut dyn GroupMember).collect();
     Heap::collect_group(&mut group);
     for first in &kept {
         assert_eq!(walk(&hs, first), (0..8).collect::<Vec<_>>());
     }
     drop(kept);
-    let mut group: Vec<&mut Heap> = hs.iter_mut().collect();
+    let mut group: Vec<&mut dyn GroupMember> = hs.iter_mut().map(|h| h as &mut dyn GroupMember).collect();
     Heap::collect_group(&mut group);
     assert_eq!(drops.load(Ordering::Relaxed), RINGS * 8);
 }
@@ -273,7 +273,7 @@ fn eight_threads_relink_far_holders() {
     let mut hs = heaps(HEAPS);
     let drops = Arc::new(AtomicUsize::new(0));
     let made = AtomicUsize::new(0);
-    let boards: Vec<Global<BoardB>> = hs.iter().map(|h| h.scope(|m| m.global(m.alloc(Board { cells: (0..CELLS).map(|_| GcSlot::default()).collect() })))).collect();
+    let boards: Vec<Global<'_, BoardB>> = hs.iter().map(|h| h.scope(|m| m.global(m.alloc(Board { cells: (0..CELLS).map(|_| GcSlot::default()).collect() })))).collect();
     for round in 0..ROUNDS {
         std::thread::scope(|s| {
             for t in 0..HEAPS {
@@ -316,7 +316,7 @@ fn eight_threads_relink_far_holders() {
             0 => hs.iter_mut().for_each(Heap::collect),
             1 => hs.iter_mut().for_each(Heap::collect_young),
             _ => {
-                let mut group: Vec<&mut Heap> = hs.iter_mut().collect();
+                let mut group: Vec<&mut dyn GroupMember> = hs.iter_mut().map(|h| h as &mut dyn GroupMember).collect();
                 Heap::collect_group(&mut group);
             }
         }
@@ -324,7 +324,7 @@ fn eight_threads_relink_far_holders() {
     drop(boards);
     // The boards are gone: the holders collect first (finalizing Holders and returning entries), then one group collection finishes up
     hs.iter_mut().for_each(Heap::collect);
-    let mut group: Vec<&mut Heap> = hs.iter_mut().collect();
+    let mut group: Vec<&mut dyn GroupMember> = hs.iter_mut().map(|h| h as &mut dyn GroupMember).collect();
     Heap::collect_group(&mut group);
     assert_eq!(drops.load(Ordering::Relaxed), made.load(Ordering::Relaxed), "every Item should be reclaimed (no entry leaked)");
 }
@@ -333,12 +333,12 @@ fn eight_threads_relink_far_holders() {
 #[test]
 fn far_targets_are_pinned_during_young_evacuation() {
     const ITEMS: u64 = if cfg!(miri) { 400 } else { 4_000 };
-    let a = Heap::new(THREADS);
-    let mut b = Heap::new(THREADS);
+    let a = Heap::new_static(THREADS);
+    let mut b = Heap::new_static(THREADS);
     b.set_young_evacuation(YoungEvacuation::Full);
     let drops = Arc::new(AtomicUsize::new(0));
-    let roots: Vec<(u64, Global<ItemB>)> = (0..ITEMS).map(|v| (v, item(&b, v, &drops))).collect();
-    let held: Vec<(u64, Global<HolderB>)> = roots.iter().filter(|(v, _)| v % 2 == 0).map(|(v, r)| (*v, hold(&a, &b, r, *v))).collect();
+    let roots: Vec<(u64, Global<'_, ItemB>)> = (0..ITEMS).map(|v| (v, item(&b, v, &drops))).collect();
+    let held: Vec<(u64, Global<'_, HolderB>)> = roots.iter().filter(|(v, _)| v % 2 == 0).map(|(v, r)| (*v, hold(&a, &b, r, *v))).collect();
     let before: Vec<usize> = b.scope(|m| roots.iter().map(|(_, r)| m.get(r).as_ptr().addr()).collect());
     b.collect_young();
     let after: Vec<usize> = b.scope(|m| roots.iter().map(|(_, r)| m.get(r).as_ptr().addr()).collect());

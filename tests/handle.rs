@@ -49,7 +49,7 @@ fn count(n: u64) -> usize {
 }
 
 /// Ids and values of the kept handles, and the addresses of their objects
-fn kept(heap: &Heap, keep: &Global<KeepB>) -> (Vec<usize>, Vec<u64>, Vec<usize>) {
+fn kept<'h>(heap: &Heap<'h>, keep: &Global<'h, KeepB>) -> (Vec<usize>, Vec<u64>, Vec<usize>) {
     heap.scope(|m| {
         let items = &m.get(keep).items;
         (items.iter().map(|h| h.id()).collect(), items.iter().map(|h| h.value).collect(), items.iter().map(|h| h.get().as_ptr().addr()).collect())
@@ -63,7 +63,7 @@ fn handles_stay_while_objects_move() {
     const KEEP_EVERY: u64 = 16;
     for mode in [YoungEvacuation::Off, YoungEvacuation::SkipRemembered, YoungEvacuation::Full] {
         let drops = Arc::new(AtomicUsize::new(0));
-        let mut heap = Heap::new(THREADS);
+        let mut heap = Heap::new_static(THREADS);
         heap.set_young_evacuation(mode);
         let keep = heap.scope(|m| {
             let items = (0..N).map(|value| m.alloc_handle(Item { value, tag: Counted(drops.clone()) })).filter(|h| h.value.is_multiple_of(KEEP_EVERY)).collect();
@@ -92,9 +92,9 @@ fn handles_stay_while_objects_move() {
 fn old_objects_hold_young_handles_without_barrier() {
     for mode in [YoungEvacuation::Off, YoungEvacuation::SkipRemembered, YoungEvacuation::Full] {
         let drops = Arc::new(AtomicUsize::new(0));
-        let mut heap = Heap::new(THREADS);
+        let mut heap = Heap::new_static(THREADS);
         heap.set_young_evacuation(mode);
-        let holder: Global<HolderB> = heap.scope(|m| m.global(m.alloc(Holder { item: HandleSlot::default() })));
+        let holder: Global<'_, HolderB> = heap.scope(|m| m.global(m.alloc(Holder { item: HandleSlot::default() })));
         heap.collect();
         heap.scope(|m| m.get(&holder).item.set(Some(m.alloc_handle(Item { value: 7, tag: Counted(drops.clone()) }))));
         heap.collect_young();
@@ -111,8 +111,8 @@ fn old_objects_hold_young_handles_without_barrier() {
 fn dead_entries_are_reused() {
     const N: u64 = 1_000;
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new(THREADS);
-    let ids = |heap: &Heap| -> (Global<KeepB>, HashSet<usize>) {
+    let mut heap = Heap::new_static(THREADS);
+    let ids = |heap: &Heap<'static>| -> (Global<'static, KeepB>, HashSet<usize>) {
         heap.scope(|m| {
             let items: Vec<_> = (0..N).map(|value| m.alloc_handle(Item { value, tag: Counted(drops.clone()) })).collect();
             let ids = items.iter().map(|h| h.id()).collect();
@@ -131,8 +131,8 @@ fn dead_entries_are_reused() {
 #[test]
 fn concurrent_marking_keeps_moved_handles() {
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new(THREADS);
-    let (a, b): (Global<HolderB>, Global<HolderB>) = heap.scope(|m| {
+    let mut heap = Heap::new_static(THREADS);
+    let (a, b): (Global<'_, HolderB>, Global<'_, HolderB>) = heap.scope(|m| {
         let item = m.alloc_handle(Item { value: 5, tag: Counted(drops.clone()) });
         (m.global(m.alloc(Holder { item: item.into() })), m.global(m.alloc(Holder { item: HandleSlot::default() })))
     });
@@ -156,8 +156,8 @@ fn concurrent_marking_keeps_moved_handles() {
 #[test]
 fn ids_turn_back_into_handles() {
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new(THREADS);
-    let (keep, id): (Global<KeepB>, usize) = heap.scope(|m| {
+    let mut heap = Heap::new_static(THREADS);
+    let (keep, id): (Global<'_, KeepB>, usize) = heap.scope(|m| {
         let h = m.alloc_handle(Item { value: 9, tag: Counted(drops.clone()) });
         (m.global(m.alloc(Keep { items: vec![h] })), h.id())
     });

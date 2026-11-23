@@ -39,8 +39,8 @@ impl<'scope> Holder<'scope> {
     }
 
     /// Allocate an object and put it in a slot if needed (the old object overwritten becomes garbage).
-    fn place(&self, m: &Scope<'scope>, frag: &mut Frag) {
-        fn put<'scope, const N: usize>(m: &Scope<'scope>, slots: &[GcSlot<'scope, Blob<N>>], slot: Option<usize>) {
+    fn place(&self, m: &Scope<'_, 'scope>, frag: &mut Frag) {
+        fn put<'scope, const N: usize>(m: &Scope<'_, 'scope>, slots: &[GcSlot<'scope, Blob<N>>], slot: Option<usize>) {
             let blob = m.alloc(Blob { _data: [0; N] });
             if let Some(i) = slot {
                 slots[i].set(m, Some(blob));
@@ -61,19 +61,19 @@ struct Paragc {
 }
 
 impl Paragc {
-    fn tree<'scope>(m: &Scope<'scope>, depth: u32) -> Gc<'scope, Node<'scope>> {
+    fn tree<'scope>(m: &Scope<'_, 'scope>, depth: u32) -> Gc<'scope, Node<'scope>> {
         let (left, right) = if depth > 1 { (Some(Self::tree(m, depth - 1)), Some(Self::tree(m, depth - 1))) } else { (None, None) };
         m.alloc(Node { left, right, value: depth.into() })
     }
 
-    fn rooted(heap: &Heap, depth: u32) -> Global<NodeB> {
+    fn rooted<'h>(heap: &Heap<'h>, depth: u32) -> Global<'h, NodeB> {
         heap.scope(|m| m.global(Self::tree(m, depth)))
     }
 
     /// A live tree + a garbage tree, timing only the part that stops mutators:
     /// `concurrent_mark` marks concurrently first (untimed); `concurrent_sweep` times only `finish_marking`, with sweeping done concurrently afterwards (untimed).
     fn timed_pause(&self, concurrent_mark: bool, concurrent_sweep: bool) -> Took {
-        let mut heap = Heap::new(self.threads);
+        let mut heap = Heap::new_static(self.threads);
         let live = Self::rooted(&heap, PAUSE_DEPTH);
         heap.scope(|m| {
             Self::tree(m, PAUSE_DEPTH);
@@ -93,7 +93,7 @@ impl Paragc {
         took
     }
 
-    fn count(heap: &Heap, root: &Global<NodeB>) -> usize {
+    fn count<'h>(heap: &Heap<'h>, root: &Global<'h, NodeB>) -> usize {
         heap.scope(|m| {
             let mut stack = vec![m.get(root)];
             let mut n = 0;
@@ -111,7 +111,7 @@ impl Bench for Paragc {
     const NAME: &str = "paragc";
 
     fn pause(&self) -> Option<Took> {
-        let mut heap = Heap::new(self.threads);
+        let mut heap = Heap::new_static(self.threads);
         let live = Self::rooted(&heap, PAUSE_DEPTH);
         heap.scope(|m| {
             Self::tree(m, PAUSE_DEPTH);
@@ -125,7 +125,7 @@ impl Bench for Paragc {
 
     fn gcbench(&self) -> Option<Took> {
         let start = Clock::start();
-        let mut heap = Heap::new(self.threads);
+        let mut heap = Heap::new_static(self.threads);
         heap.scope(|m| {
             Self::tree(m, STRETCH_DEPTH);
         });
@@ -147,8 +147,8 @@ impl Bench for Paragc {
     fn frag(&self) -> Option<(Took, Footprint)> {
         let base = Footprint::rss();
         let start = Clock::start();
-        let mut heap = Heap::new(self.threads);
-        let holder: Global<HolderB> = heap.scope(|m| m.global(m.alloc(Holder::new())));
+        let mut heap = Heap::new_static(self.threads);
+        let holder: Global<'_, HolderB> = heap.scope(|m| m.global(m.alloc(Holder::new())));
         let mut frag = Frag::default();
         let mut peak = 0;
         for _ in 0..FRAG_ROUNDS {
@@ -181,7 +181,7 @@ impl Bench for Paragc {
     }
 
     fn alloc_mt(&self) -> Option<Took> {
-        let mut heap = Heap::new(self.threads);
+        let mut heap = Heap::new_static(self.threads);
         let long = Self::rooted(&heap, LONG_LIVED_DEPTH);
         let per_thread = MT_TREES / (MT_ROUNDS * self.threads.get());
         let start = Clock::start();

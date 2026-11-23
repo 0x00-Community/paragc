@@ -311,9 +311,9 @@ fn private_heap_holds_public_handles() {
     const LEN: u64 = if cfg!(miri) { 50 } else { 5_000 };
     let space = CrossHeapSpace::reserve().unwrap();
     let public = space.create_anonymous(THREADS).unwrap();
-    let mut private = Heap::new(THREADS);
+    let mut private = Heap::new_static(THREADS);
     let drops = Arc::new(AtomicUsize::new(0));
-    let card: Global<CardB> = {
+    let card: Global<'_, CardB> = {
         let handle = list(&public, LEN);
         private.scope(|m| m.global(m.alloc(Card { public: handle, _drops: Counted(drops.clone()) })))
     };
@@ -774,7 +774,7 @@ struct Keeper<'scope> {
 
 brand!(KeeperB = for<'scope> Keeper<'scope>);
 
-fn snode_sum(heap: &Heap, root: &Global<SNodeB>) -> (u64, bool) {
+fn snode_sum<'h>(heap: &Heap<'h>, root: &Global<'h, SNodeB>) -> (u64, bool) {
     heap.scope(|m| {
         let (mut sum, mut all_crossed, mut cur) = (0, true, Some(m.get(root)));
         while let Some(n) = cur {
@@ -807,7 +807,7 @@ fn young_survivors_promote_into_attached_cross_heap() {
     const LEN: u64 = 5000;
     let space = CrossHeapSpace::reserve_fixed().unwrap();
     let cross = space.create_anonymous(THREADS).unwrap();
-    let mut heap = Heap::new(THREADS);
+    let mut heap = Heap::new_static(THREADS);
     heap.attach_cross_heap(&cross).unwrap();
     let (root, keeper, weak) = heap.scope(|m| {
         let mut top: Option<paragc::Gc<'_, SNode<'_>>> = None;
@@ -854,7 +854,7 @@ fn young_survivors_promote_into_attached_cross_heap() {
 fn private_writes_into_cross_heap_objects_wait_for_the_next_young_collection() {
     let space = CrossHeapSpace::reserve_fixed().unwrap();
     let cross = space.create_anonymous(THREADS).unwrap();
-    let mut heap = Heap::new(THREADS);
+    let mut heap = Heap::new_static(THREADS);
     heap.attach_cross_heap(&cross).unwrap();
     let root = heap.scope(|m| m.global::<SNodeB>(m.alloc_shared(SNode { value: 1, next: None.into() })));
     heap.collect_young();
@@ -920,7 +920,7 @@ fn tails_travel_with_their_objects() {
     const BIG: usize = 300_000;
     let space = CrossHeapSpace::reserve_fixed().unwrap();
     let cross = space.create_anonymous(THREADS).unwrap();
-    let mut heap = Heap::new(THREADS);
+    let mut heap = Heap::new_static(THREADS);
     heap.attach_cross_heap(&cross).unwrap();
     let roots = heap.scope(|m| {
         let len = |n: usize| u64::try_from(n).unwrap();

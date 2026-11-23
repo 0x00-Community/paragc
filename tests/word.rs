@@ -56,7 +56,7 @@ fn number(n: f64) -> u64 {
 }
 
 /// One root for the head node, then `len` nodes; node i has `n` = i
-fn build(heap: &Heap, len: usize, drops: &Arc<AtomicUsize>) -> Global<NodeB> {
+fn build<'h>(heap: &Heap<'h>, len: usize, drops: &Arc<AtomicUsize>) -> Global<'h, NodeB> {
     heap.scope(|m| {
         let mut next = number(END);
         for i in (0..len).rev() {
@@ -69,7 +69,7 @@ fn build(heap: &Heap, len: usize, drops: &Arc<AtomicUsize>) -> Global<NodeB> {
 }
 
 /// Walk to the end of the chain: the node count; `n` increases in order and the end is END
-fn walk(heap: &Heap, root: &Global<NodeB>) -> usize {
+fn walk<'h>(heap: &Heap<'h>, root: &Global<'h, NodeB>) -> usize {
     heap.scope(|m| {
         let mut cur = Some(m.get(root));
         let mut count = 0;
@@ -93,7 +93,7 @@ fn walk(heap: &Heap, root: &Global<NodeB>) -> usize {
 #[test]
 fn survives_full_collections_and_cut_frees_the_rest() {
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new(THREADS);
+    let mut heap = Heap::new_static(THREADS);
     let root = build(&heap, LEN, &drops);
     for _ in 0..3 {
         heap.collect();
@@ -119,7 +119,7 @@ fn survives_full_collections_and_cut_frees_the_rest() {
 /// Young nodes hung in old nodes' words (remembered set) survive young collections (all three evacuation modes); discarded young nodes are reclaimed
 fn young(mode: YoungEvacuation) {
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new(THREADS);
+    let mut heap = Heap::new_static(THREADS);
     heap.set_young_evacuation(mode);
     let root = build(&heap, LEN, &drops);
     heap.collect();
@@ -162,7 +162,7 @@ fn young_collection_moving_remembered() {
 #[test]
 fn concurrent_marking_while_rewriting() {
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new(THREADS);
+    let mut heap = Heap::new_static(THREADS);
     let root = build(&heap, LEN, &drops);
     heap.collect();
     for round in 0..4 {

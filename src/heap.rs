@@ -55,7 +55,9 @@ use crate::sync::{Pool, SegVec};
 #[cfg(crossheap)]
 use crate::sync::{FutexWord, Retry, Stack};
 
-pub struct Heap {
+pub struct Heap<'heap> {
+    /// The heap's brand: [`Global`]s and [`Weak`]s carry it, so they are used only with this heap
+    _brand: PhantomData<fn(&'heap ()) -> &'heap ()>,
     /// Collect with at most this many threads
     threads: NonZeroUsize,
     /// Collector thread pool: threads start at the first collection
@@ -176,16 +178,23 @@ pub struct Stats {
     pub evacuated_bytes: usize,
 }
 
-impl Default for Heap {
-    fn default() -> Self {
-        Self::new(std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN))
+impl Heap<'static> {
+    /// A new heap that collects with at most `threads` threads, with a brand of its own: [`Global`]s and [`Weak`]s made in it cannot be used with
+    /// any other heap (checked at compile time). The heap lives for the closure.
+    pub fn new<R>(threads: NonZeroUsize, f: impl for<'heap> FnOnce(Heap<'heap>) -> R) -> R {
+        f(Heap::build(threads))
+    }
+
+    /// A new heap that can be stored anywhere. All such heaps share the brand `'static`, so using a [`Global`] with the wrong one is caught at run time.
+    pub fn new_static(threads: NonZeroUsize) -> Self {
+        Self::build(threads)
     }
 }
 
-impl Heap {
-    /// Collect with at most `threads` threads.
-    pub fn new(threads: NonZeroUsize) -> Self {
+impl<'heap> Heap<'heap> {
+    fn build(threads: NonZeroUsize) -> Self {
         Self {
+            _brand: PhantomData,
             threads,
             pool: OnceLock::new(),
             epoch: 1,
@@ -273,7 +282,7 @@ impl Heap {
     }
 
     /// Work on the heap; can be called on several threads at once. Objects allocated in the closure survive the next collection only if they hang from a [`crate::Global`] (directly or indirectly).
-    pub fn scope<R>(&self, f: impl for<'scope> FnOnce(&Scope<'scope>) -> R) -> R {
+    pub fn scope<R>(&self, f: impl for<'scope> FnOnce(&Scope<'heap, 'scope>) -> R) -> R {
         let spare = self.spare.swap(null_mut(), Ordering::AcqRel);
         let mut tlab = if spare.is_null() {
             Box::default()
@@ -291,7 +300,7 @@ impl Heap {
     }
 
     /// As [`Heap::scope`], but with the caller's own allocation buffer (a thread that scopes repeatedly keeps it, saving a new block every time).
-    pub fn scope_in<R>(&self, tlab: &mut Tlab, f: impl for<'scope> FnOnce(&Scope<'scope>) -> R) -> R {
+    pub fn scope_in<R>(&self, tlab: &mut Tlab, f: impl for<'scope> FnOnce(&Scope<'heap, 'scope>) -> R) -> R {
         let _inside = Inside::enter(self);
         tlab.adopt((self.id(), self.collections));
         // Concurrent marking starts only with no mutators and ends only with the heap held exclusively, so it does not change within one scope
@@ -850,7 +859,9 @@ impl Heap {
     /// Fars held by heaps of the group are not roots: each heap marks from its own [`crate::Global`]s (and Fars held from outside the group), and a traced Far hands its target to the target heap
     /// to continue marking until nothing new appears; an unmarked entry means the Far holding it is dead, so it is cleared. No evacuation. On return dead objects are finalized.
     /// Heaps with concurrent marking in progress finish it on their own first.
-    pub fn collect_group(heaps: &mut [&mut Heap]) {
+    pub fn collect_group(heaps: &mut [&mut dyn GroupMember]) {
+        let mut heaps: Vec<&mut Heap<'static>> = heaps.iter_mut().map(|h| h.member()).collect();
+        let heaps = &mut heaps[..];
         for h in heaps.iter_mut() {
             if *h.marking.get_mut() != 0 {
                 h.finish_marking();
@@ -904,6 +915,24 @@ impl Heap {
     }
 }
 
+/// A heap of any brand, for [`Heap::collect_group`]. Implemented only by [`Heap`].
+pub trait GroupMember: Sealed {
+    #[doc(hidden)]
+    fn member(&mut self) -> &mut Heap<'static>;
+}
+
+/// Keeps [`GroupMember`] implemented by this crate only: the trait lives in a private module and is not exported.
+pub trait Sealed {}
+
+impl Sealed for Heap<'_> {}
+
+impl GroupMember for Heap<'_> {
+    fn member(&mut self) -> &mut Heap<'static> {
+        // SAFETY: the brand is a phantom lifetime; a group collection uses no branded handle, and the reference does not outlive the call
+        unsafe { &mut *(&raw mut *self).cast::<Heap<'static>>() }
+    }
+}
+
 /// Operations for this crate only: the trait lives in a private module and is not exported, so it is unreachable outside the crate.
 pub trait HeapInternal {
     fn roots(&self) -> &Arc<RootTable>;
@@ -916,7 +945,7 @@ pub trait HeapInternal {
     fn id(&self) -> usize;
 }
 
-impl HeapInternal for Heap {
+impl HeapInternal for Heap<'_> {
     fn roots(&self) -> &Arc<RootTable> {
         &self.roots
     }
@@ -936,7 +965,7 @@ impl HeapInternal for Heap {
 
 
 /// The sweeper hands a swept item back to the heap: blocks go into the block table and usable ones onto available; live large objects return to the large object table.
-impl Sink for Heap {
+impl Sink for Heap<'_> {
     fn block(&self, outcome: Outcome) {
         match outcome {
             Outcome::Usable(b) => {
@@ -958,7 +987,7 @@ impl Sink for Heap {
     }
 }
 
-impl Drop for Heap {
+impl Drop for Heap<'_> {
     fn drop(&mut self) {
         // A heap that never collected does not start threads just to finalize
         let pool = self.pool.take().unwrap_or_else(|| Pool::new(NonZeroUsize::MIN));
@@ -1113,10 +1142,10 @@ const YOUNG: u32 = 0;
 const REQUEST: u64 = 1 << 63;
 
 /// Inside scope: increment the entry count on the way in (waiting first if a marking request is pending) and decrement on the way out (also on panic).
-struct Inside<'h>(&'h Heap);
+struct Inside<'h, 'heap>(&'h Heap<'heap>);
 
-impl<'h> Inside<'h> {
-    fn enter(heap: &'h Heap) -> Self {
+impl<'h, 'heap> Inside<'h, 'heap> {
+    fn enter(heap: &'h Heap<'heap>) -> Self {
         let backoff = Backoff::new();
         let mut word = heap.gate.load(Ordering::Acquire);
         loop {
@@ -1133,22 +1162,22 @@ impl<'h> Inside<'h> {
     }
 }
 
-impl Drop for Inside<'_> {
+impl Drop for Inside<'_, '_> {
     fn drop(&mut self) {
         self.0.gate.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
 /// The allocator and brand of one scope; used only on the calling thread.
-pub struct Scope<'scope> {
-    heap: &'scope Heap,
+pub struct Scope<'heap, 'scope> {
+    heap: &'scope Heap<'heap>,
     tlab: &'scope Tlab,
     /// The epoch being marked concurrently when the scope began: for the write barrier and black allocation
     marking: Option<NonZeroU32>,
     _brand: Invariant<'scope>,
 }
 
-impl<'scope> Scope<'scope> {
+impl<'heap, 'scope> Scope<'heap, 'scope> {
 
     /// Whether this scope falls within concurrent marking (write barrier and black allocation in effect).
     pub fn is_marking(&self) -> bool {
@@ -1223,8 +1252,8 @@ impl<'scope> Scope<'scope> {
 }
 
 /// Operations for this crate only: the trait lives in a private module and is not exported, so it is unreachable outside the crate.
-pub trait ScopeInternal<'scope> {
-    fn heap(&self) -> &'scope Heap;
+pub trait ScopeInternal<'heap, 'scope> {
+    fn heap(&self) -> &'scope Heap<'heap>;
 
     /// Write barrier. During concurrent marking: the overwritten old value is marked and greyed if not yet marked (snapshot at the beginning).
     /// Normally: when a young object (mark epoch not the last completed one) is written into a slot of an old object ([`RawSlot::is_young`] false), record the slot's address —
@@ -1237,8 +1266,8 @@ pub trait ScopeInternal<'scope> {
     fn reached(&self, h: *const Header);
 }
 
-impl<'scope> ScopeInternal<'scope> for Scope<'scope> {
-    fn heap(&self) -> &'scope Heap {
+impl<'heap, 'scope> ScopeInternal<'heap, 'scope> for Scope<'heap, 'scope> {
+    fn heap(&self) -> &'scope Heap<'heap> {
         self.heap
     }
 

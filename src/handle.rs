@@ -299,11 +299,11 @@ impl<'scope, T> GcSlot<'scope, T> {
         Self::wrap(self.word.load(Ordering::Acquire))
     }
 
-    pub fn set(&self, m: &Scope<'scope>, v: Option<Gc<'scope, T>>) {
+    pub fn set(&self, m: &Scope<'_, 'scope>, v: Option<Gc<'scope, T>>) {
         self.swap(m, v);
     }
 
-    pub fn swap(&self, m: &Scope<'scope>, v: Option<Gc<'scope, T>>) -> Option<Gc<'scope, T>> {
+    pub fn swap(&self, m: &Scope<'_, 'scope>, v: Option<Gc<'scope, T>>) -> Option<Gc<'scope, T>> {
         let new = Self::raw(v);
         let old = self.word.swap(new, Ordering::AcqRel);
         m.written(self.raw_slot(), RawSlot::header(old), RawSlot::header(new));
@@ -311,7 +311,7 @@ impl<'scope, T> GcSlot<'scope, T> {
     }
 
     /// Swap in `new` only if the slot holds `current`; on failure returns the slot's value.
-    pub fn compare_exchange(&self, m: &Scope<'scope>, current: Option<Gc<'scope, T>>, new: Option<Gc<'scope, T>>) -> Result<Option<Gc<'scope, T>>, Option<Gc<'scope, T>>> {
+    pub fn compare_exchange(&self, m: &Scope<'_, 'scope>, current: Option<Gc<'scope, T>>, new: Option<Gc<'scope, T>>) -> Result<Option<Gc<'scope, T>>, Option<Gc<'scope, T>>> {
         let new = Self::raw(new);
         let done = self.word.compare_exchange(Self::raw(current), new, Ordering::AcqRel, Ordering::Acquire);
         // Write barrier: the overwritten old value (concurrent marking's snapshot), the new value written (a young object ⇒ record this slot, young collections start from it),
@@ -347,7 +347,7 @@ impl WordSlot<'_> {
 
     /// Write `word`: goes through the write barrier (see [`GcSlot`]) when the old or new value holds a pointer (and they are not the same object).
     #[inline]
-    pub fn set(&self, m: &Scope<'_>, word: u64) {
+    pub fn set(&self, m: &Scope<'_, '_>, word: u64) {
         let old = self.word.load(Ordering::Relaxed);
         self.word.store(word, Ordering::Release);
         let (o, n) = (RawSlot::header(old), RawSlot::header(word));
@@ -407,7 +407,7 @@ impl<T: fmt::Debug> fmt::Debug for GcSlot<'_, T> {
     }
 }
 
-/// Rebrand a type carrying `'scope`: `Global<B>` has no lifetime, and the current scope's `'scope` is put back on when reading it.
+/// Rebrand a type carrying `'scope`: `Global<'heap, B>` has no `'scope`, and the current scope's `'scope` is put back on when reading it.
 /// Declare it with [`brand!`](crate::brand).
 pub trait Brand {
     type Of<'scope>: Trace + 'scope;
@@ -785,36 +785,36 @@ impl<T: fmt::Debug> fmt::Debug for HandleSlot<'_, T> {
     }
 }
 
-/// A strong handle: as long as it lives the object is not collected. Carries no `'scope`, so it can be stored anywhere and passed across threads.
-/// Create it with [`Scope::global`] and read it with [`Scope::get`].
-pub struct Global<B: Brand> {
+/// A strong handle: as long as it lives the object is not collected. Carries the heap's brand `'heap` but no `'scope`, so it can be stored anywhere,
+/// passed across threads and read in any later scope of the same heap. Create it with [`Scope::global`] and read it with [`Scope::get`].
+pub struct Global<'heap, B: Brand> {
     table: Arc<RootTable>,
     slot: usize,
-    _brand: PhantomData<fn() -> B>,
+    _brand: PhantomData<(fn() -> B, fn(&'heap ()) -> &'heap ())>,
 }
 
-impl<B: Brand> Drop for Global<B> {
+impl<B: Brand> Drop for Global<'_, B> {
     fn drop(&mut self) {
         self.table.release(self.slot);
     }
 }
 
 // SAFETY: the handle itself holds no Gc; it is a root
-unsafe impl<B: Brand> Trace for Global<B> {
+unsafe impl<B: Brand> Trace for Global<'_, B> {
     const NO_EDGES: bool = true;
     fn trace(&self, _: &mut crate::Tracer<'_>) {}
 }
 
-impl<'scope> Scope<'scope> {
+impl<'heap, 'scope> Scope<'heap, 'scope> {
     /// Make a root for an object.
-    pub fn global<B: Brand>(&self, gc: Gc<'scope, B::Of<'scope>>) -> Global<B> {
+    pub fn global<B: Brand>(&self, gc: Gc<'scope, B::Of<'scope>>) -> Global<'heap, B> {
         let table = self.heap().roots().clone();
         let slot = table.claim(gc.header(), NO_HOLDER);
         Global { table, slot, _brand: PhantomData }
     }
 
     /// The object a root points at.
-    pub fn get<B: Brand>(&self, root: &Global<B>) -> Gc<'scope, B::Of<'scope>> {
+    pub fn get<B: Brand>(&self, root: &Global<'heap, B>) -> Gc<'scope, B::Of<'scope>> {
         assert!(Arc::ptr_eq(&root.table, self.heap().roots()), "this Global does not belong to this heap");
         let header = root.table.slot(root.slot).load();
         // SAFETY: the root slot holds an object made with the same B and kept alive by this root
@@ -822,7 +822,7 @@ impl<'scope> Scope<'scope> {
     }
 
     /// Point the root at another object.
-    pub fn set<B: Brand>(&self, root: &Global<B>, gc: Gc<'scope, B::Of<'scope>>) {
+    pub fn set<B: Brand>(&self, root: &Global<'heap, B>, gc: Gc<'scope, B::Of<'scope>>) {
         assert!(Arc::ptr_eq(&root.table, self.heap().roots()), "this Global does not belong to this heap");
         root.table.slot(root.slot).store(gc.header().cast_mut());
     }
@@ -834,45 +834,45 @@ impl<'scope> Scope<'scope> {
 /// Every collection (full, young, the end of concurrent marking, group) clears weak references to unmarked targets after marking and before sweeping, and rewrites moved ones to the new address;
 /// so within any scope a weak reference is either empty or points at a live object.
 /// A young object without strong references dies at the next young collection; an old one (its count stuck by the weak reference, see [`crate::Heap::collect_young`]) waits for a full collection.
-pub struct Weak<B: Brand> {
+pub struct Weak<'heap, B: Brand> {
     /// The heap's weak table
     table: Arc<RootTable>,
     slot: usize,
-    _brand: PhantomData<fn() -> B>,
+    _brand: PhantomData<(fn() -> B, fn(&'heap ()) -> &'heap ())>,
 }
 
-impl<B: Brand> Weak<B> {
+impl<B: Brand> Weak<'_, B> {
     /// The target has been collected (and stays so). No scope needed; when false the target may still die at the next collection.
     pub fn is_cleared(&self) -> bool {
         self.table.slot(self.slot).load().is_null()
     }
 }
 
-impl<B: Brand> Drop for Weak<B> {
+impl<B: Brand> Drop for Weak<'_, B> {
     fn drop(&mut self) {
         self.table.release(self.slot);
     }
 }
 
 // SAFETY: the handle itself holds no Gc and has no strong edge to its target
-unsafe impl<B: Brand> Trace for Weak<B> {
+unsafe impl<B: Brand> Trace for Weak<'_, B> {
     const NO_EDGES: bool = true;
     fn trace(&self, _: &mut crate::Tracer<'_>) {}
 }
 
-impl<'scope> Scope<'scope> {
+impl<'heap, 'scope> Scope<'heap, 'scope> {
     /// Make a weak reference to an object.
     ///
     /// From the next collection on the target's reference count sticks (no more release by count, left to tracing): release by count runs in the background concurrently with mutators and could not clear
     /// weak references first. Counts stick when each pause processes the weak table, before the decrements computed in that pause, so it is not released by count before then.
-    pub fn weak<B: Brand>(&self, gc: Gc<'scope, B::Of<'scope>>) -> Weak<B> {
+    pub fn weak<B: Brand>(&self, gc: Gc<'scope, B::Of<'scope>>) -> Weak<'heap, B> {
         let table = self.heap().weaks().clone();
         let slot = table.claim(gc.header(), NO_HOLDER);
         Weak { table, slot, _brand: PhantomData }
     }
 
     /// The object a weak reference points at; None once collected. An object obtained during concurrent marking counts as referenced (it gets marked) and does not die this round.
-    pub fn upgrade<B: Brand>(&self, weak: &Weak<B>) -> Option<Gc<'scope, B::Of<'scope>>> {
+    pub fn upgrade<B: Brand>(&self, weak: &Weak<'heap, B>) -> Option<Gc<'scope, B::Of<'scope>>> {
         assert!(Arc::ptr_eq(&weak.table, self.heap().weaks()), "this Weak does not belong to this heap");
         let header = weak.table.slot(weak.slot).load();
         if header.is_null() {
@@ -902,8 +902,8 @@ unsafe impl<B: Brand> Sync for Far<'_, B> {}
 
 impl<'a, B: Brand> Far<'a, B> {
     /// `holder`: the holder heap (this Far goes into one of its objects); `target`: the heap containing `gc`, which must differ (edges within a heap use [`crate::GcSlot`]).
-    pub fn new<'b>(holder: &Scope<'a>, target: &Scope<'b>, gc: Gc<'b, B::Of<'b>>) -> Self {
-        assert!(!core::ptr::eq(holder.heap(), target.heap()), "edges within one heap use GcSlot, not Far");
+    pub fn new<'b>(holder: &Scope<'_, 'a>, target: &Scope<'_, 'b>, gc: Gc<'b, B::Of<'b>>) -> Self {
+        assert!(holder.heap().id() != target.heap().id(), "edges within one heap use GcSlot, not Far");
         let table = target.heap().roots().clone();
         let slot = table.claim(gc.header(), holder.heap().id());
         // SAFETY: a Gc's header is non-null
@@ -912,14 +912,14 @@ impl<'a, B: Brand> Far<'a, B> {
     }
 
     /// The target object; `m` must be the target heap's mutator.
-    pub fn get<'b>(&self, m: &Scope<'b>) -> Gc<'b, B::Of<'b>> {
+    pub fn get<'b>(&self, m: &Scope<'_, 'b>) -> Gc<'b, B::Of<'b>> {
         assert!(Arc::ptr_eq(&self.table, m.heap().roots()), "this Far does not point into this heap");
         // SAFETY: the slot keeps the object alive and entry objects do not move; m proves we are inside the target heap's scope; B is the same as at creation
         unsafe { Gc::from_data(Header::data(self.ptr.as_ptr()).cast()) }
     }
 
     /// Whether the target object is in `heap`.
-    pub fn points_into(&self, heap: &Heap) -> bool {
+    pub fn points_into(&self, heap: &Heap<'_>) -> bool {
         Arc::ptr_eq(&self.table, heap.roots())
     }
 
