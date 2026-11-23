@@ -64,34 +64,37 @@ Where the code does not meet principle 1 yet:
 ## 🚀 Usage
 
 ```rust
-use paragc::{Gc, Heap, Root, Trace, brand};
+use paragc::{Heap, ScopeGlobal, Slot, Trace, brand};
 
 #[derive(Trace)]
-struct Node<'gc> {
+struct Node<'heap, 'scope> {
     value: u64,
-    next: Option<Gc<'gc, Node<'gc>>>,
+    next: Slot<'heap, 'scope, Node<'heap, 'scope>>,
 }
 
-// A root handle has no `'gc`; the brand puts it back on when you read it
-brand!(NodeB = for<'gc> Node<'gc>);
+// A ScopeGlobal has no `'scope`; the brand puts the reading scope's borrow back on
+brand!(NodeB = for<'heap, 'scope> Node<'heap, 'scope>);
 
-let mut heap = Heap::default();
-let list: Root<NodeB> = heap.mutate(|m| {
-    let mut head = None;
-    for value in 0..1000 {
-        head = Some(m.alloc(Node { value, next: head }));
-    }
-    m.root(head.unwrap())
-});
-heap.collect();
-let sum = heap.mutate(|m| {
-    let mut sum = 0;
-    let mut cur = Some(m.get(&list));
-    while let Some(n) = cur {
-        sum += n.value;
-        cur = n.next;
-    }
-    sum
+let threads = std::thread::available_parallelism().unwrap();
+let sum = Heap::new(threads, |mut heap| {
+    heap.scope(|s| {
+        let list: ScopeGlobal<'_, '_, NodeB> = {
+            let mut head = None;
+            for value in 0..1000 {
+                head = Some(s.alloc(Node { value, next: head.into() }));
+            }
+            s.scope_out(head.unwrap())
+        };
+        // Collecting borrows the scope mutably: every ScopeLocal is dead now, only roots survive
+        s.collect();
+        let mut sum = 0;
+        let mut cur = Some(s.scope_in(&list));
+        while let Some(n) = cur {
+            sum += n.value;
+            cur = n.next.get();
+        }
+        sum
+    })
 });
 assert_eq!(sum, 999 * 1000 / 2);
 ```

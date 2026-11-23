@@ -9,7 +9,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use paragc::{Heap, HeapDead, CrossHeapGlobal, CrossHeap, CrossHeapRef, CrossHeapSlot, CrossHeapSpace, Global, Shared, Trace, brand, cross_heap_brand};
+use paragc::{Heap, HeapDead, CrossHeapGlobal, CrossHeap, CrossHeapRef, CrossHeapSlot, CrossHeapSpace, ScopeGlobal, Shared, Trace, brand, cross_heap_brand};
 
 const THREADS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 /// Public heap object header
@@ -40,24 +40,24 @@ const DEADLINE: Duration = Duration::from_secs(10);
 
 #[repr(C)]
 #[derive(Shared)]
-struct Node<'scope> {
+struct Node<'heap, 'scope> {
     value: u64,
-    next: CrossHeapSlot<'scope, Node<'scope>>,
+    next: CrossHeapSlot<'heap, 'scope, Node<'heap, 'scope>>,
 }
 
-cross_heap_brand!(NodeB = for<'scope> Node<'scope>);
+cross_heap_brand!(NodeB = for<'heap, 'scope> Node<'heap, 'scope>);
 
 /// One head per chain; number 0 belongs to the parent, the rest to children
 #[repr(C)]
 #[derive(Shared)]
-struct Anchor<'scope> {
-    heads: [CrossHeapSlot<'scope, Node<'scope>>; 8],
+struct Anchor<'heap, 'scope> {
+    heads: [CrossHeapSlot<'heap, 'scope, Node<'heap, 'scope>>; 8],
 }
 
-cross_heap_brand!(AnchorB = for<'scope> Anchor<'scope>);
+cross_heap_brand!(AnchorB = for<'heap, 'scope> Anchor<'heap, 'scope>);
 
-const NODE: usize = (HEADER + size_of::<Node<'static>>()).next_multiple_of(8);
-const ANCHOR_BYTES: usize = (HEADER + size_of::<Anchor<'static>>()).next_multiple_of(8);
+const NODE: usize = (HEADER + size_of::<Node<'static, 'static>>()).next_multiple_of(8);
+const ANCHOR_BYTES: usize = (HEADER + size_of::<Anchor<'static, 'static>>()).next_multiple_of(8);
 
 /// What a child does.
 #[derive(Clone, Copy)]
@@ -98,12 +98,12 @@ impl FromStr for Role {
 }
 
 /// The chain's current length: its values from the head are len-1, len-2, …, 0 (this shape holds whichever step is killed), so the head's value + 1 is the length.
-fn length(heap: &CrossHeap, anchor: &CrossHeapGlobal<AnchorB>, chain: usize) -> u64 {
+fn length<'x>(heap: &CrossHeap<'x>, anchor: &CrossHeapGlobal<'x, AnchorB>, chain: usize) -> u64 {
     heap.scope(|m| anchor.get(m).heads[chain].get(m).map_or(0, |n| n.value + 1))
 }
 
 /// Push `push` nodes at the chain head, then pop `pop`; returns the new length.
-fn churn(heap: &CrossHeap, anchor: &CrossHeapGlobal<AnchorB>, chain: usize, push: u64, pop: u64) -> u64 {
+fn churn<'x>(heap: &CrossHeap<'x>, anchor: &CrossHeapGlobal<'x, AnchorB>, chain: usize, push: u64, pop: u64) -> u64 {
     heap.scope(|m| {
         let top = &anchor.get(m).heads[chain];
         let len = top.get(m).map_or(0, |n| n.value + 1);
@@ -120,7 +120,7 @@ fn churn(heap: &CrossHeap, anchor: &CrossHeapGlobal<AnchorB>, chain: usize, push
 }
 
 /// The chain has the right shape: len-1, …, 0 from the head. Returns the length.
-fn check(heap: &CrossHeap, anchor: &CrossHeapGlobal<AnchorB>, chain: usize) -> u64 {
+fn check<'x>(heap: &CrossHeap<'x>, anchor: &CrossHeapGlobal<'x, AnchorB>, chain: usize) -> u64 {
     heap.scope(|m| {
         let mut cur = anchor.get(m).heads[chain].get(m);
         let len = cur.map_or(0, |n| n.value + 1);
@@ -155,8 +155,8 @@ impl Rng {
 /// The parent's side: the heap file, region, heap and anchor.
 struct Parent {
     path: PathBuf,
-    heap: CrossHeap,
-    anchor: CrossHeapGlobal<AnchorB>,
+    heap: CrossHeap<'static>,
+    anchor: CrossHeapGlobal<'static, AnchorB>,
 }
 
 impl Parent {
@@ -164,7 +164,7 @@ impl Parent {
         let path = PathBuf::from(format!("/dev/shm/paragc-proc-{}-{name}", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let space = CrossHeapSpace::reserve().unwrap();
-        let heap = space.create(&path, THREADS).unwrap();
+        let heap = unsafe { space.create_unchecked(&path, THREADS) }.unwrap();
         let anchor = heap.scope(|m| m.global::<AnchorB>(m.alloc(Anchor { heads: Default::default() })));
         Self { path, heap, anchor }
     }
@@ -258,7 +258,7 @@ fn child() {
         return;
     }
     if let Role::Create = role {
-        let heap = space.create(&path, THREADS).unwrap();
+        let heap = unsafe { space.create_unchecked(&path, THREADS) }.unwrap();
         let chain = heap.scope(|m| {
             let mut top = None;
             for value in 0..CREATED_LEN {
@@ -283,8 +283,8 @@ fn child() {
             std::thread::sleep(Duration::from_secs(1));
         }
     }
-    let heap = space.open(Path::new(&path), THREADS).unwrap();
-    let anchor: CrossHeapGlobal<AnchorB> = heap.scope(|m| m.find(env(ANCHOR).parse().unwrap())).expect("the anchor is found by its entry number");
+    let heap = unsafe { space.open_unchecked(Path::new(&path), THREADS) }.unwrap();
+    let anchor: CrossHeapGlobal<'_, AnchorB> = heap.scope(|m| m.find(env(ANCHOR).parse().unwrap())).expect("the anchor is found by its entry number");
     match role {
         Role::Churn => {
             for r in 0..rounds {
@@ -364,10 +364,10 @@ fn created(kid: &mut Kid) -> (u32, usize) {
 }
 
 /// Open the heap at `path`, find the chain by entry number and check 0..CREATED_LEN, then after collecting check live bytes and the attachment count.
-fn reopen_and_check(path: &Path, index: u32) -> CrossHeap {
+fn reopen_and_check(path: &Path, index: u32) -> CrossHeap<'_> {
     let space = CrossHeapSpace::reserve().unwrap();
-    let heap = space.open(path, THREADS).unwrap();
-    let chain: CrossHeapGlobal<NodeB> = heap.scope(|m| m.find(index)).expect("the chain hung by the creating process is still there");
+    let heap = unsafe { space.open_unchecked(path, THREADS) }.unwrap();
+    let chain: CrossHeapGlobal<'_, NodeB> = heap.scope(|m| m.find(index)).expect("the chain hung by the creating process is still there");
     let sum = heap.scope(|m| {
         let (mut s, mut cur) = (0, Some(chain.get(m)));
         while let Some(n) = cur {
@@ -394,7 +394,7 @@ fn restart_after_the_creator_is_gone() {
     kid.line(READY);
     kid.kill();
     let space = CrossHeapSpace::reserve().unwrap();
-    let err = space.open(&crashed, THREADS).err().expect("the owner died, so the heap died with it");
+    let err = unsafe { space.open_unchecked(&crashed, THREADS) }.err().expect("the owner died, so the heap died with it");
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     assert!(!crashed.exists() && !dir.file(&format!(".paragc-{number}")).exists(), "the dead heap's file and marker were deleted");
     // No persist and a normal exit: deleted when the handle is dropped
@@ -435,14 +435,14 @@ fn heap_numbers_do_not_collide_across_processes() {
     assert!(kid.child.wait().unwrap().success());
     // This process creates heaps in the same directory: heap numbers must not collide with other processes', and the two heaps can be open at once in this process
     let space = CrossHeapSpace::reserve().unwrap();
-    let second = space.create(dir.file("second"), THREADS).unwrap();
+    let second = unsafe { space.create_unchecked(dir.file("second"), THREADS) }.unwrap();
     assert_ne!(second.id(), taken);
-    let reopened = space.open(&first, THREADS).unwrap();
+    let reopened = unsafe { space.open_unchecked(&first, THREADS) }.unwrap();
     assert_eq!(reopened.id(), taken);
     // The heap file is gone, so its marker is stale: the number is reclaimed and reused
     drop(reopened);
     std::fs::remove_file(&first).unwrap();
-    let third = space.create(dir.file("third"), THREADS).unwrap();
+    let third = unsafe { space.create_unchecked(dir.file("third"), THREADS) }.unwrap();
     assert_eq!(third.id(), taken, "the heap number of a stale marker is reclaimed and reused");
     drop((second, third));
     let left: Vec<_> = std::fs::read_dir(&dir.0).unwrap().map(|e| e.unwrap().file_name()).collect();
@@ -564,31 +564,31 @@ const EXIT: &str = "EXIT";
 /// The "hub" in a public heap: points at the gift for this process in every other process's public heap
 #[repr(C)]
 #[derive(Shared)]
-struct Hub<'scope> {
-    refs: [CrossHeapRef<'scope, NodeB>; PAIRS],
+struct Hub<'heap, 'scope> {
+    refs: [CrossHeapRef<'heap, 'scope, NodeB>; PAIRS],
 }
 
-cross_heap_brand!(HubB = for<'scope> Hub<'scope>);
+cross_heap_brand!(HubB = for<'heap, 'scope> Hub<'heap, 'scope>);
 
-const HUB: usize = (HEADER + size_of::<Hub<'static>>()).next_multiple_of(8);
+const HUB: usize = (HEADER + size_of::<Hub<'static, 'static>>()).next_multiple_of(8);
 
 /// A card in a private heap: holds a handle to the chain in another process's public heap
 #[derive(Trace)]
 struct Card {
     peer: usize,
-    chain: CrossHeapGlobal<NodeB>,
+    chain: CrossHeapGlobal<'static, NodeB>,
 }
 
-brand!(CardB = for<'scope> Card);
+brand!(CardB = for<'heap, 'scope> Card);
 
 /// A chain in the private heap
 #[derive(Trace)]
-struct Bead<'scope> {
+struct Bead<'heap, 'scope> {
     value: u64,
-    next: Option<paragc::ScopeLocal<'scope, Bead<'scope>>>,
+    next: Option<paragc::ScopeLocal<'heap, 'scope, Bead<'heap, 'scope>>>,
 }
 
-brand!(BeadB = for<'scope> Bead<'scope>);
+brand!(BeadB = for<'heap, 'scope> Bead<'heap, 'scope>);
 
 /// A gift's value: whom it is for and who gave it
 fn gift_value(from: usize, to: usize) -> u64 {
@@ -598,20 +598,20 @@ fn gift_value(from: usize, to: usize) -> u64 {
 /// One process of the eight-process scenario.
 struct Pair {
     me: usize,
-    mine: CrossHeap,
-    chain: CrossHeapGlobal<NodeB>,
-    hub: CrossHeapGlobal<HubB>,
+    mine: CrossHeap<'static>,
+    chain: CrossHeapGlobal<'static, NodeB>,
+    hub: CrossHeapGlobal<'static, HubB>,
     private: Heap<'static>,
-    beads: Global<'static, BeadB>,
+    beads: ScopeGlobal<'static, 'static, BeadB>,
     /// The other processes' public heaps (dead ones dropped)
-    peers: Vec<Option<CrossHeap>>,
-    cards: Vec<Option<Global<'static, CardB>>>,
+    peers: Vec<Option<CrossHeap<'static>>>,
+    cards: Vec<Option<ScopeGlobal<'static, 'static, CardB>>>,
 }
 
 impl Pair {
     /// The child's side: create the heaps, report, wait for PEERS, connect to the others, wait for RELEASE, report READY, then work while listening for commands.
     fn run(space: &CrossHeapSpace, path: &Path, me: usize) {
-        let mine = space.create(path, THREADS).unwrap();
+        let mine = unsafe { space.create_unchecked(path, THREADS) }.unwrap();
         let chain = mine.scope(|m| {
             let mut top = None;
             for value in 0..PAIR_NODES {
@@ -621,7 +621,7 @@ impl Pair {
         });
         let hub = mine.scope(|m| m.global::<HubB>(m.alloc(Hub { refs: Default::default() })));
         // A gift for every other process: once its hub points here and this process drops its handle, it lives only through that reference
-        let gifts: Vec<Option<CrossHeapGlobal<NodeB>>> = (0..PAIRS).map(|j| (j != me).then(|| mine.scope(|m| m.global(m.alloc(Node { value: gift_value(me, j), next: CrossHeapSlot::default() }))))).collect();
+        let gifts: Vec<Option<CrossHeapGlobal<'_, NodeB>>> = (0..PAIRS).map(|j| (j != me).then(|| mine.scope(|m| m.global(m.alloc(Node { value: gift_value(me, j), next: CrossHeapSlot::default() }))))).collect();
         let gift_list: Vec<String> = gifts.iter().map(|g| g.as_ref().map_or(u32::MAX, CrossHeapGlobal::index).to_string()).collect();
         println!("{PAIR_INFO}{me} {} {}", chain.index(), gift_list.join(","));
         let mut stdin = std::io::stdin().lines();
@@ -638,8 +638,8 @@ impl Pair {
                 (path, chain, gifts)
             })
             .collect();
-        let peers: Vec<Option<CrossHeap>> = infos.iter().enumerate().map(|(j, (p, _, _))| (j != me).then(|| space.open(p, THREADS).unwrap())).collect();
-        let mut private = Heap::new_static(THREADS);
+        let peers: Vec<Option<CrossHeap<'_>>> = infos.iter().enumerate().map(|(j, (p, _, _))| (j != me).then(|| unsafe { space.open_unchecked(p, THREADS) }.unwrap())).collect();
+        let mut private = unsafe { Heap::new_unchecked(THREADS) };
         let beads = private.scope(|m| {
             let mut top = None;
             for value in 0..PAIR_NODES {
@@ -650,13 +650,13 @@ impl Pair {
         let mut cards = Vec::new();
         for (j, peer) in peers.iter().enumerate() {
             cards.push(peer.as_ref().map(|h| {
-                let chain: CrossHeapGlobal<NodeB> = h.scope(|m| m.find(infos[j].1)).expect("the other's chain");
+                let chain: CrossHeapGlobal<'_, NodeB> = h.scope(|m| m.find(infos[j].1)).expect("the other's chain");
                 private.scope(|m| m.global(m.alloc(Card { peer: j, chain })))
             }));
             // Hub slot j points at the gift j gave this process
             if let Some(h) = peer {
                 mine.scope_with(h, |mi, mj| {
-                    let gift: CrossHeapGlobal<NodeB> = mj.find(infos[j].2[me]).expect("gift");
+                    let gift: CrossHeapGlobal<'_, NodeB> = mj.find(infos[j].2[me]).expect("gift");
                     hub.get(mi).refs[j].set(mi, mj, Some(gift.get(mj)));
                 });
             }
@@ -719,7 +719,7 @@ impl Pair {
             if dead.contains(&j) {
                 if let Some(h) = h {
                     assert!(!h.is_alive(), "process {j} died, so its public heap should be dead too");
-                    assert_eq!(h.try_mutate(|_| ()), Err(HeapDead));
+                    assert_eq!(h.try_scope(|_| ()), Err(HeapDead));
                 }
                 // Drop the handles pointing at it: the card in the private heap, and this process's mapping of it
                 self.cards[j] = None;
@@ -731,14 +731,14 @@ impl Pair {
             let gift = self.mine.scope_with(h, |mi, mj| self.hub.get(mi).refs[j].get(mj).map(|g| g.value));
             assert_eq!(gift, Some(gift_value(j, me)), "the hub points at the gift from {j}");
             let card = self.cards[j].as_ref().expect("the live card is still there");
-            let head = self.private.scope(|m| h.try_mutate(|mj| m.get(card).chain.get(mj).value)).expect("a live one can be read");
+            let head = self.private.scope(|m| h.try_scope(|mj| m.scope_in(card).chain.get(mj).value)).expect("a live one can be read");
             assert_eq!(head, PAIR_NODES - 1);
-            assert_eq!(self.private.scope(|m| m.get(card).peer), j);
+            assert_eq!(self.private.scope(|m| m.scope_in(card).peer), j);
         }
         // Private heap: cards are finalized (their handles return entries), and the bead chain is intact
         self.private.collect();
         let sum = self.private.scope(|m| {
-            let (mut s, mut cur) = (0, Some(m.get(&self.beads)));
+            let (mut s, mut cur) = (0, Some(m.scope_in(&self.beads)));
             while let Some(b) = cur {
                 s += b.value;
                 cur = b.next;

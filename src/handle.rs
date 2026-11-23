@@ -47,8 +47,14 @@ use crate::sync::{PushList, SegVec};
 /// Brand: `'scope` is invariant, so a `ScopeLocal` cannot escape the [`crate::Heap::scope`] closure.
 pub type Invariant<'scope> = PhantomData<Cell<&'scope ()>>;
 
+/// An invariant lifetime brand that can cross threads (the Cell in [`Invariant`] cannot)
+pub type Tag<'a> = fn(&'a ()) -> &'a ();
+
+/// The brand of a handle with two lifetimes and a type brand `B`
+type Branded<'a, 'b, B> = PhantomData<(Tag<'a>, Tag<'b>, fn() -> B)>;
+
 /// The brand of a ScopeLocal: borrows `&'scope T`, plus invariance over `'scope`
-type LocalBrand<'heap, 'scope, T> = PhantomData<(&'scope T, fn(&'scope ()) -> &'scope (), fn(&'heap ()) -> &'heap ())>;
+type LocalBrand<'heap, 'scope, T> = PhantomData<(&'scope T, Tag<'scope>, Tag<'heap>)>;
 
 /// A pointer to a heap object, valid only within one scope (`'scope` is that call's brand). Objects may move only during stop-the-world collections (between two scopes).
 ///
@@ -96,7 +102,7 @@ impl<T> ScopeLocalInternal for ScopeLocal<'_, '_, T> {
     }
 }
 
-impl<'heap, 'scope, T> ScopeLocal<'heap, 'scope, T> {
+impl<'scope, T> ScopeLocal<'_, 'scope, T> {
     pub fn as_ptr(self) -> *const T {
         self.ptr.as_ptr()
     }
@@ -392,7 +398,7 @@ pub trait SlotInternal<'scope> {
     fn raw_slot(&self) -> &RawSlot;
 }
 
-impl<'heap, 'scope, T> SlotInternal<'scope> for Slot<'heap, 'scope, T> {
+impl<'scope, T> SlotInternal<'scope> for Slot<'_, 'scope, T> {
     type Data = T;
 
     fn raw_slot(&self) -> &RawSlot {
@@ -791,7 +797,7 @@ impl<T: fmt::Debug> fmt::Debug for HandleSlot<'_, '_, T> {
 pub struct ScopeGlobal<'heap, 'life, B: Brand> {
     table: Arc<RootTable>,
     slot: usize,
-    _brand: PhantomData<(fn() -> B, fn(&'heap ()) -> &'heap (), fn(&'life ()) -> &'life ())>,
+    _brand: Branded<'heap, 'life, B>,
 }
 
 impl<B: Brand> Drop for ScopeGlobal<'_, '_, B> {
@@ -849,7 +855,7 @@ pub struct Weak<'heap, B: Brand> {
     /// The heap's weak table
     table: Arc<RootTable>,
     slot: usize,
-    _brand: PhantomData<(fn() -> B, fn(&'heap ()) -> &'heap ())>,
+    _brand: PhantomData<(fn() -> B, Tag<'heap>)>,
 }
 
 impl<B: Brand> Weak<'_, B> {
@@ -871,7 +877,7 @@ unsafe impl<B: Brand> Trace for Weak<'_, B> {
     fn trace(&self, _: &mut crate::Tracer<'_>) {}
 }
 
-impl<'heap, 'life> Scope<'heap, 'life> {
+impl<'heap> Scope<'heap, '_> {
     /// Make a weak reference to an object.
     ///
     /// From the next collection on the target's reference count sticks (no more release by count, left to tracing): release by count runs in the background concurrently with mutators and could not clear
@@ -903,7 +909,7 @@ pub struct Far<'heap, 'scope, B: Brand> {
     slot: usize,
     /// The target object's header (entry objects are not evacuated, so it does not change)
     ptr: NonNull<Header>,
-    _brand: PhantomData<(Invariant<'scope>, fn(&'heap ()) -> &'heap (), fn() -> B)>,
+    _brand: Branded<'heap, 'scope, B>,
 }
 
 // SAFETY: only shared references to B::Of are given out, and B::Of: Trace requires Send + Sync; the root table is thread safe
@@ -1117,7 +1123,7 @@ impl<T> Clone for CrossHeapLocal<'_, '_, T> {
 impl<T> Copy for CrossHeapLocal<'_, '_, T> {}
 
 #[cfg(crossheap)]
-impl<'xheap, 'scope, T> CrossHeapLocal<'xheap, 'scope, T> {
+impl<'scope, T> CrossHeapLocal<'_, 'scope, T> {
 
     pub fn as_ptr(self) -> *const T {
         self.ptr.as_ptr()
@@ -1259,7 +1265,7 @@ pub struct CrossHeapRef<'xheap, 'scope, B: CrossHeapBrand> {
     off: AtomicU64,
     /// The target heap's identity ([`crate::layout::Super::incarnation`])
     incarnation: AtomicU64,
-    _brand: PhantomData<(HolderBrand<'xheap>, HolderBrand<'scope>, fn() -> B)>,
+    _brand: Branded<'xheap, 'scope, B>,
 }
 
 /// The holder heap's brand: invariant over `'a`; a fn pointer form so it can cross threads (the Cell used by [`Invariant`] cannot)

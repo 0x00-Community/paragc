@@ -37,7 +37,7 @@ use crossbeam_utils::{Backoff, CachePadded};
 
 use crate::{ScopeLocal, Trace};
 use crate::Handle;
-use crate::handle::{ScopeLocalInternal, HandleInternal, Invariant, NO_HOLDER, RawSlot, RootTable};
+use crate::handle::{Tag, ScopeLocalInternal, HandleInternal, Invariant, NO_HOLDER, RawSlot, RootTable};
 #[cfg(crossheap)]
 use crate::handle::{EdgeMap, CrossHeapGlobal, CrossHeapBrand, CrossHeapLocal, CrossHeapLocalInternal, CrossHeapGlobalInternal, STAMP_MASK, Shared, Signature, WeakWord};
 use crate::layout::{BLOCK, Block, Pages, WARM_CYCLES, YOUNG_COPY_DEN, YOUNG_COPY_NUM, LINE, EVACUATE_LIVE, EVACUATE_MAX, EVACUATE_MIN, GRANULE, GROWTH, HEADER, Header, LARGE, MAX_EPOCH, MIN_SPARE_BLOCKS, MIN_TRIGGER, OVERFLOW_TRIES, FRAG_NUM, FRAG_DEN, YOUNG_PER_FULL, YOUNG_PER_FULL_RC};
@@ -57,7 +57,7 @@ use crate::sync::{FutexWord, Retry, Stack};
 
 pub struct Heap<'heap> {
     /// The heap's brand: [`ScopeGlobal`]s and [`Weak`]s carry it, so they are used only with this heap
-    _brand: PhantomData<fn(&'heap ()) -> &'heap ()>,
+    _brand: PhantomData<Tag<'heap>>,
     /// Collect with at most this many threads
     threads: NonZeroUsize,
     /// Collector thread pool: threads start at the first collection
@@ -181,12 +181,13 @@ pub struct Stats {
 impl Heap<'_> {
     /// A new heap that collects with at most `threads` threads, with a brand of its own: everything made in it carries `'heap`, so nothing of it can be used
     /// with any other heap (checked at compile time). The heap is the outermost scope and lives for the closure.
+    #[expect(clippy::new_ret_no_self, reason = "the heap lives in the closure, so its brand cannot escape")]
     pub fn new<R>(threads: NonZeroUsize, f: impl for<'heap> FnOnce(Heap<'heap>) -> R) -> R {
         f(Heap::build(threads))
     }
 }
 
-impl<'heap> Heap<'heap> {
+impl Heap<'_> {
     /// A new heap with a brand the caller picks, for heaps that must be stored in structs or collections.
     ///
     /// # Safety
@@ -322,6 +323,7 @@ impl<'heap> Heap<'heap> {
         f(&mut s)
     }
 
+    #[expect(clippy::unnecessary_box_returns, reason = "the spare buffer is kept as a raw Box pointer")]
     fn take_tlab(&self) -> Box<Tlab> {
         let spare = self.spare.swap(null_mut(), Ordering::AcqRel);
         if spare.is_null() {
@@ -1207,6 +1209,33 @@ impl Drop for Inside<'_, '_> {
 ///
 /// A scope from [`Heap::scope`] holds the heap exclusively and may collect ([`Scope::collect`] and friends). One from [`Heap::scope_shared`] can run on several
 /// threads at once and must not collect (it panics).
+///
+/// A direct pointer does not survive a collection in its scope:
+///
+/// ```compile_fail
+/// use paragc::{Heap, Trace};
+/// #[derive(Trace)]
+/// struct X(u64);
+/// Heap::new(std::num::NonZeroUsize::MIN, |mut heap| heap.scope(|s| {
+///     let x = s.alloc(X(1));
+///     s.collect();
+///     x.0
+/// }));
+/// ```
+///
+/// and objects of two heaps never mix:
+///
+/// ```compile_fail
+/// use paragc::{Heap, Slot, Trace};
+/// #[derive(Trace)]
+/// struct N<'heap, 'scope>(Slot<'heap, 'scope, N<'heap, 'scope>>);
+/// let t = std::num::NonZeroUsize::MIN;
+/// Heap::new(t, |a| Heap::new(t, |b| a.scope_shared(|sa| b.scope_shared(|sb| {
+///     let x = sa.alloc(N(Slot::default()));
+///     let y = sb.alloc(N(Slot::default()));
+///     y.0.set(sb, Some(x));
+/// }))));
+/// ```
 pub struct Scope<'heap, 'life> {
     heap: NonNull<Heap<'heap>>,
     tlab: NonNull<Tlab>,
@@ -1217,7 +1246,7 @@ pub struct Scope<'heap, 'life> {
     _brand: PhantomData<(&'life mut Heap<'heap>, Invariant<'life>)>,
 }
 
-impl<'heap, 'life> Scope<'heap, 'life> {
+impl<'heap> Scope<'heap, '_> {
     fn heap(&self) -> &Heap<'heap> {
         // SAFETY: the scope borrows the heap for its whole life
         unsafe { self.heap.as_ref() }
@@ -2314,7 +2343,7 @@ impl Drop for Inner {
 
 /// A public heap. Several threads can [`CrossHeap::scope`] at once; when the same heap is also mapped elsewhere (another region, another process), the handshake still excludes them mutually.
 #[cfg(crossheap)]
-pub struct CrossHeap<'xheap>(Arc<Inner>, PhantomData<fn(&'xheap ()) -> &'xheap ()>);
+pub struct CrossHeap<'xheap>(Arc<Inner>, PhantomData<Tag<'xheap>>);
 
 #[cfg(crossheap)]
 impl From<Inner> for CrossHeap<'_> {
@@ -2533,19 +2562,12 @@ impl<'h> Promoter<'h> {
 #[cfg(crossheap)]
 pub trait CrossHeapInternal {
     fn is(&self, inner: &Arc<Inner>) -> bool;
-
-    /// Give a heap made inside this crate its own brand.
-    fn rebrand(h: CrossHeap<'static>) -> Self;
 }
 
 #[cfg(crossheap)]
 impl CrossHeapInternal for CrossHeap<'_> {
     fn is(&self, inner: &Arc<Inner>) -> bool {
         Arc::ptr_eq(&self.0, inner)
-    }
-
-    fn rebrand(h: CrossHeap<'static>) -> Self {
-        CrossHeap(Arc::clone(&h.0), PhantomData)
     }
 }
 
@@ -2619,11 +2641,11 @@ pub struct CrossHeapScope<'xheap, 'life> {
     epoch: u32,
     /// The birth stamp of objects allocated in this scope ([`Inner::stamp`])
     stamp: u32,
-    _brand: PhantomData<(Invariant<'life>, fn(&'xheap ()) -> &'xheap ())>,
+    _brand: PhantomData<(Invariant<'life>, Tag<'xheap>)>,
 }
 
 #[cfg(crossheap)]
-impl<'xheap, 'life> CrossHeapScope<'xheap, 'life> {
+impl<'xheap> CrossHeapScope<'xheap, '_> {
 
     /// Allocate an object. The type must not have a destructor (checked at compile time).
     pub fn alloc<'s, T: Shared>(&'s self, value: T) -> CrossHeapLocal<'xheap, 's, T> {

@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use paragc::{GroupMember, Far, ScopeLocal, Heap, Global, Slot, Trace, Tracer, YoungEvacuation, brand};
+use paragc::{GroupMember, Far, ScopeLocal, Heap, ScopeGlobal, Slot, Trace, Tracer, YoungEvacuation, brand};
 
 /// Collector threads per heap (fewer under Miri)
 const THREADS: NonZeroUsize = NonZeroUsize::new(if cfg!(miri) { 2 } else { 4 }).unwrap();
@@ -30,49 +30,49 @@ struct Item {
     _counted: Counted,
 }
 
-brand!(ItemB = for<'scope> Item);
+brand!(ItemB = for<'heap, 'scope> Item);
 
 /// An object in the holder heap: points directly at an Item in another heap
 #[derive(Trace)]
-struct Holder<'scope> {
+struct Holder<'heap, 'scope> {
     value: u64,
-    far: Far<'scope, ItemB>,
+    far: Far<'heap, 'scope, ItemB>,
 }
 
-brand!(HolderB = for<'scope> Holder<'scope>);
+brand!(HolderB = for<'heap, 'scope> Holder<'heap, 'scope>);
 
 /// One ring of the cycle: `out` points to this heap's Hop, and the Hop points through a Far to the next heap's Link (a Far is fixed once made, so make the Link first and then the Hop)
 #[derive(Trace)]
-struct Link<'scope> {
+struct Link<'heap, 'scope> {
     heap: usize,
     _counted: Counted,
-    out: Slot<'scope, Hop<'scope>>,
+    out: Slot<'heap, 'scope, Hop<'heap, 'scope>>,
 }
 
 #[derive(Trace)]
-struct Hop<'scope> {
-    far: Far<'scope, LinkB>,
+struct Hop<'heap, 'scope> {
+    far: Far<'heap, 'scope, LinkB>,
 }
 
-brand!(LinkB = for<'scope> Link<'scope>);
+brand!(LinkB = for<'heap, 'scope> Link<'heap, 'scope>);
 
 fn heaps(n: usize) -> Vec<Heap<'static>> {
-    (0..n).map(|_| Heap::new_static(THREADS)).collect()
+    (0..n).map(|_| unsafe { Heap::new_unchecked(THREADS) }).collect()
 }
 
 /// Make an Item and return its root.
-fn item<'h>(heap: &Heap<'h>, value: u64, drops: &Arc<AtomicUsize>) -> Global<'h, ItemB> {
-    heap.scope(|m| m.global(m.alloc(Item { value, _counted: Counted(drops.clone()) })))
+fn item<'h>(heap: &Heap<'h>, value: u64, drops: &Arc<AtomicUsize>) -> ScopeGlobal<'h, 'h, ItemB> {
+    heap.scope_shared(|m| m.global(m.alloc(Item { value, _counted: Counted(drops.clone()) })))
 }
 
 /// Make a Holder in heap `holder`, pointing directly at the object of `root` in heap `target`.
-fn hold<'h, 't>(holder: &Heap<'h>, target: &Heap<'t>, root: &Global<'t, ItemB>, value: u64) -> Global<'h, HolderB> {
-    holder.scope(|ma| target.scope(|mb| ma.global(ma.alloc(Holder { value, far: Far::new(ma, mb, mb.get(root)) }))))
+fn hold<'h, 't>(holder: &Heap<'h>, target: &Heap<'t>, root: &ScopeGlobal<'t, 't, ItemB>, value: u64) -> ScopeGlobal<'h, 'h, HolderB> {
+    holder.scope_shared(|ma| target.scope_shared(|mb| ma.global(ma.alloc(Holder { value, far: Far::new(ma, mb, mb.scope_in(root)) }))))
 }
 
 /// Read the target Item's value through the Holder's Far.
-fn far_value<'h>(holder: &Heap<'h>, target: &Heap<'h>, root: &Global<'h, HolderB>) -> u64 {
-    holder.scope(|ma| target.scope(|mb| ma.get(root).far.get(mb).value))
+fn far_value<'h>(holder: &Heap<'h>, target: &Heap<'h>, root: &ScopeGlobal<'h, 'h, HolderB>) -> u64 {
+    holder.scope_shared(|ma| target.scope_shared(|mb| ma.scope_in(root).far.get(mb).value))
 }
 
 #[test]
@@ -80,10 +80,10 @@ fn far_targets_are_pinned_during_evacuation() {
     // The first quarter of the Items is pointed to directly from A (cannot move); the rest have only roots (can move). Keep one in KEEP and let the rest die ⇒ every block is sparse and an evacuation candidate
     const ITEMS: u64 = if cfg!(miri) { 5_600 } else { 40_000 };
     const KEEP: u64 = 40;
-    let mut a = Heap::new_static(THREADS);
-    let mut b = Heap::new_static(THREADS);
+    let mut a = unsafe { Heap::new_unchecked(THREADS) };
+    let mut b = unsafe { Heap::new_unchecked(THREADS) };
     let drops = Arc::new(AtomicUsize::new(0));
-    let roots: Vec<(u64, Global<'_, ItemB>)> = b.scope(|m| {
+    let roots: Vec<(u64, ScopeGlobal<'_, '_, ItemB>)> = b.scope_shared(|m| {
         let mut kept = Vec::new();
         for value in 0..ITEMS {
             let gc = m.alloc(Item { value, _counted: Counted(drops.clone()) });
@@ -93,25 +93,25 @@ fn far_targets_are_pinned_during_evacuation() {
         }
         kept
     });
-    let held: Vec<(u64, Global<'_, HolderB>)> = roots.iter().filter(|(v, _)| *v < ITEMS / 4).map(|(v, r)| (*v, hold(&a, &b, r, *v))).collect();
+    let held: Vec<(u64, ScopeGlobal<'_, '_, HolderB>)> = roots.iter().filter(|(v, _)| *v < ITEMS / 4).map(|(v, r)| (*v, hold(&a, &b, r, *v))).collect();
     // First pass: the sweep records each block's live bytes; second pass: evacuate the sparse blocks
     b.collect();
     b.collect();
     assert!(b.stats().evacuated_blocks > 0, "the blocks with only roots should be evacuated");
     a.collect();
-    b.scope(|mb| {
-        a.scope(|ma| {
+    b.scope_shared(|mb| {
+        a.scope_shared(|ma| {
             for (value, h) in &held {
-                let via_far = ma.get(h).far.get(mb);
+                let via_far = ma.scope_in(h).far.get(mb);
                 assert_eq!(via_far.value, *value);
                 let root = &roots.iter().find(|(v, _)| v == value).expect("same value").1;
                 // Roots follow the objects that move; those pointed to by a Far must stay put, and both paths reach the same object
-                assert!(ScopeLocal::ptr_eq(mb.get(root), via_far), "an object pointed to by a Far was moved");
+                assert!(ScopeLocal::ptr_eq(mb.scope_in(root), via_far), "an object pointed to by a Far was moved");
             }
         });
     });
     for (value, r) in &roots {
-        assert_eq!(b.scope(|m| m.get(r).value), *value);
+        assert_eq!(b.scope_shared(|m| m.scope_in(r).value), *value);
     }
     let dead = usize::try_from(ITEMS - ITEMS.div_ceil(KEEP)).unwrap();
     assert_eq!(drops.load(Ordering::Relaxed), dead);
@@ -119,8 +119,8 @@ fn far_targets_are_pinned_during_evacuation() {
 
 #[test]
 fn far_keeps_target_until_holder_dies() {
-    let mut a = Heap::new_static(THREADS);
-    let mut b = Heap::new_static(THREADS);
+    let mut a = unsafe { Heap::new_unchecked(THREADS) };
+    let mut b = unsafe { Heap::new_unchecked(THREADS) };
     let drops = Arc::new(AtomicUsize::new(0));
     let target = item(&b, 7, &drops);
     let holder = hold(&a, &b, &target, 1);
@@ -142,8 +142,8 @@ fn far_keeps_target_until_holder_dies() {
 #[test]
 fn far_survives_holder_heap_drop_order() {
     // The target heap is dropped first: the Holder returns its slot when it is finalized later; the root table lives on through its Arc
-    let a = Heap::new_static(THREADS);
-    let b = Heap::new_static(THREADS);
+    let a = unsafe { Heap::new_unchecked(THREADS) };
+    let b = unsafe { Heap::new_unchecked(THREADS) };
     let drops = Arc::new(AtomicUsize::new(0));
     let target = item(&b, 3, &drops);
     let holder = hold(&a, &b, &target, 1);
@@ -155,14 +155,14 @@ fn far_survives_holder_heap_drop_order() {
 }
 
 /// Make a cycle: one Link per heap in `heaps`, the i-th pointing through a Hop directly at the (i+1)-th, the last back to the first. Returns the root of the first Link.
-fn ring(heaps: &[Heap<'static>], drops: &Arc<AtomicUsize>) -> Global<'static, LinkB> {
-    let links: Vec<Global<'_, LinkB>> = heaps.iter().enumerate().map(|(i, h)| h.scope(|m| m.global(m.alloc(Link { heap: i, _counted: Counted(drops.clone()), out: Slot::default() })))).collect();
+fn ring(heaps: &[Heap<'static>], drops: &Arc<AtomicUsize>) -> ScopeGlobal<'static, 'static, LinkB> {
+    let links: Vec<ScopeGlobal<'_, '_, LinkB>> = heaps.iter().enumerate().map(|(i, h)| h.scope_shared(|m| m.global(m.alloc(Link { heap: i, _counted: Counted(drops.clone()), out: Slot::default() })))).collect();
     for i in 0..heaps.len() {
         let j = (i + 1) % heaps.len();
-        heaps[i].scope(|ma| {
-            heaps[j].scope(|mb| {
-                let hop = ma.alloc(Hop { far: Far::new(ma, mb, mb.get(&links[j])) });
-                ma.get(&links[i]).out.set(ma, Some(hop));
+        heaps[i].scope_shared(|ma| {
+            heaps[j].scope_shared(|mb| {
+                let hop = ma.alloc(Hop { far: Far::new(ma, mb, mb.scope_in(&links[j])) });
+                ma.scope_in(&links[i]).out.set(ma, Some(hop));
             });
         });
     }
@@ -170,18 +170,18 @@ fn ring(heaps: &[Heap<'static>], drops: &Arc<AtomicUsize>) -> Global<'static, Li
 }
 
 /// Walk once around the cycle from the first Link and return the heap ids passed.
-fn walk(heaps: &[Heap<'static>], first: &Global<'static, LinkB>) -> Vec<usize> {
-    fn step<'a>(heaps: &[Heap<'static>], at: usize, link: ScopeLocal<'a, Link<'a>>, seen: &mut Vec<usize>) {
+fn walk(heaps: &[Heap<'static>], first: &ScopeGlobal<'static, 'static, LinkB>) -> Vec<usize> {
+    fn step<'a>(heaps: &[Heap<'static>], at: usize, link: ScopeLocal<'static, 'a, Link<'static, 'a>>, seen: &mut Vec<usize>) {
         seen.push(link.heap);
         let next = (at + 1) % heaps.len();
         if next == 0 {
             return;
         }
         let hop = link.out.get().expect("the cycle is linked");
-        heaps[next].scope(|mb| step(heaps, next, hop.far.get(mb), seen));
+        heaps[next].scope_shared(|mb| step(heaps, next, hop.far.get(mb), seen));
     }
     let mut seen = Vec::new();
-    heaps[0].scope(|m| step(heaps, 0, m.get(first), &mut seen));
+    heaps[0].scope_shared(|m| step(heaps, 0, m.scope_in(first), &mut seen));
     seen
 }
 
@@ -214,9 +214,9 @@ fn rings_over_eight_heaps() {
     const RINGS: usize = if cfg!(miri) { 2 } else { 64 };
     let mut hs = heaps(8);
     let drops = Arc::new(AtomicUsize::new(0));
-    let rings: Vec<Global<'_, LinkB>> = (0..RINGS).map(|_| ring(&hs, &drops)).collect();
+    let rings: Vec<ScopeGlobal<'_, '_, LinkB>> = (0..RINGS).map(|_| ring(&hs, &drops)).collect();
     // Keep half
-    let kept: Vec<Global<'_, LinkB>> = rings.into_iter().step_by(2).collect();
+    let kept: Vec<ScopeGlobal<'_, '_, LinkB>> = rings.into_iter().step_by(2).collect();
     let dead = (RINGS - kept.len()) * hs.len();
     // Put only the first 4 heaps in a group: the cycle spans 8 heaps and entries held from outside the group are roots ⇒ nothing is reclaimed
     {
@@ -248,11 +248,11 @@ fn rings_over_eight_heaps() {
 
 /// One board per heap: a row of slots, each holding a Holder (pointing directly at an Item in another heap)
 #[derive(Trace)]
-struct Board<'scope> {
-    cells: Vec<Slot<'scope, Holder<'scope>>>,
+struct Board<'heap, 'scope> {
+    cells: Vec<Slot<'heap, 'scope, Holder<'heap, 'scope>>>,
 }
 
-brand!(BoardB = for<'scope> Board<'scope>);
+brand!(BoardB = for<'heap, 'scope> Board<'heap, 'scope>);
 
 /// A simple linear congruential generator (reproducible tests)
 struct Rng(u64);
@@ -273,7 +273,7 @@ fn eight_threads_relink_far_holders() {
     let mut hs = heaps(HEAPS);
     let drops = Arc::new(AtomicUsize::new(0));
     let made = AtomicUsize::new(0);
-    let boards: Vec<Global<'_, BoardB>> = hs.iter().map(|h| h.scope(|m| m.global(m.alloc(Board { cells: (0..CELLS).map(|_| Slot::default()).collect() })))).collect();
+    let boards: Vec<ScopeGlobal<'_, '_, BoardB>> = hs.iter().map(|h| h.scope_shared(|m| m.global(m.alloc(Board { cells: (0..CELLS).map(|_| Slot::default()).collect() })))).collect();
     for round in 0..ROUNDS {
         std::thread::scope(|s| {
             for t in 0..HEAPS {
@@ -286,20 +286,20 @@ fn eight_threads_relink_far_holders() {
                         let cell = rng.below(CELLS);
                         // Holder value = Item value: reading it back proves the Far still points at the original object
                         let value = ((round * HEAPS + t) * STEPS + step) as u64;
-                        hs[i].scope(|ma| {
-                            hs[j].scope(|mb| {
+                        hs[i].scope_shared(|ma| {
+                            hs[j].scope_shared(|mb| {
                                 let it = mb.alloc(Item { value, _counted: Counted(drops.clone()) });
                                 made.fetch_add(1, Ordering::Relaxed);
                                 let h = ma.alloc(Holder { value, far: Far::new(ma, mb, it) });
-                                ma.get(&boards[i]).cells[cell].set(ma, Some(h));
+                                ma.scope_in(&boards[i]).cells[cell].set(ma, Some(h));
                             });
                         });
                         // Read a cell somewhere else on the way
                         let (k, c) = (rng.below(HEAPS), rng.below(CELLS));
-                        hs[k].scope(|mk| {
-                            if let Some(h) = mk.get(&boards[k]).cells[c].get() {
+                        hs[k].scope_shared(|mk| {
+                            if let Some(h) = mk.scope_in(&boards[k]).cells[c].get() {
                                 let (_, target) = hs.iter().enumerate().find(|&(x, heap)| x != k && h.far.points_into(heap)).expect("the Far points at some other heap");
-                                target.scope(|mt| assert_eq!(h.far.get(mt).value, h.value));
+                                target.scope_shared(|mt| assert_eq!(h.far.get(mt).value, h.value));
                             }
                         });
                     }
@@ -333,15 +333,15 @@ fn eight_threads_relink_far_holders() {
 #[test]
 fn far_targets_are_pinned_during_young_evacuation() {
     const ITEMS: u64 = if cfg!(miri) { 400 } else { 4_000 };
-    let a = Heap::new_static(THREADS);
-    let mut b = Heap::new_static(THREADS);
+    let a = unsafe { Heap::new_unchecked(THREADS) };
+    let mut b = unsafe { Heap::new_unchecked(THREADS) };
     b.set_young_evacuation(YoungEvacuation::Full);
     let drops = Arc::new(AtomicUsize::new(0));
-    let roots: Vec<(u64, Global<'_, ItemB>)> = (0..ITEMS).map(|v| (v, item(&b, v, &drops))).collect();
-    let held: Vec<(u64, Global<'_, HolderB>)> = roots.iter().filter(|(v, _)| v % 2 == 0).map(|(v, r)| (*v, hold(&a, &b, r, *v))).collect();
-    let before: Vec<usize> = b.scope(|m| roots.iter().map(|(_, r)| m.get(r).as_ptr().addr()).collect());
+    let roots: Vec<(u64, ScopeGlobal<'_, '_, ItemB>)> = (0..ITEMS).map(|v| (v, item(&b, v, &drops))).collect();
+    let held: Vec<(u64, ScopeGlobal<'_, '_, HolderB>)> = roots.iter().filter(|(v, _)| v % 2 == 0).map(|(v, r)| (*v, hold(&a, &b, r, *v))).collect();
+    let before: Vec<usize> = b.scope_shared(|m| roots.iter().map(|(_, r)| m.scope_in(r).as_ptr().addr()).collect());
     b.collect_young();
-    let after: Vec<usize> = b.scope(|m| roots.iter().map(|(_, r)| m.get(r).as_ptr().addr()).collect());
+    let after: Vec<usize> = b.scope_shared(|m| roots.iter().map(|(_, r)| m.scope_in(r).as_ptr().addr()).collect());
     for ((value, _), (x, y)) in roots.iter().zip(before.iter().zip(&after)) {
         if value % 2 == 0 {
             assert_eq!(x, y, "a young object pointed to by a Far was moved");
@@ -352,7 +352,7 @@ fn far_targets_are_pinned_during_young_evacuation() {
         assert_eq!(far_value(&a, &b, h), *value);
     }
     for (value, r) in &roots {
-        assert_eq!(b.scope(|m| m.get(r).value), *value);
+        assert_eq!(b.scope_shared(|m| m.scope_in(r).value), *value);
     }
     assert_eq!(drops.load(Ordering::Relaxed), 0);
 }

@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use paragc::{Handle, HandleSlot, Heap, Global, Trace, Tracer, YoungEvacuation, brand};
+use paragc::{Handle, HandleSlot, Heap, ScopeGlobal, Trace, Tracer, YoungEvacuation, brand};
 
 /// Collector threads per heap; 2 under Miri
 const THREADS: NonZeroUsize = NonZeroUsize::new(if cfg!(miri) { 2 } else { 4 }).unwrap();
@@ -31,27 +31,27 @@ struct Item {
 }
 
 #[derive(Trace)]
-struct Keep<'scope> {
-    items: Vec<Handle<'scope, Item>>,
+struct Keep<'heap, 'scope> {
+    items: Vec<Handle<'heap, 'scope, Item>>,
 }
 
-brand!(KeepB = for<'scope> Keep<'scope>);
+brand!(KeepB = for<'heap, 'scope> Keep<'heap, 'scope>);
 
 #[derive(Trace)]
-struct Holder<'scope> {
-    item: HandleSlot<'scope, Item>,
+struct Holder<'heap, 'scope> {
+    item: HandleSlot<'heap, 'scope, Item>,
 }
 
-brand!(HolderB = for<'scope> Holder<'scope>);
+brand!(HolderB = for<'heap, 'scope> Holder<'heap, 'scope>);
 
 fn count(n: u64) -> usize {
     usize::try_from(n).expect("small")
 }
 
 /// Ids and values of the kept handles, and the addresses of their objects
-fn kept<'h>(heap: &Heap<'h>, keep: &Global<'h, KeepB>) -> (Vec<usize>, Vec<u64>, Vec<usize>) {
-    heap.scope(|m| {
-        let items = &m.get(keep).items;
+fn kept<'h>(heap: &Heap<'h>, keep: &ScopeGlobal<'h, 'h, KeepB>) -> (Vec<usize>, Vec<u64>, Vec<usize>) {
+    heap.scope_shared(|m| {
+        let items = &m.scope_in(keep).items;
         (items.iter().map(|h| h.id()).collect(), items.iter().map(|h| h.value).collect(), items.iter().map(|h| h.get().as_ptr().addr()).collect())
     })
 }
@@ -63,9 +63,9 @@ fn handles_stay_while_objects_move() {
     const KEEP_EVERY: u64 = 16;
     for mode in [YoungEvacuation::Off, YoungEvacuation::SkipRemembered, YoungEvacuation::Full] {
         let drops = Arc::new(AtomicUsize::new(0));
-        let mut heap = Heap::new_static(THREADS);
+        let mut heap = unsafe { Heap::new_unchecked(THREADS) };
         heap.set_young_evacuation(mode);
-        let keep = heap.scope(|m| {
+        let keep = heap.scope_shared(|m| {
             let items = (0..N).map(|value| m.alloc_handle(Item { value, tag: Counted(drops.clone()) })).filter(|h| h.value.is_multiple_of(KEEP_EVERY)).collect();
             m.global(m.alloc(Keep { items }))
         });
@@ -92,15 +92,15 @@ fn handles_stay_while_objects_move() {
 fn old_objects_hold_young_handles_without_barrier() {
     for mode in [YoungEvacuation::Off, YoungEvacuation::SkipRemembered, YoungEvacuation::Full] {
         let drops = Arc::new(AtomicUsize::new(0));
-        let mut heap = Heap::new_static(THREADS);
+        let mut heap = unsafe { Heap::new_unchecked(THREADS) };
         heap.set_young_evacuation(mode);
-        let holder: Global<'_, HolderB> = heap.scope(|m| m.global(m.alloc(Holder { item: HandleSlot::default() })));
+        let holder: ScopeGlobal<'_, '_, HolderB> = heap.scope_shared(|m| m.global(m.alloc(Holder { item: HandleSlot::default() })));
         heap.collect();
-        heap.scope(|m| m.get(&holder).item.set(Some(m.alloc_handle(Item { value: 7, tag: Counted(drops.clone()) }))));
+        heap.scope_shared(|m| m.scope_in(&holder).item.set(Some(m.alloc_handle(Item { value: 7, tag: Counted(drops.clone()) }))));
         heap.collect_young();
         heap.collect_young();
-        assert_eq!(heap.scope(|m| m.get(&holder).item.get().map(|h| h.value)), Some(7), "{mode:?}");
-        heap.scope(|m| m.get(&holder).item.set(None));
+        assert_eq!(heap.scope_shared(|m| m.scope_in(&holder).item.get().map(|h| h.value)), Some(7), "{mode:?}");
+        heap.scope_shared(|m| m.scope_in(&holder).item.set(None));
         heap.collect();
         assert_eq!(drops.load(Ordering::Relaxed), 1, "{mode:?}");
     }
@@ -111,9 +111,9 @@ fn old_objects_hold_young_handles_without_barrier() {
 fn dead_entries_are_reused() {
     const N: u64 = 1_000;
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new_static(THREADS);
-    let ids = |heap: &Heap<'static>| -> (Global<'static, KeepB>, HashSet<usize>) {
-        heap.scope(|m| {
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
+    let ids = |heap: &Heap<'static>| -> (ScopeGlobal<'static, 'static, KeepB>, HashSet<usize>) {
+        heap.scope_shared(|m| {
             let items: Vec<_> = (0..N).map(|value| m.alloc_handle(Item { value, tag: Counted(drops.clone()) })).collect();
             let ids = items.iter().map(|h| h.id()).collect();
             (m.global(m.alloc(Keep { items })), ids)
@@ -131,23 +131,23 @@ fn dead_entries_are_reused() {
 #[test]
 fn concurrent_marking_keeps_moved_handles() {
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new_static(THREADS);
-    let (a, b): (Global<'_, HolderB>, Global<'_, HolderB>) = heap.scope(|m| {
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
+    let (a, b): (ScopeGlobal<'_, '_, HolderB>, ScopeGlobal<'_, '_, HolderB>) = heap.scope_shared(|m| {
         let item = m.alloc_handle(Item { value: 5, tag: Counted(drops.clone()) });
         (m.global(m.alloc(Holder { item: item.into() })), m.global(m.alloc(Holder { item: HandleSlot::default() })))
     });
     heap.collect();
     assert!(heap.mark_concurrently());
-    heap.scope(|m| {
-        let (a, b) = (m.get(&a), m.get(&b));
+    heap.scope_shared(|m| {
+        let (a, b) = (m.scope_in(&a), m.scope_in(&b));
         b.item.set(a.item.get());
         a.item.set(None);
     });
     heap.finish_marking();
     heap.sweep_concurrently();
     assert_eq!(drops.load(Ordering::Relaxed), 0);
-    assert_eq!(heap.scope(|m| m.get(&b).item.get().map(|h| h.value)), Some(5));
-    heap.scope(|m| m.get(&b).item.set(None));
+    assert_eq!(heap.scope_shared(|m| m.scope_in(&b).item.get().map(|h| h.value)), Some(5));
+    heap.scope_shared(|m| m.scope_in(&b).item.set(None));
     heap.collect();
     assert_eq!(drops.load(Ordering::Relaxed), 1);
 }
@@ -156,17 +156,17 @@ fn concurrent_marking_keeps_moved_handles() {
 #[test]
 fn ids_turn_back_into_handles() {
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut heap = Heap::new_static(THREADS);
-    let (keep, id): (Global<'_, KeepB>, usize) = heap.scope(|m| {
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
+    let (keep, id): (ScopeGlobal<'_, '_, KeepB>, usize) = heap.scope_shared(|m| {
         let h = m.alloc_handle(Item { value: 9, tag: Counted(drops.clone()) });
         (m.global(m.alloc(Keep { items: vec![h] })), h.id())
     });
     heap.collect();
     heap.collect();
-    heap.scope(|m| {
+    heap.scope_shared(|m| {
         // SAFETY: the id came from a handle that the rooted Keep still holds
-        let h: Handle<'_, Item> = unsafe { Handle::from_id(id) };
-        assert!(h == m.get(&keep).items[0]);
+        let h: Handle<'_, '_, Item> = unsafe { Handle::from_id(id) };
+        assert!(h == m.scope_in(&keep).items[0]);
         assert_eq!(h.value, 9);
     });
 }
