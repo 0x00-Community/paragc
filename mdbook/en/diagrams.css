@@ -1,0 +1,75 @@
+/* Diagrams for the bit-layout and moving chapters: bit fields, byte maps, block grids, timelines.
+   Colours are translucent so they work on every mdBook theme. */
+.dg { margin: 1.4em 0 1.8em; font-size: 0.84em; }
+.dg-cap { font-weight: 600; margin: 0 0 0.45em; }
+.dg-cap code { font-size: 0.95em; }
+.dg-note { opacity: 0.75; font-size: 0.9em; margin-top: 0.45em; }
+
+.bf { display: flex; border: 1px solid var(--table-border-color); border-radius: 8px; overflow: hidden; }
+.bf + .bf { margin-top: 0.5em; }
+.bf > div {
+  flex: var(--w, 1) 1 0; min-width: 2.9em; padding: 0.5em 0.35em;
+  display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 0.15em;
+  border-left: 1px solid var(--table-border-color); text-align: center; line-height: 1.25;
+}
+.bf > div:first-child { border-left: 0; }
+.bf b { font-family: var(--mono-font, monospace); font-weight: 600; }
+.bf small { opacity: 0.7; font-size: 0.82em; }
+.bf i { font-style: normal; opacity: 0.6; font-size: 0.78em; font-family: var(--mono-font, monospace); }
+.bf .dim { background: repeating-linear-gradient(135deg, transparent 0 6px, rgba(127, 127, 127, 0.12) 6px 12px); }
+
+.ruler { display: flex; justify-content: space-between; font-family: var(--mono-font, monospace); font-size: 0.75em; opacity: 0.55; margin-top: 0.2em; }
+
+.k1 { background: rgba(59, 130, 246, 0.18); }
+.k2 { background: rgba(16, 185, 129, 0.18); }
+.k3 { background: rgba(245, 158, 11, 0.2); }
+.k4 { background: rgba(236, 72, 153, 0.16); }
+.k5 { background: rgba(139, 92, 246, 0.18); }
+.k6 { background: rgba(20, 184, 166, 0.18); }
+.k7 { background: rgba(239, 68, 68, 0.16); }
+
+.blk { display: grid; grid-template-columns: repeat(16, 1fr); gap: 3px; max-width: 30em; }
+.blk span { aspect-ratio: 1; border-radius: 3px; border: 1px solid var(--table-border-color); }
+.blk .live { background: rgba(16, 185, 129, 0.55); }
+.blk .old { background: rgba(127, 127, 127, 0.18); }
+.blk .free { background: transparent; }
+.legend { display: flex; flex-wrap: wrap; gap: 1.2em; margin-top: 0.6em; font-size: 0.9em; }
+.legend span::before { content: ""; display: inline-block; width: 0.9em; height: 0.9em; border-radius: 3px; margin-right: 0.4em; vertical-align: -0.1em; border: 1px solid var(--table-border-color); }
+.legend .live::before { background: rgba(16, 185, 129, 0.55); }
+.legend .old::before { background: rgba(127, 127, 127, 0.18); }
+.legend .free::before { background: transparent; }
+
+.gran { display: grid; grid-template-columns: repeat(32, 1fr); gap: 2px; }
+.gran span { height: 1.7em; border-radius: 2px; }
+.gran.bits span { height: 1.1em; border: 1px solid var(--table-border-color); font-family: var(--mono-font, monospace); font-size: 0.75em; display: flex; align-items: center; justify-content: center; }
+.gran.bits .on { background: rgba(59, 130, 246, 0.55); color: #fff; }
+
+.chips { display: grid; grid-template-columns: repeat(auto-fill, minmax(10.5em, 1fr)); gap: 0.45em; }
+.chip { border: 1px solid var(--table-border-color); border-radius: 8px; padding: 0.45em 0.6em; display: flex; flex-direction: column; gap: 0.1em; }
+.chip b { font-family: var(--mono-font, monospace); }
+.chip small { opacity: 0.75; }
+.chip.ptr { border-color: rgba(59, 130, 246, 0.7); background: rgba(59, 130, 246, 0.12); }
+
+.flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0.3em; }
+.flow .step { flex: 1 1 11em; border: 1px solid var(--table-border-color); border-radius: 10px; padding: 0.7em 0.8em; display: flex; flex-direction: column; gap: 0.3em; }
+.flow .step h5 { margin: 0; font-size: 1em; }
+.flow .step .addr { font-family: var(--mono-font, monospace); font-size: 0.9em; padding: 0.15em 0.4em; border-radius: 4px; align-self: flex-start; }
+.flow .step p { margin: 0; font-size: 0.92em; opacity: 0.85; }
+.flow .arrow { align-self: center; font-size: 1.4em; opacity: 0.5; }
+
+.swap { display: grid; grid-template-columns: auto 1fr; gap: 0.5em 0.8em; align-items: center; }
+.swap > span { font-size: 0.9em; opacity: 0.8; white-space: nowrap; }
+
+@media (max-width: 640px) {
+  .bf > div { min-width: 2.2em; padding: 0.4em 0.15em; }
+  .flow .arrow { display: none; }
+}
+
+.bf.ruled { overflow: visible; margin-bottom: 1.5em; }
+.bf.ruled > div { position: relative; }
+.bf.ruled > div:first-child { border-radius: 8px 0 0 8px; }
+.bf.ruled > div:last-child { border-radius: 0 8px 8px 0; }
+.bf u { position: absolute; left: -1px; top: calc(100% + 0.3em); text-decoration: none; font-family: var(--mono-font, monospace); font-size: 0.78em; opacity: 0.6; white-space: nowrap; border-left: 1px solid currentColor; padding-left: 0.25em; line-height: 1.1; }
+.bf u.end { left: auto; right: -1px; border-left: 0; border-right: 1px solid currentColor; padding: 0 0.25em 0 0; }
+.bf.exact > div { min-width: 0; }
+.dg-sub { font-size: 0.85em; opacity: 0.75; margin: 0.4em 0 0.3em; }
