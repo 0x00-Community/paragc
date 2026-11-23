@@ -19,6 +19,7 @@
 # 私有堆
 
 - [块、行与对象头](layout.md)
+- [比特布局](bits.md)
 - [分配](allocation.md)
 - [标记与线程池](marking.md)
 - [清扫](sweeping.md)
@@ -35,6 +36,7 @@
 # 跨堆（Linux，feature `crossheap`）
 
 - [概览](crossheap.md)
+- [一个 JS 对象怎么跨进程](walkthrough.md)
 - [地址空间与文件布局](crossheap-layout.md)
 - [对象、类型与指针图](crossheap-objects.md)
 - [进程、崩溃与寿命](crossheap-processes.md)

@@ -19,6 +19,7 @@
 # The private heap
 
 - [Blocks, lines and headers](layout.md)
+- [Bit layouts](bits.md)
 - [Allocation](allocation.md)
 - [Marking and the thread pool](marking.md)
 - [Sweeping](sweeping.md)
@@ -35,6 +36,7 @@
 # Cross-heap (Linux, feature `crossheap`)
 
 - [Overview](crossheap.md)
+- [Sharing a JS object, step by step](walkthrough.md)
 - [Address space and file layout](crossheap-layout.md)
 - [Objects, types and pointer maps](crossheap-objects.md)
 - [Processes, crashes and lifetime](crossheap-processes.md)
