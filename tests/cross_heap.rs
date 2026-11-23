@@ -800,6 +800,7 @@ fn in_fixed(addr: usize) -> bool {
 fn promotion_into_attached_cross_heap() {
     young_survivors_promote_into_attached_cross_heap();
     private_writes_into_cross_heap_objects_wait_for_the_next_young_collection();
+    tails_travel_with_their_objects();
 }
 
 fn young_survivors_promote_into_attached_cross_heap() {
@@ -883,4 +884,58 @@ fn private_writes_into_cross_heap_objects_wait_for_the_next_young_collection() {
     drop(root);
     heap.collect();
     assert_eq!(cross.stats().live, 0);
+}
+
+/// A byte string kept in the tail after its length
+#[repr(C)]
+#[derive(Trace, Shared)]
+struct Bytes {
+    len: u64,
+}
+
+brand!(BytesB = for<'gc> Bytes);
+
+impl Bytes {
+    fn tail(&self) -> &[u8] {
+        // SAFETY: allocated with alloc_tail / alloc_shared_tail and len bytes of tail
+        unsafe { std::slice::from_raw_parts((&raw const *self).add(1).cast::<u8>(), usize::try_from(self.len).unwrap()) }
+    }
+
+    fn fill(len: usize) -> impl FnOnce(&mut [std::mem::MaybeUninit<u8>]) {
+        move |tail| {
+            assert_eq!(tail.len(), len);
+            for (i, b) in tail.iter_mut().enumerate() {
+                b.write(u8::try_from(i % 251).unwrap());
+            }
+        }
+    }
+
+    fn intact(&self) -> bool {
+        self.tail().iter().enumerate().all(|(i, &b)| usize::from(b) == i % 251)
+    }
+}
+
+fn tails_travel_with_their_objects() {
+    const SMALL: usize = 1000;
+    const BIG: usize = 300_000;
+    let space = CrossHeapSpace::reserve_fixed().unwrap();
+    let cross = space.create_anonymous(THREADS).unwrap();
+    let mut heap = Heap::new(THREADS);
+    heap.attach_cross_heap(&cross).unwrap();
+    let roots = heap.mutate(|m| {
+        let len = |n: usize| u64::try_from(n).unwrap();
+        [
+            m.root::<BytesB>(m.alloc_shared_tail(Bytes { len: len(SMALL) }, SMALL, Bytes::fill(SMALL))),
+            m.root::<BytesB>(m.alloc_shared_tail(Bytes { len: len(BIG) }, BIG, Bytes::fill(BIG))),
+            m.root::<BytesB>(m.alloc_tail(Bytes { len: len(SMALL) }, SMALL, Bytes::fill(SMALL))),
+        ]
+    });
+    heap.collect_young();
+    heap.collect();
+    heap.mutate(|m| {
+        let [small, big, private] = roots.each_ref().map(|r| m.get(r));
+        assert!(in_fixed(small.as_ptr().addr()) && in_fixed(big.as_ptr().addr()), "shareable tails were promoted");
+        assert!(!in_fixed(private.as_ptr().addr()));
+        assert!(small.intact() && big.intact() && private.intact(), "the tails came along unchanged");
+    });
 }

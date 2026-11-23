@@ -18,6 +18,7 @@
 use core::any::type_name;
 use core::cell::Cell;
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::num::{NonZeroU32, NonZeroUsize};
 use core::ptr::{NonNull, null_mut};
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -1132,19 +1133,31 @@ impl<'gc> Mutator<'gc> {
 
     /// Allocate an object.
     pub fn alloc<T: Trace + 'gc>(&self, value: T) -> Gc<'gc, T> {
-        self.alloc_with(value, Header::new::<T>)
+        self.alloc_with(value, Header::new::<T>, 0, |_| {})
+    }
+
+    /// Allocate an object followed by `tail` bytes of plain data (no pointers: the collector never looks inside, and copies them with the object when it moves or is promoted).
+    /// The tail starts `size_of::<T>()` bytes after the data pointer; `fill` writes all of it before the object is reachable. `T` keeps the tail's length itself.
+    pub fn alloc_tail<T: Trace + 'gc>(&self, value: T, tail: usize, fill: impl FnOnce(&mut [MaybeUninit<u8>])) -> Gc<'gc, T> {
+        self.alloc_with(value, Header::new::<T>, tail, fill)
     }
 
     /// Allocate a shareable object (its type is also [`Shared`], with no destructor): when a cross-heap is attached ([`Heap::attach_cross_heap`]),
     /// it is promoted into the cross-heap once it survives a young collection, and other processes can find it by signature or weak reference. Its edges may only point at shareable objects.
     #[cfg(crossheap)]
     pub fn alloc_shared<T: Trace + Shared + 'gc>(&self, value: T) -> Gc<'gc, T> {
-        self.alloc_with(value, Header::new_shared::<T>)
+        self.alloc_with(value, Header::new_shared::<T>, 0, |_| {})
     }
 
-    fn alloc_with<T: Trace + 'gc>(&self, value: T, header: fn(usize, bool, u32) -> Header) -> Gc<'gc, T> {
+    /// [`Mutator::alloc_tail`] for a shareable object: the tail goes with it into the cross-heap.
+    #[cfg(crossheap)]
+    pub fn alloc_shared_tail<T: Trace + Shared + 'gc>(&self, value: T, tail: usize, fill: impl FnOnce(&mut [MaybeUninit<u8>])) -> Gc<'gc, T> {
+        self.alloc_with(value, Header::new_shared::<T>, tail, fill)
+    }
+
+    fn alloc_with<T: Trace + 'gc>(&self, value: T, header: fn(usize, bool, u32) -> Header, tail: usize, fill: impl FnOnce(&mut [MaybeUninit<u8>])) -> Gc<'gc, T> {
         const { assert!(align_of::<T>() <= GRANULE, "object data alignment must not exceed 8 bytes") };
-        let bytes = (HEADER + size_of::<T>()).next_multiple_of(GRANULE);
+        let bytes = (HEADER + size_of::<T>() + tail).next_multiple_of(GRANULE);
         let large = bytes > LARGE;
         let p = if large { self.heap.alloc_large(bytes) } else { self.alloc_small(bytes) };
         // Normally: young (mark 0 ≠ the last completed epoch; it lives in a block swept before being handed out, or a new one, so the sweep in progress never touches it).
@@ -1162,6 +1175,7 @@ impl<'gc> Mutator<'gc> {
             p.cast::<Header>().write(header(bytes, large, mark));
             let data = Header::data(p.cast()).cast::<T>();
             data.write(value);
+            fill(core::slice::from_raw_parts_mut(data.add(1).cast::<MaybeUninit<u8>>(), tail));
             Gc::from_data(data)
         }
     }
