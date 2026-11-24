@@ -74,6 +74,8 @@ enum Role {
     Create,
     /// A member of the eight-process scenario: one public heap + one private heap, referencing the others' public heaps; acts on commands from standard input (see [`Pair`])
     Pair,
+    /// Create a persisted heap at [`PATH`] attached to a private heap as its old generation, promote a chain of [`Owned`] nodes into it, persist the head and print [`CREATED`]; then exit or wait to be killed
+    Own,
 }
 
 impl Role {
@@ -85,6 +87,7 @@ impl Role {
             Self::CollectForever => "collect-forever",
             Self::Create => "create",
             Self::Pair => "pair",
+            Self::Own => "own",
         }
     }
 }
@@ -93,7 +96,7 @@ impl FromStr for Role {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, String> {
-        [Self::Churn, Self::ChurnForever, Self::Hold, Self::CollectForever, Self::Create, Self::Pair].into_iter().find(|r| r.name() == s).ok_or_else(|| format!("unknown child role {s}"))
+        [Self::Churn, Self::ChurnForever, Self::Hold, Self::CollectForever, Self::Create, Self::Pair, Self::Own].into_iter().find(|r| r.name() == s).ok_or_else(|| format!("unknown child role {s}"))
     }
 }
 
@@ -257,6 +260,10 @@ fn child() {
         Pair::run(&space, &path, chain);
         return;
     }
+    if let Role::Own = role {
+        Owned::create(&path, rounds);
+        return;
+    }
     if let Role::Create = role {
         let heap = unsafe { space.create_unchecked(&path, THREADS) }.unwrap();
         let chain = heap.scope(|m| {
@@ -330,7 +337,7 @@ fn child() {
                 heap.collect();
             }
         }
-        Role::Create | Role::Pair => unreachable!("handled above"),
+        Role::Create | Role::Pair | Role::Own => unreachable!("handled above"),
     }
 }
 
@@ -857,5 +864,114 @@ fn simultaneous_creates_get_distinct_numbers() {
             k.kill();
         }
         assert!(unique, "round {round}: heap numbers created at the same time collided: {numbers:?}");
+    }
+}
+
+/// A private object the owner's chain points at (never promoted)
+#[derive(Trace)]
+struct Private {
+    value: u64,
+}
+
+/// A shareable key reached through a cross-heap handle
+#[repr(C)]
+#[derive(Trace, Shared)]
+struct OwnedKey {
+    value: u64,
+}
+
+/// A node promoted from the owner's private heap: a private edge (pinned slot) and a cross-heap handle
+#[repr(C)]
+#[derive(Trace, Shared)]
+struct Owned<'heap, 'scope> {
+    value: u64,
+    private: paragc::Slot<'heap, 'scope, Private>,
+    key: paragc::HandleSlot<'heap, 'scope, OwnedKey>,
+    next: paragc::Slot<'heap, 'scope, Owned<'heap, 'scope>>,
+}
+
+brand!(OwnedB = for<'heap, 'scope> Owned<'heap, 'scope>);
+cross_heap_brand!(OwnedX = for<'heap, 'scope> Owned<'heap, 'scope>);
+
+const OWNED_LEN: u64 = 1000;
+
+impl Owned<'_, '_> {
+    fn create(path: &Path, rounds: u64) {
+        let space = CrossHeapSpace::reserve_fixed().unwrap();
+        let cross = unsafe { space.create_unchecked(path, THREADS) }.unwrap();
+        let mut heap = unsafe { Heap::new_unchecked(THREADS) };
+        heap.attach_cross_heap(&cross).unwrap();
+        let root = heap.scope(|m| {
+            let mut top = None;
+            for value in 0..OWNED_LEN {
+                let private = m.alloc(Private { value });
+                let key = m.alloc_shared_handle(OwnedKey { value: 2 * value });
+                top = Some(m.alloc_shared(Owned { value, private: Some(private).into(), key: key.into(), next: top.into() }));
+            }
+            m.global::<OwnedB>(top.unwrap())
+        });
+        heap.collect_young();
+        let index = heap.scope(|m| cross.scope(|cm| cm.adopt::<OwnedX, _>(m.scope_in(&root)).map(|n| cm.global::<OwnedX>(n).persist()))).expect("the head was promoted");
+        cross.persist();
+        println!("{CREATED}{index} {}", cross.id());
+        if rounds != STAY {
+            drop(root);
+            std::mem::forget(heap);
+            return;
+        }
+        println!("{READY}");
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    /// Sum of values and of key values along the chain, and how many private edges are left.
+    fn walk(cross: &CrossHeap<'_>, index: u32) -> (u64, u64, usize) {
+        let head: CrossHeapGlobal<'_, OwnedX> = cross.scope(|m| m.find(index)).expect("the persisted head");
+        cross.scope(|m| {
+            let (mut sum, mut keys, mut private, mut cur) = (0, 0, 0, Some(head.get(m)));
+            while let Some(n) = cur {
+                sum += n.value;
+                keys += n.key.get().expect("every node keeps its key").value;
+                private += usize::from(n.private.get().is_some());
+                cur = n.next.get().and_then(|p| m.adopt::<OwnedX, _>(p));
+            }
+            (sum, keys, private)
+        })
+    }
+}
+
+/// A new owner takes over a persisted heap after the old one is gone (exited or killed): values and handles intact, the old owner's private edges cleared, and it collects as owner.
+#[test]
+fn new_owner_takes_over_a_persisted_heap() {
+    let dir = Dir::new("takeover");
+    for (name, rounds) in [("exited", 0), ("killed", STAY)] {
+        let path = dir.file(name);
+        let mut kid = Kid::spawn(Role::Own, &path, 0, 0, rounds, true);
+        let (index, _) = created(&mut kid);
+        if rounds == STAY {
+            kid.line(READY);
+            kid.kill();
+        } else {
+            assert!(kid.child.wait().unwrap().success());
+        }
+        let space = CrossHeapSpace::reserve_fixed().unwrap();
+        let cross = unsafe { space.open_unchecked(&path, THREADS) }.unwrap();
+        let mut heap = unsafe { Heap::new_unchecked(THREADS) };
+        heap.attach_cross_heap(&cross).expect("a persisted heap whose owner is gone can be taken over");
+        let total = OWNED_LEN * (OWNED_LEN - 1) / 2;
+        assert_eq!(Owned::walk(&cross, index), (total, 2 * total, 0), "values and handles survive, the old owner's private edges are cleared");
+        heap.collect();
+        heap.collect();
+        assert_eq!(Owned::walk(&cross, index), (total, 2 * total, 0), "the new owner collects it");
+        let node = (HEADER + size_of::<Owned<'static, 'static>>()).next_multiple_of(8);
+        let key = (HEADER + size_of::<OwnedKey>()).next_multiple_of(8);
+        assert_eq!(cross.stats().live, usize::try_from(OWNED_LEN).unwrap() * (node + key));
+        assert!(cross.scope(|m| m.release(index)));
+        heap.collect();
+        assert_eq!(cross.stats().live, 0);
+        let second = Heap::attach_cross_heap(&mut unsafe { Heap::new_unchecked(THREADS) }, &cross);
+        assert!(second.is_ok(), "this process owns it now");
+        drop(heap);
     }
 }

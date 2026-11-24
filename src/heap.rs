@@ -278,12 +278,10 @@ impl<'heap> Heap<'heap> {
         if !inner.space.is_fixed() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "a cross-heap used as the old generation must be created in the fixed-address region (CrossHeapSpace::reserve_fixed)"));
         }
-        if inner.sup().owner_pid.load(Ordering::Acquire) != Process::current().pid {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "only a cross-heap created by this process can be attached"));
-        }
         if self.cross.is_some() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "a cross-heap is already attached"));
         }
+        inner.take_over()?;
         inner.sup().owner_only.store(1, Ordering::Release);
         self.cross = Some(CrossHeap(Arc::clone(inner), PhantomData));
         Ok(())
@@ -1840,6 +1838,41 @@ impl Inner {
             return;
         }
         self.collect_rooted(&[], shrink, None);
+    }
+
+    /// Become the owner: nothing to do for a heap this process created; a persisted heap whose owner is gone is taken over (a new owner continuing after a restart).
+    /// Taking over collects it from its own entries (whatever only the old owner's private heap held dies), returns handle entries still pointing at the old owner's private objects,
+    /// and clears every slot pointing outside the region: those were the old owner's private addresses, meaningless here. Then this process is recorded as the owner.
+    fn take_over(&self) -> io::Result<()> {
+        let sup = self.sup();
+        let me = Process::current();
+        let owner = Process { pid: sup.owner_pid.load(Ordering::Acquire), start: sup.owner_start.load(Ordering::Acquire) };
+        if owner.pid == me.pid {
+            return Ok(());
+        }
+        if sup.persist.load(Ordering::Acquire) == 0 || !self.is_alive() {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "only a cross-heap created by this process, or a persisted one whose owner is gone, can be attached"));
+        }
+        if owner.alive() {
+            return Err(io::Error::new(io::ErrorKind::ResourceBusy, "the cross-heap's owner is still running"));
+        }
+        let mut retry = Retry::new();
+        while !(self.claim_collection(false) && self.drain()) {
+            self.release();
+            retry.pause();
+        }
+        self.reap_dead();
+        sup.owner_only.store(0, Ordering::Release);
+        let private = Injector::new();
+        Self::collect_members(&[self], &[], false, Some(&private));
+        for slot in crate::Heap::drain(&private) {
+            // SAFETY: a pointer slot (one AtomicU64 first) of a live object of this heap, found by the marking that just finished; nobody else is inside
+            unsafe { &*core::ptr::with_exposed_provenance::<AtomicU64>(slot) }.store(0, Ordering::Release);
+        }
+        sup.owner_start.store(me.start, Ordering::Release);
+        sup.owner_pid.store(me.pid, Ordering::Release);
+        self.release();
+        Ok(())
     }
 
     /// Collection by the owner (the private heap it is attached to): `extra` holds data addresses of this heap's objects traced from the private heap, also roots. Returns this round's epoch
