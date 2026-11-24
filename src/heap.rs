@@ -300,6 +300,8 @@ impl<'heap> Heap<'heap> {
         let (epoch, pins) = cross.0.collect_owned(&extra, *self.shrinking.get_mut());
         // SAFETY: no mutators
         unsafe { self.weaks.clear_crossed(|p| Inner::survived(p, epoch)) };
+        // SAFETY: as above
+        unsafe { self.handles.reap_crossed(|p| Inner::survived(p, epoch)) };
         let parity = *self.rc_parity.get_mut();
         self.settle_pins(pins, parity);
     }
