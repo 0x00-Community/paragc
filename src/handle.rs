@@ -431,8 +431,9 @@ macro_rules! brand {
     };
 }
 
-/// A root slot: the object header pointer (null when free) + the holder.
+/// A root slot: the object header pointer (null when free) + the holder. The pointer comes first: a cross-heap handle entry is read through this type (see [`crate::Scope::alloc_shared_handle`]).
 #[derive(Default)]
+#[repr(C)]
 pub struct Entry {
     ptr: AtomicPtr<Header>,
     /// The heap holding this root (the identity of the heap the [`crate::Far`] lives in); [`NO_HOLDER`] for a plain [`ScopeGlobal`]
@@ -694,6 +695,10 @@ pub trait HandleInternal {
 
     /// The entry's current header.
     fn header(self) -> *const Header;
+
+    /// The entry's address.
+    #[cfg(crossheap)]
+    fn entry_addr(self) -> usize;
 }
 
 impl<T> HandleInternal for Handle<'_, '_, T> {
@@ -704,6 +709,11 @@ impl<T> HandleInternal for Handle<'_, '_, T> {
     fn header(self) -> *const Header {
         // SAFETY: entries live as long as the heap, and the brand keeps this handle inside one of its scopes
         unsafe { self.entry.as_ref() }.load()
+    }
+
+    #[cfg(crossheap)]
+    fn entry_addr(self) -> usize {
+        self.entry.as_ptr().addr()
     }
 }
 
@@ -748,6 +758,7 @@ impl<T: fmt::Debug> fmt::Debug for Handle<'_, '_, T> {
 }
 
 /// A rewritable field holding a [`Handle`] or nothing. Writing needs no mutator and no barrier.
+#[repr(transparent)]
 pub struct HandleSlot<'heap, 'scope, T> {
     entry: AtomicPtr<Entry>,
     _brand: LocalBrand<'heap, 'scope, T>,
@@ -992,9 +1003,13 @@ pub const WORD_EDGE: u32 = 1 << 30;
 /// An offset in the pointer map with this bit is a nullable raw pointer ([`ScopeLocal`], `Option<ScopeLocal>`) holding the object data's absolute address
 #[cfg(crossheap)]
 pub const PTR_EDGE: u32 = 1 << 29;
+/// An offset in the pointer map with this bit is a [`Handle`] / [`HandleSlot`]: the address of an entry of this heap's entry table holding the handle object's absolute header address
+/// (see [`crate::Scope::alloc_shared_handle`])
+#[cfg(crossheap)]
+pub const HANDLE_EDGE: u32 = 1 << 28;
 /// The bits of a pointer map offset that give the kind of edge
 #[cfg(crossheap)]
-pub const EDGE_KINDS: u32 = FAR_EDGE | WORD_EDGE | PTR_EDGE;
+pub const EDGE_KINDS: u32 = FAR_EDGE | WORD_EDGE | PTR_EDGE | HANDLE_EDGE;
 
 /// A type's pointer map: the byte offset of every pointer slot in the object data.
 #[derive(Default)]
@@ -1022,6 +1037,11 @@ impl EdgeMap {
         self.0.push(at | PTR_EDGE);
     }
 
+    /// A nullable entry address ([`Handle`], [`HandleSlot`]).
+    pub fn handle(&mut self, at: u32) {
+        self.0.push(at | HANDLE_EDGE);
+    }
+
     /// Every offset reported (the [`FAR_EDGE`] bit marks cross-heap ones).
     pub fn as_slice(&self) -> &[u32] {
         &self.0
@@ -1029,7 +1049,23 @@ impl EdgeMap {
 
     /// Turn a field offset into a pointer map offset (for the derive).
     pub fn offset(bytes: usize) -> u32 {
-        u32::try_from(bytes).ok().filter(|&b| b & EDGE_KINDS == 0).expect("public heap objects are at most 512 MiB")
+        u32::try_from(bytes).ok().filter(|&b| b & EDGE_KINDS == 0).expect("public heap objects are at most 256 MiB")
+    }
+}
+
+// SAFETY: a handle is the address of its entry
+#[cfg(crossheap)]
+unsafe impl<T: Send + Sync> Shared for Handle<'_, '_, T> {
+    fn edges(map: &mut EdgeMap, at: u32) {
+        map.handle(at);
+    }
+}
+
+// SAFETY: a handle slot is a nullable entry address
+#[cfg(crossheap)]
+unsafe impl<T: Send + Sync> Shared for HandleSlot<'_, '_, T> {
+    fn edges(map: &mut EdgeMap, at: u32) {
+        map.handle(at);
     }
 }
 
