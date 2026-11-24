@@ -505,6 +505,18 @@ impl RootTable {
         }
     }
 
+    /// A handle table after a cross-heap collection: entries of cross-heap objects that `alive` says are dead are cleared and reused. SAFETY (caller): no mutators.
+    #[cfg(crossheap)]
+    pub unsafe fn reap_crossed(&self, alive: impl Fn(*mut u8) -> bool) {
+        for (i, slot) in self.slots.iter().enumerate() {
+            let p = slot.load();
+            if !p.is_null() && Self::crossed(p) && !alive(Header::data(p)) {
+                slot.store(null_mut());
+                self.returned.push(i);
+            }
+        }
+    }
+
     /// Take a slot for `header` (only inside one of this heap's scopes). `holder`: the holder heap, [`NO_HOLDER`] for a plain root.
     pub fn claim(&self, header: *const Header, holder: usize) -> usize {
         // SAFETY: ready does not change during a scope
@@ -592,15 +604,18 @@ impl RootTable {
 
     /// The handle table after marking and before sweeping: entries whose object was not marked with `epoch` are cleared and reused, moved ones rewritten to the new address, and live objects
     /// get stuck counts (handles are not counted, so reference counting must never release an object with an entry). SAFETY (caller): as [`RootTable::clear_unreached`].
+    /// Entries of objects promoted into a cross-heap are rewritten to the new place and then left to [`RootTable::reap_crossed`] (the private heap never marks or counts them).
     pub unsafe fn reap(&self, epoch: u32, parity: bool) {
         for (i, slot) in self.slots.iter().enumerate() {
             let old = slot.load();
-            if old.is_null() {
+            if old.is_null() || Self::crossed(old) {
                 continue;
             }
             if let Some(new) = Header::survivor(old, epoch) {
-                // SAFETY: a live object
-                unsafe { &*new }.rc_stick(parity);
+                if !Self::crossed(new) {
+                    // SAFETY: a live object
+                    unsafe { &*new }.rc_stick(parity);
+                }
                 slot.store(new.cast_mut());
             } else {
                 slot.store(null_mut());
@@ -623,7 +638,8 @@ impl RootTable {
                 continue;
             }
             let new = Header::survivor(old, epoch);
-            if let Some(new) = new {
+            // A target just promoted into a cross-heap is not counted by the private heap (its header is not a private one)
+            if let Some(new) = new.filter(|&n| !Self::crossed(n)) {
                 // SAFETY: a live object
                 unsafe { &*new }.rc_stick(parity);
             }

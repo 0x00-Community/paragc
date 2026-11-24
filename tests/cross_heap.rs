@@ -803,6 +803,7 @@ fn promotion_into_attached_cross_heap() {
     tails_travel_with_their_objects();
     cross_heap_objects_keep_private_edges();
     handles_live_in_the_cross_heap();
+    small_tails_of_handles_survive_promotion();
 }
 
 fn young_survivors_promote_into_attached_cross_heap() {
@@ -1147,4 +1148,47 @@ fn handles_live_in_the_cross_heap() {
     let ids: Vec<usize> = before.iter().map(|&(id, _)| id).collect();
     let reused = heap.scope(|m| m.alloc_shared_handle(Key { value: 9 }).id());
     assert!(ids.contains(&reused), "dead handles returned their entries");
+    let (bytes, id) = heap.scope(|m| {
+        let b = m.alloc_shared_handle_tail(Bytes { len: 5000 }, 5000, Bytes::fill(5000));
+        (m.global::<BytesB>(b.get()), b.id())
+    });
+    heap.collect_young();
+    heap.scope(|m| {
+        let b = m.scope_in(&bytes);
+        assert!(in_fixed(b.as_ptr().addr()) && b.intact(), "a handle object's tail moves over with it");
+        assert_eq!(unsafe { paragc::Handle::<Bytes>::from_id(id) }.get().as_ptr(), b.as_ptr(), "the handle follows it");
+    });
+}
+
+fn small_tails_of_handles_survive_promotion() {
+    let space = CrossHeapSpace::reserve_fixed().unwrap();
+    let cross = unsafe { space.create_anonymous_unchecked(THREADS) }.unwrap();
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
+    // Handles taken before the cross-heap is attached live in the private handle table; their objects are promoted all the same
+    let early = heap.scope(|m| (0..50usize).map(|i| m.global::<BytesB>(m.alloc_shared_handle_tail(Bytes { len: 24 + i as u64 }, 24 + i, Bytes::fill(24 + i)).get())).collect::<Vec<_>>());
+    heap.attach_cross_heap(&cross).unwrap();
+    let all = heap.scope(|m| {
+        (0..2000usize)
+            .map(|i| {
+                let len = 8 + i % 40;
+                let g = if i % 2 == 0 { m.alloc_shared_handle_tail(Bytes { len: len as u64 }, len, Bytes::fill(len)).get() } else { m.alloc_shared_tail(Bytes { len: len as u64 }, len, Bytes::fill(len)) };
+                m.alloc(Secret { value: i as u64, next: None.into() });
+                std::mem::forget(m.weak::<BytesB>(g));
+                m.global::<BytesB>(g)
+            })
+            .collect::<Vec<_>>()
+    });
+    heap.collect();
+    heap.collect();
+    heap.scope(|m| {
+        for (i, g) in all.iter().enumerate() {
+            let b = m.scope_in(g);
+            assert!(in_fixed(b.as_ptr().addr()), "{i} promoted");
+            assert!(b.intact(), "{i}: tail of {} bytes intact", b.len);
+        }
+        assert!(early.iter().all(|g| m.scope_in(g).intact()));
+    });
+    drop((all, early));
+    heap.collect();
+    assert_eq!(cross.stats().live, 0);
 }
