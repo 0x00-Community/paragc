@@ -100,6 +100,20 @@ pub struct Tracer<'t> {
     /// The owner collecting its cross-heap: traced edges into cross-heap objects (data addresses) are reported here as cross-heap roots
     #[cfg(crossheap)]
     crossing: Option<&'t Injector<usize>>,
+    /// Promoting: slots of cross-heap objects left pointing at private objects that cannot be promoted (addresses) are reported here
+    #[cfg(crossheap)]
+    pins: Option<&'t Injector<usize>>,
+    /// The kind of edge being forwarded: from a cross-heap object, the target of a slot may stay private (a pinned slot), the target of a raw pointer may not
+    #[cfg(crossheap)]
+    edge: EdgeKind,
+}
+
+/// See [`Tracer::edge`]
+#[cfg(crossheap)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EdgeKind {
+    Pointer,
+    Slot,
 }
 
 /// Marks a promoted object in the work queue (headers are granule aligned, so the lowest bit is free): the item is the old header, and the copy in the cross-heap is what gets relocated
@@ -188,6 +202,16 @@ impl Tracer<'_> {
         self.answer.take()
     }
 
+    /// After forwarding a slot's target: a slot of a cross-heap object still pointing at a private object is pinned (reported to the owner, which keeps the target alive and in place).
+    fn pin(&self, raw: &RawSlot) {
+        if let Some(pins) = self.pins
+            && raw.current().is_some()
+            && Region::holds_fixed((&raw const *raw).addr())
+        {
+            pins.push((&raw const *raw).expose_provenance());
+        }
+    }
+
     /// A shareable young object in a young collection: promote it into the cross-heap and return its new location (computed as a private header, see [`Promoter::copy`]).
     fn promote(&mut self, header: *const Header, no_edges: bool) -> Option<*const Header> {
         let p = self.promoter?;
@@ -261,6 +285,20 @@ pub trait TracerInternal<'t> {
     fn scan(&mut self, item: usize);
 }
 
+impl Tracer<'_> {
+    /// [`TracerInternal::forward`] for the target of a slot: from a cross-heap object it may stay private (pinned) instead of failing.
+    fn forward_slot(&mut self, header: *const Header, no_edges: bool) -> *const Header {
+        #[cfg(crossheap)]
+        let was = core::mem::replace(&mut self.edge, EdgeKind::Slot);
+        let to = self.forward(header, no_edges);
+        #[cfg(crossheap)]
+        {
+            self.edge = was;
+        }
+        to
+    }
+}
+
 impl<'t> TracerInternal<'t> for Tracer<'t> {
     fn new(work: &'t Worker<usize>, epoch: u32, copier: Option<&'t mut Copier>) -> Self {
         Self {
@@ -282,6 +320,10 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
             in_shared: false,
             #[cfg(crossheap)]
             crossing: None,
+            #[cfg(crossheap)]
+            pins: None,
+            #[cfg(crossheap)]
+            edge: EdgeKind::Pointer,
         }
     }
 
@@ -354,6 +396,8 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
             raw.promote();
             if let Some(h) = raw.current() {
                 self.visit(h, no_edges);
+                #[cfg(crossheap)]
+                self.pin(raw);
             }
         }
     }
@@ -364,10 +408,12 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
             self.crossed(Header::of(p));
         }
         if let Some(old) = raw.current() {
-            let new = self.forward(old, no_edges);
+            let new = self.forward_slot(old, no_edges);
             if !core::ptr::eq(old, new) {
                 raw.relocate(new);
             }
+            #[cfg(crossheap)]
+            self.pin(raw);
         }
         if self.count.is_none() {
             raw.promote();
@@ -391,7 +437,7 @@ impl<'t> TracerInternal<'t> for Tracer<'t> {
             if let Some(to) = self.promote(header, no_edges) {
                 return to;
             }
-            assert!(!self.in_shared, "a shareable object points at a private object that cannot be promoted (a non-shareable type, an old object, or one pointed to directly from another heap)");
+            assert!(!self.in_shared || self.edge == EdgeKind::Slot, "a shareable object points through a raw pointer at a private object that cannot be promoted (a non-shareable type, an old object, or one pointed to directly from another heap)");
         }
         // SAFETY: header comes from this heap's ScopeLocal / roots, the object is alive
         let h = unsafe { &*header };
@@ -707,6 +753,9 @@ pub struct Marking<'g> {
     /// Edges into the cross-heap are reported here
     #[cfg(crossheap)]
     crossing: Option<&'g Injector<usize>>,
+    /// Promoting: cross-heap slots left pointing at private objects are reported here
+    #[cfg(crossheap)]
+    pins: Option<&'g Injector<usize>>,
 }
 
 // SAFETY: each worker id's copy buffer is taken by one thread only (ids are distinct); the rest is thread safe
@@ -728,13 +777,16 @@ impl<'g> Marking<'g> {
             promote: None,
             #[cfg(crossheap)]
             crossing: None,
+            #[cfg(crossheap)]
+            pins: None,
         }
     }
 
-    /// During young evacuation, promote shareable young objects into `cross`.
+    /// During young evacuation, promote shareable young objects into `cross`; slots of cross-heap objects left pointing at private objects go to `pins`.
     #[cfg(crossheap)]
-    pub fn promoting(mut self, cross: Option<&'g Inner>) -> Self {
+    pub fn promoting(mut self, cross: Option<&'g Inner>, pins: &'g Injector<usize>) -> Self {
         self.promote = cross;
+        self.pins = Some(pins);
         self
     }
 
@@ -828,6 +880,7 @@ impl<'g> Marking<'g> {
         {
             t.promoter = promoter.as_ref();
             t.crossing = self.crossing;
+            t.pins = self.pins;
         }
         if me == 0
             && let Some(roots) = self.roots
@@ -842,12 +895,12 @@ impl<'g> Marking<'g> {
                 // SAFETY: the slot lives in the old object written to and is not freed before this collection (see Scope::written); no mutator writes it during the pause
                 let slot = unsafe { &*core::ptr::with_exposed_provenance::<RawSlot>(slot) };
                 if let Some(old) = slot.current() {
-                    // A remembered slot inside a cross-heap object must end up pointing into the cross-heap
+                    // A remembered slot inside a cross-heap object ends up pointing into the cross-heap, or pinned when its target cannot be promoted
                     #[cfg(crossheap)]
                     {
                         t.in_shared = Region::holds_fixed((&raw const *slot).addr());
                     }
-                    let new = t.forward(old, false);
+                    let new = t.forward_slot(old, false);
                     #[cfg(crossheap)]
                     {
                         t.in_shared = false;
@@ -855,6 +908,8 @@ impl<'g> Marking<'g> {
                     if !core::ptr::eq(old, new) {
                         slot.relocate(new);
                     }
+                    #[cfg(crossheap)]
+                    t.pin(slot);
                 }
             }
         }
@@ -981,6 +1036,8 @@ pub struct Marker<'h> {
     by_heap: [Option<usize>; WINDOWS],
     /// In a group collection: cross-heap edges found inside the group (index of the source, public offset of the target)
     found: Option<&'h Injector<(usize, u64)>>,
+    /// Slots (addresses) holding a pointer outside the region (a private heap object) are reported here
+    private: Option<&'h Injector<usize>>,
     crew: Crew<'h>,
 }
 
@@ -996,8 +1053,15 @@ impl<'h> Marker<'h> {
             members,
             by_heap,
             found,
+            private: None,
             crew: Crew::new(workers, grey),
         }
+    }
+
+    /// Report slots pointing at private heap objects to `private`.
+    pub fn reporting_private(mut self, private: Option<&'h Injector<usize>>) -> Self {
+        self.private = private;
+        self
     }
 
     /// Mark from `roots` (index in the group, object header address) until every worker is idle.
@@ -1042,7 +1106,14 @@ impl<'h> Marker<'h> {
             let raw = unsafe { &*data.add(off).cast::<AtomicU64>() }.load(Ordering::Acquire);
             // Edges storing absolute addresses become public offsets (addresses outside the region, private heap objects, are not handled here)
             let absolute = match edge & (WORD_EDGE | PTR_EDGE) {
-                WORD_EDGE => Some(word_pointer(raw).map_or(0, <*mut u8>::addr)),
+                WORD_EDGE => Some(word_pointer(raw).map_or(0, <*mut u8>::addr)).inspect(|&addr| {
+                    if addr != 0
+                        && !Region::holds_fixed(addr)
+                        && let Some(private) = self.private
+                    {
+                        private.push(data.addr() + off);
+                    }
+                }),
                 PTR_EDGE => usize::try_from(raw).ok(),
                 _ => None,
             };

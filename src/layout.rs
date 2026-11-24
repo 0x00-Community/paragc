@@ -166,11 +166,14 @@ impl Header {
         Self { core: Core::new(bytes, large, mark), visit: Self::visit_shared_as::<T>, drop: None }
     }
 
-    /// As [`Header::visit_as`]; when the collector asks for the type ([`Tracer::asking`]) it answers `T`. SAFETY as for [`Header::visit_as`]
+    /// As [`Header::visit_as`]; when the collector asks for the type ([`Tracer::asking`]) it answers `T` if the object is [`crate::Shared::shareable`] now. SAFETY as for [`Header::visit_as`]
     #[cfg(crossheap)]
     unsafe fn visit_shared_as<T: Trace + crate::Shared>(data: *mut u8, t: &mut Tracer<'_>) {
         if t.asking() {
-            t.answer::<T>();
+            // SAFETY: data points at a live T
+            if unsafe { &*data.cast::<T>() }.shareable() {
+                t.answer::<T>();
+            }
             return;
         }
         // SAFETY: see above

@@ -801,6 +801,7 @@ fn promotion_into_attached_cross_heap() {
     young_survivors_promote_into_attached_cross_heap();
     private_writes_into_cross_heap_objects_wait_for_the_next_young_collection();
     tails_travel_with_their_objects();
+    cross_heap_objects_keep_private_edges();
 }
 
 fn young_survivors_promote_into_attached_cross_heap() {
@@ -938,4 +939,119 @@ fn tails_travel_with_their_objects() {
         assert!(!in_fixed(private.as_ptr().addr()));
         assert!(small.intact() && big.intact() && private.intact(), "the tails came along unchanged");
     });
+}
+
+/// A private object that can never be promoted (not shareable)
+#[derive(Trace)]
+struct Secret<'heap, 'scope> {
+    value: u64,
+    next: paragc::Slot<'heap, 'scope, Secret<'heap, 'scope>>,
+}
+
+brand!(SecretB = for<'heap, 'scope> Secret<'heap, 'scope>);
+
+/// A shareable object pointing at a private one
+#[repr(C)]
+#[derive(Trace, Shared)]
+struct Keeps<'heap, 'scope> {
+    value: u64,
+    secret: paragc::Slot<'heap, 'scope, Secret<'heap, 'scope>>,
+    next: paragc::Slot<'heap, 'scope, Keeps<'heap, 'scope>>,
+}
+
+brand!(KeepsB = for<'heap, 'scope> Keeps<'heap, 'scope>);
+
+/// A shareable type whose objects decide at each young collection whether they may be promoted
+#[repr(C)]
+#[derive(Trace)]
+struct Gated {
+    share: u64,
+}
+
+// SAFETY: no pointer slots
+unsafe impl Shared for Gated {
+    const NO_EDGES: bool = true;
+
+    fn edges(_: &mut paragc::EdgeMap, _: u32) {}
+
+    fn shareable(&self) -> bool {
+        self.share != 0
+    }
+}
+
+brand!(GatedB = for<'heap, 'scope> Gated);
+
+fn secret_values<'h>(heap: &Heap<'h>, root: &ScopeGlobal<'h, 'h, KeepsB>) -> Vec<Option<u64>> {
+    heap.scope_shared(|m| {
+        let (mut out, mut cur) = (Vec::new(), Some(m.scope_in(root)));
+        while let Some(h) = cur {
+            assert!(in_fixed(h.as_ptr().addr()), "every holder was promoted");
+            out.push(h.secret.get().map(|s| {
+                assert!(!in_fixed(s.as_ptr().addr()), "secrets stay private");
+                s.value + s.next.get().map_or(0, |n| n.value)
+            }));
+            cur = h.next.get();
+        }
+        out
+    })
+}
+
+fn cross_heap_objects_keep_private_edges() {
+    const HOLDERS: u64 = 300;
+    let space = CrossHeapSpace::reserve_fixed().unwrap();
+    let cross = unsafe { space.create_anonymous_unchecked(THREADS) }.unwrap();
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
+    heap.attach_cross_heap(&cross).unwrap();
+    let old = heap.scope(|m| m.global::<SecretB>(m.alloc(Secret { value: 1000, next: None.into() })));
+    heap.collect_young();
+    let (root, weaks) = heap.scope(|m| {
+        let mut top = None;
+        let mut weaks = Vec::new();
+        for value in 0..HOLDERS {
+            let tail = m.alloc(Secret { value: 1, next: None.into() });
+            let secret = if value % 3 == 0 { m.scope_in(&old) } else { m.alloc(Secret { value, next: Some(tail).into() }) };
+            weaks.push(m.weak::<SecretB>(secret));
+            top = Some(m.alloc_shared(Keeps { value, secret: Some(secret).into(), next: top.into() }));
+        }
+        (m.global::<KeepsB>(top.unwrap()), weaks)
+    });
+    let expected: Vec<Option<u64>> = (0..HOLDERS).rev().map(|v| Some(if v % 3 == 0 { 1000 } else { v + 1 })).collect();
+    heap.collect_young();
+    assert_eq!(secret_values(&heap, &root), expected, "holders were promoted, their secrets stayed private and readable");
+    for round in 0..4 {
+        heap.scope(|m| {
+            for value in 0..20_000 {
+                m.alloc(Secret { value, next: None.into() });
+            }
+        });
+        heap.collect();
+        assert_eq!(secret_values(&heap, &root), expected, "pinned targets survive full collection {round}");
+    }
+    let fresh = heap.scope(|m| {
+        let h = m.scope_in(&root);
+        let fresh = m.alloc(Secret { value: 7, next: Some(m.alloc(Secret { value: 3, next: None.into() })).into() });
+        h.secret.set(m, Some(fresh));
+        m.weak::<SecretB>(fresh)
+    });
+    heap.collect_young();
+    heap.collect();
+    let mut changed = expected.clone();
+    changed[0] = Some(10);
+    assert_eq!(secret_values(&heap, &root), changed, "a private object written into a cross-heap slot is pinned");
+    heap.scope(|m| m.scope_in(&root).secret.set(m, None));
+    heap.collect();
+    changed[0] = None;
+    assert_eq!(secret_values(&heap, &root), changed);
+    assert!(heap.scope(|m| m.upgrade(&fresh).is_none()), "no longer pinned, so collected");
+    let gated = heap.scope(|m| [0, 1].map(|share| m.global::<GatedB>(m.alloc_shared(Gated { share }))));
+    heap.collect_young();
+    heap.scope(|m| {
+        assert!(!in_fixed(m.scope_in(&gated[0]).as_ptr().addr()), "an object that declines stays private");
+        assert!(in_fixed(m.scope_in(&gated[1]).as_ptr().addr()));
+    });
+    drop((root, gated, old));
+    heap.collect();
+    assert_eq!(cross.stats().live, 0);
+    heap.collect();
+    assert!(heap.scope(|m| weaks.iter().all(|w| m.upgrade(w).is_none())), "secrets held only by dead cross-heap objects go one full collection later");
 }
