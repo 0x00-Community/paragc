@@ -132,6 +132,13 @@ pub struct Heap<'heap> {
     /// A private object was written into a cross-heap object since the last young collection
     #[cfg(crossheap)]
     promotion_pending: AtomicBool,
+    /// Pinned slots: slots (addresses) of cross-heap objects pointing at private objects that were not promoted. Their targets are roots of the private heap, never move in a full
+    /// collection and are never released by count; a full collection recomputes the set from the live cross-heap objects
+    #[cfg(crossheap)]
+    pins: Vec<usize>,
+    /// Pinned slots found by the workers of a young collection
+    #[cfg(crossheap)]
+    pinning: Injector<usize>,
 }
 
 /// Whether young collections move surviving young objects into compact blocks ([`Heap::set_young_evacuation`]).
@@ -240,6 +247,10 @@ impl<'heap> Heap<'heap> {
             cross: None,
             #[cfg(crossheap)]
             promotion_pending: AtomicBool::new(false),
+            #[cfg(crossheap)]
+            pins: Vec::new(),
+            #[cfg(crossheap)]
+            pinning: Injector::new(),
         }
     }
 
@@ -283,9 +294,37 @@ impl<'heap> Heap<'heap> {
         unsafe { self.roots.crossing(|p| extra.push(p.addr())) };
         extra.sort_unstable();
         extra.dedup();
-        let epoch = cross.0.collect_owned(&extra, *self.shrinking.get_mut());
+        let (epoch, pins) = cross.0.collect_owned(&extra, *self.shrinking.get_mut());
         // SAFETY: no mutators
         unsafe { self.weaks.clear_crossed(|p| Inner::survived(p, epoch)) };
+        let parity = *self.rc_parity.get_mut();
+        self.settle_pins(pins, parity);
+    }
+
+    /// The pinned slots after marking (`replace`: the set recomputed by collecting the cross-heap): add the ones found by promotion, drop the ones no longer pointing at a private object,
+    /// and stick the targets' counts (cross-heap slots are not counted, so counting must never release a pinned target).
+    #[cfg(crossheap)]
+    fn settle_pins(&mut self, replace: Option<Vec<usize>>, parity: bool) {
+        let found = Self::drain(&self.pinning);
+        if let Some(pins) = replace {
+            self.pins = pins;
+        }
+        self.pins.extend(found);
+        self.pins.sort_unstable();
+        self.pins.dedup();
+        self.pins.retain(|&addr| {
+            // SAFETY: a slot of a cross-heap object not swept since it was pinned (only the owner collects the cross-heap, and every such collection recomputes the set)
+            let target = unsafe { &*core::ptr::with_exposed_provenance::<RawSlot>(addr) }.current();
+            // SAFETY: the target is alive: a root of this collection
+            target.inspect(|&h| unsafe { &*h }.rc_stick(parity)).is_some()
+        });
+    }
+
+    /// The current targets of the pinned slots.
+    #[cfg(crossheap)]
+    fn pinned_targets(&self) -> Vec<*const Header> {
+        // SAFETY: as in settle_pins
+        self.pins.iter().filter_map(|&addr| unsafe { &*core::ptr::with_exposed_provenance::<RawSlot>(addr) }.current()).collect()
     }
 
     /// Open a scope holding the heap exclusively: allocate, derive smaller scopes, and collect inside it ([`Scope::collect`]).
@@ -670,9 +709,11 @@ impl<'heap> Heap<'heap> {
             };
             let mark = mark.evacuating(&self.roots, &self.available, &self.blocks, &self.pages, &moved, epoch).relocating_slots(slots).relocating_handles(&self.handles);
             #[cfg(crossheap)]
-            let mark = mark.promoting(cross.as_deref());
+            let mark = mark.promoting(cross.as_deref(), &self.pinning);
             mark.run(pool);
         }
+        #[cfg(crossheap)]
+        self.settle_pins(None, parity);
         // Reference counts (when trustworthy) are settled after marking (objects may have moved, so the new addresses are used): current roots +1, logged slots settle "new value +1,
         // last counted value −1", and the previous round's roots are decremented now (deferred)
         // SAFETY: &mut self ⇒ no mutators
@@ -800,10 +841,14 @@ impl<'heap> Heap<'heap> {
         let available = self.take_available();
         let targets = Injector::new();
         let mut evacuate = if marking == 0 { Self::pick_evacuation(&available, &targets) } else { 0 };
+        #[cfg(crossheap)]
+        let pinned = self.pinned_targets();
+        #[cfg(not(crossheap))]
+        let pinned: Vec<*const Header> = Vec::new();
         if evacuate > 0 {
             // Objects pointed to directly from other heaps must not move: their blocks are taken off evacuation and become destinations. This must happen before marking starts,
             // otherwise another worker might reach the object through an edge inside the heap first and move it
-            let pin = |h: *const Header| {
+            let mut pin = |h: *const Header| {
                 // SAFETY: entries point at live objects of this heap
                 if !unsafe { &*h }.is_large() && Block::containing(h.cast()).pin() {
                     evacuate -= 1;
@@ -811,7 +856,11 @@ impl<'heap> Heap<'heap> {
                 }
             };
             // SAFETY: no mutators
-            unsafe { self.roots.pinned(pin) };
+            unsafe { self.roots.pinned(&mut pin) };
+            // Targets of pinned slots do not move either: the cross-heap slots pointing at them are not rewritten by a full collection
+            for &h in &pinned {
+                pin(h);
+            }
         }
         // Black objects from concurrent marking: marked but never scanned, so they go on the grey queue for the final marking to scan once (only for counting)
         for addr in Self::drain(&self.black) {
@@ -823,6 +872,7 @@ impl<'heap> Heap<'heap> {
         #[cfg(crossheap)]
         let mark = mark.crossing(self.cross.is_some().then_some(&crossing));
         let moved = AtomicUsize::new(0);
+        Marking::seed(&self.grey, &pinned, epoch);
         if evacuate > 0 {
             mark.evacuating(&self.roots, &targets, &self.blocks, &self.pages, &moved, self.epoch).run(pool);
         } else {
@@ -847,7 +897,12 @@ impl<'heap> Heap<'heap> {
     /// a stop-the-world one flips the count parity here (slots logged before marking: if their object is alive it is scanned and switched to the current value; if dead, nothing to do).
     fn begin_full(&mut self, concurrent: bool) {
         drop(Self::drain(&self.dirty));
-        drop(Self::drain(&self.remembered));
+        let remembered = Self::drain(&self.remembered);
+        // Remembered slots of cross-heap objects still pointing at private objects: the full marking does not scan cross-heap objects, so they must be pinned
+        #[cfg(crossheap)]
+        self.pins.extend(remembered.into_iter().filter(|&addr| Region::holds_fixed(addr)));
+        #[cfg(not(crossheap))]
+        drop(remembered);
         self.young_since_full = 0;
         if !concurrent {
             drop(Self::drain(&self.rc_log));
@@ -1716,13 +1771,15 @@ impl Inner {
         if self.sup().owner_only.load(Ordering::Acquire) != 0 && self.is_alive() {
             return;
         }
-        self.collect_rooted(&[], shrink);
+        self.collect_rooted(&[], shrink, None);
     }
 
-    /// Collection by the owner (the private heap it is attached to): `extra` holds data addresses of this heap's objects traced from the private heap, also roots. Returns this round's epoch.
-    pub fn collect_owned(&self, extra: &[usize], shrink: bool) -> u32 {
-        self.collect_rooted(extra, shrink);
-        self.sup().epoch.load(Ordering::Acquire)
+    /// Collection by the owner (the private heap it is attached to): `extra` holds data addresses of this heap's objects traced from the private heap, also roots. Returns this round's epoch
+    /// and, when it collected, the slots (addresses) of live objects pointing at private objects.
+    pub fn collect_owned(&self, extra: &[usize], shrink: bool) -> (u32, Option<Vec<usize>>) {
+        let private = Injector::new();
+        let collected = self.collect_rooted(extra, shrink, Some(&private));
+        (self.sup().epoch.load(Ordering::Acquire), collected.then(|| crate::Heap::drain(&private)))
     }
 
     /// `data` (the data address of an object of this heap) survived the collection of epoch `epoch`.
@@ -1731,11 +1788,12 @@ impl Inner {
         unsafe { &*PHeader::of(data) }.core.is_marked(epoch)
     }
 
-    fn collect_rooted(&self, extra: &[usize], shrink: bool) {
+    /// Returns false when someone else just collected.
+    fn collect_rooted(&self, extra: &[usize], shrink: bool, private: Option<&Injector<usize>>) -> bool {
         let mut retry = Retry::new();
         loop {
             if !self.claim_collection(true) {
-                return;
+                return false;
             }
             if self.drain() {
                 break;
@@ -1744,8 +1802,9 @@ impl Inner {
             retry.pause();
         }
         self.reap_dead();
-        Self::collect_members(&[self], extra, shrink);
+        Self::collect_members(&[self], extra, shrink, private);
         self.release();
+        true
     }
 
     /// Collect several heaps together: claim each heap's collection in increasing heap number and start only when all are empty; if one cannot be waited for, give everything up and retry (so group collections never deadlock each other).
@@ -1771,7 +1830,7 @@ impl Inner {
         for m in members {
             m.reap_dead();
         }
-        Self::collect_members(members, &[], false);
+        Self::collect_members(members, &[], false, None);
         for m in members.iter().rev() {
             m.release();
         }
@@ -2092,7 +2151,8 @@ impl Inner {
     /// For several heaps together: entries whose holder is a heap of the group are not roots (tracing decides), and after marking these registrations are rebuilt from the cross-heap edges traced — new ones registered first,
     /// old ones returned after, so being killed in between leaves only extras (a single collection taking over still treats them as roots).
     /// `extra`: additional roots for a single collection (data addresses of objects in the first heap, traced by the owner's private heap).
-    fn collect_members(members: &[&Self], extra: &[usize], shrink: bool) {
+    /// `private`: slots (addresses) of live objects pointing outside the region (at private heap objects) are reported here.
+    fn collect_members(members: &[&Self], extra: &[usize], shrink: bool, private: Option<&Injector<usize>>) {
         let in_group = |e: &Entry| members.len() > 1 && Self::held_by(members, e.holder.load(Ordering::Acquire), e.holder_incarnation.load(Ordering::Acquire));
         let mut epochs = Vec::with_capacity(members.len());
         let mut roots = Vec::new();
@@ -2121,7 +2181,7 @@ impl Inner {
         let found = Injector::new();
         let pool = members[0].pool();
         let grey = Injector::new();
-        Marker::new(&marked, (members.len() > 1).then_some(&found), &grey, pool.sized(blocks)).run(pool, &roots);
+        Marker::new(&marked, (members.len() > 1).then_some(&found), &grey, pool.sized(blocks)).reporting_private(private).run(pool, &roots);
         if members.len() > 1 {
             Self::reregister(members, &found);
         }

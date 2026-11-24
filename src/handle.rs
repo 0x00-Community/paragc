@@ -974,6 +974,12 @@ pub unsafe trait Shared: Send + Sync {
 
     /// Report the offset of each pointer slot inside itself (`at` + the slot's offset within it) to `map`.
     fn edges(map: &mut EdgeMap, at: u32);
+
+    /// Whether this object may be promoted into an attached cross-heap now (asked at each young collection that finds it young). An object answering `false` stays in the private heap;
+    /// a cross-heap object pointing at it through a [`Slot`] or [`WordSlot`] keeps a private edge (see [`crate::Heap::attach_cross_heap`]).
+    fn shareable(&self) -> bool {
+        true
+    }
 }
 
 /// An offset in the pointer map with this bit is a [`CrossHeapRef`] (offset + target heap identity) pointing into another heap; without it, a [`CrossHeapSlot`] within the same heap
