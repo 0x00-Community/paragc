@@ -1147,4 +1147,14 @@ fn handles_live_in_the_cross_heap() {
     let ids: Vec<usize> = before.iter().map(|&(id, _)| id).collect();
     let reused = heap.scope(|m| m.alloc_shared_handle(Key { value: 9 }).id());
     assert!(ids.contains(&reused), "dead handles returned their entries");
+    let (bytes, id) = heap.scope(|m| {
+        let b = m.alloc_shared_handle_tail(Bytes { len: 5000 }, 5000, Bytes::fill(5000));
+        (m.global::<BytesB>(b.get()), b.id())
+    });
+    heap.collect_young();
+    heap.scope(|m| {
+        let b = m.scope_in(&bytes);
+        assert!(in_fixed(b.as_ptr().addr()) && b.intact(), "a handle object's tail moves over with it");
+        assert_eq!(unsafe { paragc::Handle::<Bytes>::from_id(id) }.get().as_ptr(), b.as_ptr(), "the handle follows it");
+    });
 }

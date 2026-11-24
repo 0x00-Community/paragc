@@ -1413,7 +1413,16 @@ impl<'heap> Scope<'heap, '_> {
     /// and can be compared, hashed and embedded in generated code by its [`Handle::id`]. Reading through it costs one extra load. The object stays alive while any object (or root) holding
     /// the handle is alive, and dies with them; its entry is then reused. Old objects that hold handles keep their targets until the next full collection.
     pub fn alloc_handle<'s, T: Trace + 's>(&'s self, value: T) -> Handle<'heap, 's, T> {
-        let gc = self.alloc(value);
+        self.handle_for(self.alloc(value))
+    }
+
+    /// As [`Scope::alloc_handle`], with `tail` bytes of plain data after the object (see [`Scope::alloc_tail`]).
+    pub fn alloc_handle_tail<'s, T: Trace + 's>(&'s self, value: T, tail: usize, fill: impl FnOnce(&mut [MaybeUninit<u8>])) -> Handle<'heap, 's, T> {
+        self.handle_for(self.alloc_tail(value, tail, fill))
+    }
+
+    /// An entry in the private handle table for a new object.
+    fn handle_for<'s, T: Trace + 's>(&'s self, gc: ScopeLocal<'heap, 's, T>) -> Handle<'heap, 's, T> {
         let table = self.heap().handles();
         let entry = table.slot(table.claim(gc.header(), NO_HOLDER));
         // SAFETY: the entry lives in the heap's handle table (a segmented vector, never moved) and now holds this object
@@ -1424,11 +1433,20 @@ impl<'heap> Scope<'heap, '_> {
     /// in every process, and cross-heap objects may hold it ([`HandleSlot`] fields). Until a young collection promotes the object the entry is a root and holds its private address.
     #[cfg(crossheap)]
     pub fn alloc_shared_handle<'s, T: Trace + Shared + 's>(&'s self, value: T) -> Handle<'heap, 's, T> {
-        let gc = self.alloc_shared(value);
+        self.shared_handle_for(self.alloc_shared(value))
+    }
+
+    /// As [`Scope::alloc_shared_handle`], with `tail` bytes of plain data after the object (see [`Scope::alloc_tail`]).
+    #[cfg(crossheap)]
+    pub fn alloc_shared_handle_tail<'s, T: Trace + Shared + 's>(&'s self, value: T, tail: usize, fill: impl FnOnce(&mut [MaybeUninit<u8>])) -> Handle<'heap, 's, T> {
+        self.shared_handle_for(self.alloc_shared_tail(value, tail, fill))
+    }
+
+    /// A handle entry in the attached cross-heap (the private handle table when none is attached) for a new shareable object.
+    #[cfg(crossheap)]
+    fn shared_handle_for<'s, T: Trace + Shared + 's>(&'s self, gc: ScopeLocal<'heap, 's, T>) -> Handle<'heap, 's, T> {
         let Some(cross) = &self.heap().cross else {
-            let table = self.heap().handles();
-            // SAFETY: as in alloc_handle
-            return unsafe { Handle::from_entry(table.slot(table.claim(gc.header(), NO_HOLDER))) };
+            return self.handle_for(gc);
         };
         let entry = cross.0.claim_handle_entry(gc.header().addr());
         self.heap().pending_handles.push(entry.addr());
