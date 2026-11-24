@@ -1173,6 +1173,7 @@ fn small_tails_of_handles_survive_promotion() {
                 let len = 8 + i % 40;
                 let g = if i % 2 == 0 { m.alloc_shared_handle_tail(Bytes { len: len as u64 }, len, Bytes::fill(len)).get() } else { m.alloc_shared_tail(Bytes { len: len as u64 }, len, Bytes::fill(len)) };
                 m.alloc(Secret { value: i as u64, next: None.into() });
+                std::mem::forget(m.weak::<BytesB>(g));
                 m.global::<BytesB>(g)
             })
             .collect::<Vec<_>>()

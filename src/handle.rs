@@ -638,7 +638,8 @@ impl RootTable {
                 continue;
             }
             let new = Header::survivor(old, epoch);
-            if let Some(new) = new {
+            // A target just promoted into a cross-heap is not counted by the private heap (its header is not a private one)
+            if let Some(new) = new.filter(|&n| !Self::crossed(n)) {
                 // SAFETY: a live object
                 unsafe { &*new }.rc_stick(parity);
             }
