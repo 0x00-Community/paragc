@@ -802,6 +802,7 @@ fn promotion_into_attached_cross_heap() {
     private_writes_into_cross_heap_objects_wait_for_the_next_young_collection();
     tails_travel_with_their_objects();
     cross_heap_objects_keep_private_edges();
+    handles_live_in_the_cross_heap();
 }
 
 fn young_survivors_promote_into_attached_cross_heap() {
@@ -1054,4 +1055,96 @@ fn cross_heap_objects_keep_private_edges() {
     assert_eq!(cross.stats().live, 0);
     heap.collect();
     assert!(heap.scope(|m| weaks.iter().all(|w| m.upgrade(w).is_none())), "secrets held only by dead cross-heap objects go one full collection later");
+}
+
+/// A shareable object reached through a handle
+#[repr(C)]
+#[derive(Trace, Shared)]
+struct Key {
+    value: u64,
+}
+
+/// A shareable object holding handles
+#[repr(C)]
+#[derive(Trace, Shared)]
+struct Keyed<'heap, 'scope> {
+    key: paragc::HandleSlot<'heap, 'scope, Key>,
+    next: paragc::Slot<'heap, 'scope, Keyed<'heap, 'scope>>,
+}
+
+brand!(KeyedB = for<'heap, 'scope> Keyed<'heap, 'scope>);
+cross_heap_brand!(KeyedX = for<'heap, 'scope> Keyed<'heap, 'scope>);
+
+/// A private object holding a handle
+#[derive(Trace)]
+struct KeyKeeper<'heap, 'scope> {
+    key: paragc::HandleSlot<'heap, 'scope, Key>,
+}
+
+brand!(KeyKeeperB = for<'heap, 'scope> KeyKeeper<'heap, 'scope>);
+
+fn keyed<'h>(heap: &Heap<'h>, root: &ScopeGlobal<'h, 'h, KeyedB>) -> Vec<(usize, u64)> {
+    heap.scope_shared(|m| {
+        let (mut out, mut cur) = (Vec::new(), Some(m.scope_in(root)));
+        while let Some(k) = cur {
+            let h = k.key.get().expect("every holder has a key");
+            out.push((h.id(), h.value));
+            cur = k.next.get();
+        }
+        out
+    })
+}
+
+fn handles_live_in_the_cross_heap() {
+    const KEYS: u64 = 500;
+    let space = CrossHeapSpace::reserve_fixed().unwrap();
+    let cross = unsafe { space.create_anonymous_unchecked(THREADS) }.unwrap();
+    let mut heap = unsafe { Heap::new_unchecked(THREADS) };
+    heap.attach_cross_heap(&cross).unwrap();
+    let (root, keeper) = heap.scope(|m| {
+        let mut top = None;
+        let mut first = None;
+        for value in 0..KEYS {
+            let key = m.alloc_shared_handle(Key { value });
+            assert!(in_fixed(key.id()), "the handle entry lives in the cross-heap");
+            first.get_or_insert(key);
+            top = Some(m.alloc_shared(Keyed { key: key.into(), next: top.into() }));
+        }
+        let keeper = m.alloc(KeyKeeper { key: first.into() });
+        (m.global::<KeyedB>(top.unwrap()), m.global::<KeyKeeperB>(keeper))
+    });
+    let before = keyed(&heap, &root);
+    assert_eq!(before.iter().map(|&(_, v)| v).collect::<Vec<_>>(), (0..KEYS).rev().collect::<Vec<_>>());
+    heap.collect_young();
+    assert_eq!(keyed(&heap, &root), before, "promotion keeps every handle's identity and value");
+    heap.scope(|m| {
+        let top = m.scope_in(&root);
+        assert!(in_fixed(top.as_ptr().addr()) && in_fixed(top.key.get().unwrap().get().as_ptr().addr()), "holders and keys moved over");
+        let sum: u64 = cross.scope(|cm| {
+            let (mut sum, mut cur) = (0, cm.adopt::<KeyedX, _>(top));
+            while let Some(k) = cur {
+                sum += k.key.get().unwrap().value;
+                cur = k.next.get().and_then(|n| cm.adopt::<KeyedX, _>(n));
+            }
+            sum
+        });
+        assert_eq!(sum, triangle(KEYS - 1) + KEYS - 1, "the cross-heap's own view follows the handles");
+    });
+    for _ in 0..3 {
+        heap.collect();
+        assert_eq!(keyed(&heap, &root), before, "handles survive full collections");
+    }
+    let key_bytes = (HEADER + size_of::<Key>()).next_multiple_of(8);
+    let keyed_bytes = (HEADER + size_of::<Keyed<'static, 'static>>()).next_multiple_of(8);
+    assert_eq!(cross.stats().live, usize::try_from(KEYS).unwrap() * (key_bytes + keyed_bytes));
+    drop(root);
+    heap.collect();
+    assert_eq!(cross.stats().live, key_bytes, "only the key held by the private keeper is left");
+    assert_eq!(heap.scope(|m| m.scope_in(&keeper).key.get().map(|k| k.value)), Some(0));
+    drop(keeper);
+    heap.collect();
+    assert_eq!(cross.stats().live, 0);
+    let ids: Vec<usize> = before.iter().map(|&(id, _)| id).collect();
+    let reused = heap.scope(|m| m.alloc_shared_handle(Key { value: 9 }).id());
+    assert!(ids.contains(&reused), "dead handles returned their entries");
 }

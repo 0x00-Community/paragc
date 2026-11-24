@@ -33,7 +33,7 @@ use crossbeam_utils::{Backoff, CachePadded};
 use crate::{ScopeLocal, Handle, HandleSlot, Slot, WordSlot};
 use crate::handle::{ScopeLocalInternal, HandleInternal, RawSlot, RootTable, SlotInternal, WordSlotInternal};
 #[cfg(crossheap)]
-use crate::handle::{EDGE_KINDS, FAR_EDGE, PTR_EDGE, WORD_EDGE, word_pointer};
+use crate::handle::{EDGE_KINDS, FAR_EDGE, HANDLE_EDGE, PTR_EDGE, WORD_EDGE, word_pointer};
 #[cfg(crossheap)]
 use crate::heap::{Inner, Promoter};
 #[cfg(crossheap)]
@@ -538,6 +538,11 @@ unsafe impl Trace for WordSlot<'_, '_> {
 // SAFETY: the handle's target is an edge; the handle itself never changes
 unsafe impl<T: Trace> Trace for Handle<'_, '_, T> {
     fn trace(&self, t: &mut Tracer<'_>) {
+        #[cfg(crossheap)]
+        assert!(
+            !t.in_shared || Region::holds_fixed(HandleInternal::entry_addr(*self)),
+            "a cross-heap object holds a handle from the private handle table (allocate the handle object with Scope::alloc_shared_handle)"
+        );
         t.handle(HandleInternal::header(*self), T::NO_EDGES);
     }
 
@@ -756,6 +761,9 @@ pub struct Marking<'g> {
     /// Promoting: cross-heap slots left pointing at private objects are reported here
     #[cfg(crossheap)]
     pins: Option<&'g Injector<usize>>,
+    /// Promoting: objects of cross-heap handle entries not yet promoted; worker 0 forwards them like roots
+    #[cfg(crossheap)]
+    handle_roots: &'g [*const Header],
 }
 
 // SAFETY: each worker id's copy buffer is taken by one thread only (ids are distinct); the rest is thread safe
@@ -779,7 +787,16 @@ impl<'g> Marking<'g> {
             crossing: None,
             #[cfg(crossheap)]
             pins: None,
+            #[cfg(crossheap)]
+            handle_roots: &[],
         }
+    }
+
+    /// Objects of cross-heap handle entries still private: roots of this young collection, forwarded (promoted) like the handle table's entries.
+    #[cfg(crossheap)]
+    pub fn handle_roots(mut self, roots: &'g [*const Header]) -> Self {
+        self.handle_roots = roots;
+        self
     }
 
     /// During young evacuation, promote shareable young objects into `cross`; slots of cross-heap objects left pointing at private objects go to `pins`.
@@ -890,6 +907,10 @@ impl<'g> Marking<'g> {
                 for entry in handles.entries() {
                     t.forward(entry, false);
                 }
+            }
+            #[cfg(crossheap)]
+            for &h in self.handle_roots {
+                t.forward(h, false);
             }
             for &slot in self.slots {
                 // SAFETY: the slot lives in the old object written to and is not freed before this collection (see Scope::written); no mutator writes it during the pause
@@ -1105,7 +1126,8 @@ impl<'h> Marker<'h> {
             // SAFETY: every offset in the pointer map is the position of a pointer slot (one AtomicU64) in this type
             let raw = unsafe { &*data.add(off).cast::<AtomicU64>() }.load(Ordering::Acquire);
             // Edges storing absolute addresses become public offsets (addresses outside the region, private heap objects, are not handled here)
-            let absolute = match edge & (WORD_EDGE | PTR_EDGE) {
+            let absolute = match edge & (WORD_EDGE | PTR_EDGE | HANDLE_EDGE) {
+                HANDLE_EDGE => Some(source.handle_target(raw)),
                 WORD_EDGE => Some(word_pointer(raw).map_or(0, <*mut u8>::addr)).inspect(|&addr| {
                     if addr != 0
                         && !Region::holds_fixed(addr)

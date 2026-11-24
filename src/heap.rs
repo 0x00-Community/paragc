@@ -139,6 +139,9 @@ pub struct Heap<'heap> {
     /// Pinned slots found by the workers of a young collection
     #[cfg(crossheap)]
     pinning: Injector<usize>,
+    /// Handle entries in the cross-heap ([`Scope::alloc_shared_handle`]) still pointing at a private object (entry addresses): roots until the object is promoted and the entry rewritten
+    #[cfg(crossheap)]
+    pending_handles: Injector<usize>,
 }
 
 /// Whether young collections move surviving young objects into compact blocks ([`Heap::set_young_evacuation`]).
@@ -251,6 +254,8 @@ impl<'heap> Heap<'heap> {
             pins: Vec::new(),
             #[cfg(crossheap)]
             pinning: Injector::new(),
+            #[cfg(crossheap)]
+            pending_handles: Injector::new(),
         }
     }
 
@@ -320,11 +325,46 @@ impl<'heap> Heap<'heap> {
         });
     }
 
-    /// The current targets of the pinned slots.
+    /// The current targets of the pinned slots, and of the handle entries still pointing at private objects.
     #[cfg(crossheap)]
     fn pinned_targets(&self) -> Vec<*const Header> {
+        let pending = Self::drain(&self.pending_handles);
         // SAFETY: as in settle_pins
-        self.pins.iter().filter_map(|&addr| unsafe { &*core::ptr::with_exposed_provenance::<RawSlot>(addr) }.current()).collect()
+        let mut out: Vec<*const Header> = self.pins.iter().filter_map(|&addr| unsafe { &*core::ptr::with_exposed_provenance::<RawSlot>(addr) }.current()).collect();
+        for e in pending {
+            out.push(core::ptr::with_exposed_provenance(Self::handle_entry(e).load(Ordering::Acquire)));
+            self.pending_handles.push(e);
+        }
+        out
+    }
+
+    /// Take the pending handle entries and their objects' headers.
+    #[cfg(crossheap)]
+    fn take_pending_handles(&self) -> (Vec<usize>, Vec<*const Header>) {
+        let pending = Self::drain(&self.pending_handles);
+        let roots = pending.iter().map(|&e| core::ptr::with_exposed_provenance(Self::handle_entry(e).load(Ordering::Acquire))).collect();
+        (pending, roots)
+    }
+
+    /// The header word of a cross-heap handle entry (its first field).
+    #[cfg(crossheap)]
+    fn handle_entry<'a>(entry: usize) -> &'a AtomicUsize {
+        // SAFETY: a handle entry of the attached cross-heap (alive as long as it), whose first field is the header address (cross-heaps exist only on 64-bit Linux)
+        unsafe { &*core::ptr::with_exposed_provenance::<AtomicUsize>(entry) }
+    }
+
+    /// After a young collection marked with `epoch`: point the pending handle entries at their objects' new places; the ones still private stay pending.
+    #[cfg(crossheap)]
+    fn settle_handles(&self, pending: &[usize], epoch: u32) {
+        for &e in pending {
+            let word = Self::handle_entry(e);
+            let old = core::ptr::with_exposed_provenance::<Header>(word.load(Ordering::Acquire));
+            let new = Header::survivor(old, epoch).expect("a pending handle entry is a root");
+            word.store(new.expose_provenance(), Ordering::Release);
+            if !Region::holds_fixed(new.addr()) {
+                self.pending_handles.push(e);
+            }
+        }
     }
 
     /// Open a scope holding the heap exclusively: allocate, derive smaller scopes, and collect inside it ([`Scope::collect`]).
@@ -648,18 +688,7 @@ impl<'heap> Heap<'heap> {
             return;
         }
         self.sweep_concurrently();
-        // Blocks in which objects were released in the background: recompute lines from the old objects still there (young objects' lines are marked by the trace below, dead ones reclaimed by sweeping).
-        // Blocks taken for allocation may hold unswept dead young objects (start bits still set): only recompute lines without putting them back on the available queue, and let the young sweep classify them
-        let epoch = self.epoch;
-        let mut dirty = Self::drain(&self.dirty);
-        dirty.sort_unstable_by_key(|b| b.line(0).addr());
-        dirty.dedup();
-        for b in dirty {
-            // SAFETY: exclusive; the objects marked in the start bitmap are not finalized yet
-            if unsafe { b.recompute_lines(epoch) } && b.list() {
-                self.available.push(b);
-            }
-        }
+        self.recompute_dirty();
         let epoch = self.epoch;
         let mode = self.young_mode();
         // With a cross-heap attached: every shareable young object must move over (including ones pointed to directly by old objects, with remembered slots rewritten)
@@ -673,6 +702,8 @@ impl<'heap> Heap<'heap> {
         let remembered = Self::drain(&self.remembered);
         #[cfg(crossheap)]
         self.promotion_pending.store(false, Ordering::Release);
+        #[cfg(crossheap)]
+        let (pending, handle_roots) = self.take_pending_handles();
         let counting = *self.rc_valid.get_mut();
         let parity = *self.rc_parity.get_mut();
         let pool = self.pool.get_or_init(|| Pool::new(self.threads));
@@ -709,11 +740,13 @@ impl<'heap> Heap<'heap> {
             };
             let mark = mark.evacuating(&self.roots, &self.available, &self.blocks, &self.pages, &moved, epoch).relocating_slots(slots).relocating_handles(&self.handles);
             #[cfg(crossheap)]
-            let mark = mark.promoting(cross.as_deref(), &self.pinning);
+            let mark = mark.promoting(cross.as_deref(), &self.pinning).handle_roots(&handle_roots);
             mark.run(pool);
         }
         #[cfg(crossheap)]
         self.settle_pins(None, parity);
+        #[cfg(crossheap)]
+        self.settle_handles(&pending, epoch);
         // Reference counts (when trustworthy) are settled after marking (objects may have moved, so the new addresses are used): current roots +1, logged slots settle "new value +1,
         // last counted value −1", and the previous round's roots are decremented now (deferred)
         // SAFETY: &mut self ⇒ no mutators
@@ -766,6 +799,21 @@ impl<'heap> Heap<'heap> {
         self.collections += 1;
         self.young_collections += 1;
         self.young_since_full += 1;
+    }
+
+    /// Blocks in which objects were released in the background: recompute lines from the old objects still there (young objects' lines are marked by the young trace, dead ones reclaimed by sweeping).
+    /// Blocks taken for allocation may hold unswept dead young objects (start bits still set): only recompute lines without putting them back on the available queue, and let the young sweep classify them
+    fn recompute_dirty(&mut self) {
+        let epoch = self.epoch;
+        let mut dirty = Self::drain(&self.dirty);
+        dirty.sort_unstable_by_key(|b| b.line(0).addr());
+        dirty.dedup();
+        for b in dirty {
+            // SAFETY: exclusive; the objects marked in the start bitmap are not finalized yet
+            if unsafe { b.recompute_lines(epoch) } && b.list() {
+                self.available.push(b);
+            }
+        }
     }
 
     /// How this young collection moves objects: as configured, except that when the last young collection kept nearly everything (young objects that tend to live a while, such as batches built and then
@@ -1374,6 +1422,22 @@ impl<'heap> Scope<'heap, '_> {
         unsafe { Handle::from_entry(entry) }
     }
 
+    /// Allocate a shareable object behind a handle whose entry lives in the attached cross-heap (in the private handle table when none is attached): the handle's identity is then the same
+    /// in every process, and cross-heap objects may hold it ([`HandleSlot`] fields). Until a young collection promotes the object the entry is a root and holds its private address.
+    #[cfg(crossheap)]
+    pub fn alloc_shared_handle<'s, T: Trace + Shared + 's>(&'s self, value: T) -> Handle<'heap, 's, T> {
+        let gc = self.alloc_shared(value);
+        let Some(cross) = &self.heap().cross else {
+            let table = self.heap().handles();
+            // SAFETY: as in alloc_handle
+            return unsafe { Handle::from_entry(table.slot(table.claim(gc.header(), NO_HOLDER))) };
+        };
+        let entry = cross.0.claim_handle_entry(gc.header().addr());
+        self.heap().pending_handles.push(entry.addr());
+        // SAFETY: a cross-heap entry has the private entry's layout where a handle reads it (the header address first) and lives as long as the cross-heap
+        unsafe { Handle::from_entry(&*entry.cast::<crate::handle::Entry>()) }
+    }
+
     /// Allocate an object followed by `tail` bytes of plain data (no pointers: the collector never looks inside, and copies them with the object when it moves or is promoted).
     /// The tail starts `size_of::<T>()` bytes after the data pointer; `fill` writes all of it before the object is reachable. `T` keeps the tail's length itself.
     pub fn alloc_tail<'s, T: Trace + 's>(&'s self, value: T, tail: usize, fill: impl FnOnce(&mut [MaybeUninit<u8>])) -> ScopeLocal<'heap, 's, T> {
@@ -1507,6 +1571,10 @@ pub const SAME_DIR: u32 = 1 << 30;
 /// The heap number bits of [`Entry::holder`]
 #[cfg(crossheap)]
 const HOLDER_INDEX: u32 = SAME_DIR - 1;
+/// [`Entry::holder`] of a handle entry ([`crate::Scope::alloc_shared_handle`]): `ptr` holds the handle object's absolute header address (as in a private heap's handle table), not a public offset,
+/// and the entry is not a root (the handle object lives while handles to it are traced). No heap has this number, and without [`SAME_DIR`] no cleanup takes it for a dead heap's registration
+#[cfg(crossheap)]
+pub const HANDLE_HOLDER: u32 = HEAP_HOLDER | HOLDER_INDEX;
 /// How often `try_scope` checks again that the owner is still there (reading /proc)
 #[cfg(crossheap)]
 const ALIVE_RECHECK: Duration = Duration::from_millis(10);
@@ -2056,6 +2124,52 @@ impl Inner {
         unsafe { &*self.at::<Entry>(self.layout.entries).add(i as usize) }
     }
 
+    /// Take a handle entry (see [`HANDLE_HOLDER`]) holding `header` (an absolute header address, private or of this heap); returns its address, the handle's identity.
+    pub fn claim_handle_entry(&self, header: usize) -> *const Entry {
+        let i = self.claim_entry_for(header as u64, HANDLE_HOLDER, 0);
+        self.entry(i)
+    }
+
+    /// The data address of the object a handle entry of this heap points at when it lives in this heap; 0 otherwise (an empty or foreign entry, or a handle object still private).
+    pub fn handle_target(&self, entry: u64) -> usize {
+        let table = self.at::<Entry>(self.layout.entries).addr();
+        let Some(i) = usize::try_from(entry).ok().and_then(|e| e.checked_sub(table)).filter(|d| d % size_of::<Entry>() == 0).map(|d| d / size_of::<Entry>()) else { return 0 };
+        if i >= self.sup().entries.load(Ordering::Acquire) as usize {
+            return 0;
+        }
+        let e = self.entry(u32::try_from(i).expect("entry index"));
+        if e.holder.load(Ordering::Acquire) != HANDLE_HOLDER {
+            return 0;
+        }
+        let data = Self::handle_data(e);
+        if self.offset_of(data).is_some_and(|off| self.owns(off)) { data } else { 0 }
+    }
+
+    /// The data address a handle entry points at.
+    fn handle_data(e: &Entry) -> usize {
+        let header = usize::try_from(e.ptr.load(Ordering::Acquire)).unwrap_or(0);
+        crate::layout::Header::data(core::ptr::with_exposed_provenance(header)).addr()
+    }
+
+    /// After marking with `epoch`: return handle entries whose object of this heap died, and (unless the owner lives and collects this heap) entries still pointing at a private object.
+    fn reap_handles(&self, epoch: u32) {
+        let owner_lives = self.sup().owner_only.load(Ordering::Acquire) != 0 && self.is_alive();
+        for i in 0..self.sup().entries.load(Ordering::Acquire) {
+            let e = self.entry(i);
+            if e.holder.load(Ordering::Acquire) != HANDLE_HOLDER {
+                continue;
+            }
+            let data = Self::handle_data(e);
+            let dead = match self.offset_of(data).filter(|&off| self.owns(off)) {
+                Some(_) => !Self::survived(core::ptr::with_exposed_provenance_mut(data), epoch),
+                None => !owner_lives,
+            };
+            if dead {
+                self.release_entry(i);
+            }
+        }
+    }
+
     /// Take an entry for public offset `off`, held by this attachment (only inside one of this heap's scopes).
     pub fn claim_entry(&self, off: u64) -> u32 {
         self.claim_entry_for(off, u32::try_from(self.slot + 1).expect("attachment slot"), 0)
@@ -2171,7 +2285,7 @@ impl Inner {
             for i in 0..sup.entries.load(Ordering::Acquire) {
                 let e = heap.entry(i);
                 let off = e.ptr.load(Ordering::Acquire);
-                if off != 0 && !in_group(e) {
+                if off != 0 && !in_group(e) && e.holder.load(Ordering::Acquire) != HANDLE_HOLDER {
                     roots.push((m, PHeader::of(heap.ptr(off)).expose_provenance()));
                 }
             }
@@ -2186,6 +2300,7 @@ impl Inner {
             Self::reregister(members, &found);
         }
         for (heap, epoch) in members.iter().zip(epochs) {
+            heap.reap_handles(epoch);
             heap.sweep_all(epoch, shrink);
         }
     }
@@ -2754,8 +2869,9 @@ impl<'xheap> CrossHeapScope<'xheap, '_> {
         if index >= sup.entries.load(Ordering::Acquire) {
             return None;
         }
-        let off = self.heap.entry(index).ptr.load(Ordering::Acquire);
-        if off == 0 || !self.heap.owns(off) {
+        let e = self.heap.entry(index);
+        let off = e.ptr.load(Ordering::Acquire);
+        if off == 0 || e.holder.load(Ordering::Acquire) == HANDLE_HOLDER || !self.heap.owns(off) {
             return None;
         }
         // Inside scope: a non-empty entry ⇒ the object is a root right now and does not die before the next collection; take our own entry below before leaving
