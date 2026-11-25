@@ -116,6 +116,12 @@ pub struct Heap<'heap> {
     handles: RootTable,
     /// Bytes newly taken since the last collection (counted by blocks / large objects)
     allocated: AtomicUsize,
+    /// Bytes of the large objects the heap holds now ([`Heap::used`]; its blocks are counted by [`Pages`])
+    large_bytes: AtomicUsize,
+    /// Held bytes past which taking a block or making a large object calls the limit hook once ([`Heap::set_limit`]); [`NO_LIMIT`] when disarmed
+    limit: AtomicUsize,
+    /// Called on the allocating thread when the held bytes first pass the limit ([`Heap::on_limit`])
+    on_limit: Option<LimitHook<'heap>>,
     /// Blocks taken in each of the last [`WARM_CYCLES`] rounds (caps the warm pool of [`Pages`])
     recent: [usize; WARM_CYCLES],
     /// This collection was started by [`Heap::collect_if_needed`] (automatic, by allocation volume): only these keep a warm pool of [`Pages`]
@@ -160,6 +166,12 @@ impl From<u8> for YoungEvacuation {
         }
     }
 }
+
+/// The hook [`Heap::on_limit`] installs.
+type LimitHook<'heap> = Box<dyn Fn() + Send + Sync + 'heap>;
+
+/// [`Heap::set_limit`] disarmed.
+const NO_LIMIT: usize = usize::MAX;
 
 /// Heap statistics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -231,6 +243,9 @@ impl<'heap> Heap<'heap> {
             weaks: Arc::default(),
             handles: RootTable::default(),
             allocated: AtomicUsize::new(0),
+            large_bytes: AtomicUsize::new(0),
+            limit: AtomicUsize::new(NO_LIMIT),
+            on_limit: None,
             recent: [0; WARM_CYCLES],
             young_allocated: 0,
             automatic: false,
@@ -455,6 +470,7 @@ impl<'heap> Heap<'heap> {
     /// Take a block for an allocation buffer: a swept one first; otherwise take an unswept one and sweep it on the spot (lazy sweeping), using it if possible; finally open a new one.
     fn acquire(&self) -> Block {
         self.allocated.fetch_add(BLOCK, Ordering::Relaxed);
+        self.check_limit();
         loop {
             match self.available.steal() {
                 Steal::Success(b) => {
@@ -486,6 +502,7 @@ impl<'heap> Heap<'heap> {
     /// otherwise open a new block.
     fn acquire_for(&self, bytes: usize) -> Block {
         self.allocated.fetch_add(BLOCK, Ordering::Relaxed);
+        self.check_limit();
         let mut rejected = Vec::new();
         let mut found = None;
         while rejected.len() < OVERFLOW_TRIES {
@@ -535,6 +552,37 @@ impl<'heap> Heap<'heap> {
         self.parallel_drop.store(on, Ordering::Relaxed);
     }
 
+    /// Arm the limit: once the heap holds more than `bytes` ([`Heap::used`]), the next block taken for allocation or large object made calls the hook set with
+    /// [`Heap::on_limit`] once, on the allocating thread, and disarms the limit (arm it again to hear of the next crossing). `None` disarms it.
+    /// Only taking a block or making a large object checks it, so allocation inside a block costs nothing more. Cross-heap allocation is not counted.
+    pub fn set_limit(&self, bytes: Option<usize>) {
+        self.limit.store(bytes.unwrap_or(NO_LIMIT), Ordering::Relaxed);
+    }
+
+    /// The hook [`Heap::set_limit`] calls. It runs inside an allocation, so it must not use the heap: set a flag for the runtime to act on.
+    pub fn on_limit(&mut self, hook: impl Fn() + Send + Sync + 'heap) {
+        self.on_limit = Some(Box::new(hook));
+    }
+
+    /// Bytes the heap holds now, what [`Heap::set_limit`] compares against: its blocks (32 KiB each) plus its large objects. It goes down only when
+    /// sweeping gives blocks back or frees large objects, so it does not depend on which collection ran last.
+    pub fn used(&self) -> usize {
+        self.pages.held() * BLOCK + self.large_bytes.load(Ordering::Relaxed)
+    }
+
+    fn check_limit(&self) {
+        let limit = self.limit.load(Ordering::Relaxed);
+        if limit == NO_LIMIT {
+            return;
+        }
+        if self.used() > limit
+            && self.limit.compare_exchange(limit, NO_LIMIT, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            && let Some(hook) = &self.on_limit
+        {
+            hook();
+        }
+    }
+
     pub fn is_sweeping(&self) -> bool {
         !self.sweeper.is_done()
     }
@@ -554,6 +602,8 @@ impl<'heap> Heap<'heap> {
         let p = unsafe { NonNull::new_unchecked(Large::alloc(bytes)) };
         self.large.push(Large(p.cast()));
         self.allocated.fetch_add(bytes, Ordering::Relaxed);
+        self.large_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.check_limit();
         p.as_ptr()
     }
 
@@ -1017,6 +1067,10 @@ impl Sink for Heap<'_> {
     fn large(&self, survivor: Large) {
         self.large.push(survivor);
     }
+
+    fn large_freed(&self, bytes: usize) {
+        self.large_bytes.fetch_sub(bytes, Ordering::Relaxed);
+    }
 }
 
 impl Drop for Heap<'_> {
@@ -1262,6 +1316,16 @@ impl<'heap> Scope<'heap, '_> {
     /// Whether this scope falls within concurrent marking (write barrier and black allocation in effect).
     pub fn is_marking(&self) -> bool {
         self.marking.get().is_some()
+    }
+
+    /// [`Heap::set_limit`] from inside a scope, to arm the limit again while mutators run.
+    pub fn set_limit(&self, bytes: Option<usize>) {
+        self.heap().set_limit(bytes);
+    }
+
+    /// [`Heap::used`] from inside a scope.
+    pub fn used(&self) -> usize {
+        self.heap().used()
     }
 
     /// Derive a smaller scope. Every [`ScopeLocal`] of this scope is dead inside it; carry objects in with [`ScopeGlobal`]s.

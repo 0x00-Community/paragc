@@ -48,6 +48,7 @@ paragc 的每一部分都要守住下面几条。违反其中任何一条的设�
 | 🔒 **借用即独占** | `Heap::collect(&mut self)` 不可能和 `scope` 重叠：借用检查器就是「停住世界」，没有安全点协议，也没有锁。 |
 | 🌊 **并发标记** | `Heap::mark_concurrently(&self)` 在 mutator 照常跑的同时标记（`Slot` 写入走初始快照写屏障、新对象黑分配）。mutator 只在开头短暂握手时等一下。 |
 | 🧹 **并发清扫** | `Heap::finish_marking(&mut self)` 只做标记收尾、把块交给清扫器；mutator 要块时顺手扫（惰性清扫），`Heap::sweep_concurrently(&self)` 在线程池上扫剩下的。两者都用上，停顿只剩清空灰队列。析构缺省在全部回收线程上并行跑；`Heap::set_parallel_drop(false)` 改成只在调用回收 / `sweep_concurrently` 的线程上析构（判死、算行照旧并行），析构要释放 mutator 线程分配的内存时用它，免得跨线程释放让分配器争用。 |
+| 🚧 **分配上限** | `Heap::set_limit(Some(bytes))` 给堆持有的字节（块加大对象，`Heap::used`）设上限；越过之后取的第一个块或大对象在分配线程上调一次 `Heap::on_limit` 的钩子，并解除上限。只有取块时才检查，块内分配没有多出开销。运行时用它中止长过堆上限的 JS；cross-heap 里的分配不计入。 |
 | 🏃 **并行回收** | 每个堆一个常驻线程池（两次回收之间线程挂起）。标记：每个工人一个 crossbeam 工作窃取双端队列、成批偷；清扫（含析构）：块按批分给同一批工人。 |
 | 🏷️ **带Brand的 Handle** | `ScopeLocal<'heap, 'scope, T>` 逃不出 `scope` 的闭包；`ScopeGlobal<'heap, 'heap, B>` 不带生命周期，可以存在任何地方、跨线程传。 |
 | 🪪 **Handle** | `Scope::alloc_handle` 返回 `Handle<'heap, 'scope, T>`，指向堆里 handle 表的表项而不是对象本身。对象搬动只改写表项，所以 handle、它的 `==` / `Hash` 和 `Handle::id` 永远不变（不用重新哈希，id 可以写进生成的代码）；读取多一次加载。handle 是强边，存的时候不走屏障（`HandleSlot`）；带 handle 的对象由完整回收释放。 |
@@ -172,6 +173,7 @@ heap.collect();
 | `young_evacuation_moves_survivors` | 老持有者的槽与根各挂一条年轻链（中间夹垃圾）：`Full` 全搬、槽与根指到新地址；`SkipRemembered` 槽直接指着的头不动、其余搬；`Off` 不动；值都不变，之后引用计数照样收干净 |
 | `medium_objects_overflow_without_wasting_holes` | 块里只剩单行空洞时交替分配小对象与中对象：小对象填进旧空洞，新开的块只够放中对象 |
 | `shrink_keeps_objects_and_reuses_lines` | `shrink` 把空行还给系统后存活对象完好，接着往那些行里分配也对 |
+| `crossing_calls_the_hook_once` · `arming_again_inside_a_scope` · `a_large_object_crosses_too` · `no_limit_no_hook` · `crossing_after_a_young_collection` · `crossing_while_sweeping_lazily` | 分配上限：每次越过只调一次钩子，在 scope 里重新设上限，大对象也计入，没设上限时不调；年轻代回收之后、完整回收惰性清扫期间，老对象照样计入 |
 | `serial_drop_stays_on_the_caller` | 关掉并行析构：引用计数后台释放、年轻 / 完整清扫、堆析构的死对象都在调用方线程上析构，一个不少 |
 | `promoted_slots_remember_young_values` | 第一次完整回收前被年轻回收晋升的持有者，之后写进去的年轻叶子在下一次年轻回收后还活着 |
 | `young_collections_while_relinking` | mutator 在老、年轻对象之间挪节点，轮流年轻回收、并发标记后年轻回收收尾、完整回收；每轮计数恰好 |

@@ -52,3 +52,18 @@ j8 stores the bytes of every JS string this way. `alloc_shared_tail` is the same
 
 A buffer remembers the heap and the collection count it belongs to. After a collection it starts over, because the
 sweep may have reclassified its block.
+
+## The allocation limit
+
+`Heap::set_limit(Some(bytes))` arms a limit on the bytes the heap holds (`Heap::used`): its blocks (counted where a block
+is taken from and given back to the heap's pages, so blocks the collector opens while evacuating count too) plus its large
+objects. The count does not depend on which collection ran last, and it drops only when sweeping gives blocks back or
+frees large objects. Taking a block for allocation (a swept one or a fresh one) or making a large object checks it; the
+first one past the limit calls the hook set with `Heap::on_limit`, once, on the allocating thread, and the limit disarms
+itself. Arming it again (`Scope::set_limit` works while mutators run) waits for the next block taken past it. Allocation
+inside a block never looks at the limit, and with no limit armed the check is one atomic load per block.
+
+The hook runs inside an allocation, so it must not touch the heap: it sets a flag that the runtime above acts on at a
+safe point or at its next check. j8 uses it for a heap limit: the hook interrupts the running JS, which asks the
+embedder's callback for a new limit and stops the JS when the callback does not raise it. Memory that objects own outside
+the heap (a `Vec`, an `ArrayBuffer`'s bytes) is not counted, and neither is allocation in a cross-heap.
