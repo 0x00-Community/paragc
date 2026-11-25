@@ -56,3 +56,16 @@ j8 的每个 JS 字符串都这样存字节。`alloc_shared_tail` 是可共享�
 
 钩子在分配里面跑，不能碰堆：它只置一个标志，由上层运行时在安全点或下一个检查点处理。j8 用它做堆上限：钩子打断正在跑的 JS，由 JS 线程向
 嵌入方的回调要新上限，回调不抬高上限就中止 JS。对象自己持有的堆外内存（`Vec`、`ArrayBuffer` 的字节）不计入，cross-heap 里的分配也不计入。
+
+## 回收阈值
+
+`Heap::set_collect_threshold(Some(bytes))` 规定什么时候该回收：上次回收以来新占用了 `bytes` 字节（取来分配的块和大对象，与
+`Stats::allocated` 是同一个数）。缺省的 `None` 沿用 `collect_if_needed` 的增长策略：上次回收后的存活字节 × `GROWTH`，至少
+`MIN_TRIGGER`。`collect_if_needed` 正好在这个阈值回收，所以钩子和回收策略不会对不上。
+
+越过之后取的第一个块或大对象在分配线程上调一次 `Heap::on_collect_needed` 设的钩子；`Heap::request_collect()`（以及
+`Scope::request_collect`）可以从任何线程调同一个钩子，用于宿主的内存压力通知或测试里的 `gc()`。回收之前不会再调，每次回收（完整、
+年轻代、scope 里外都算）都会重新武装。和分配上限不同，上限触发一次就解除，阈值会一直监视下去。
+
+paragc 自己没有安全点（stop-the-world 就是一次 `&mut` 借用），所以钩子不能碰堆：它只通知运行时，由运行时在下一个安全点回收，那时它持有的
+东西都能从根到达。j8 的做法是打断正在跑的 JS，在中断检查点回收，解释器帧作为根。

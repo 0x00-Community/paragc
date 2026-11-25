@@ -68,3 +68,20 @@ The hook runs inside an allocation, so it must not touch the heap: it sets a fla
 safe point or at its next check. j8 uses it for a heap limit: the hook interrupts the running JS, which asks the
 embedder's callback for a new limit and stops the JS when the callback does not raise it. Memory that objects own outside
 the heap (a `Vec`, an `ArrayBuffer`'s bytes) is not counted, and neither is allocation in a cross-heap.
+
+## The collection threshold
+
+`Heap::set_collect_threshold(Some(bytes))` says when a collection is due: once `bytes` were newly taken since the last
+collection (blocks taken for allocation and large objects made, the same count as `Stats::allocated`). `None`, the
+default, keeps the growth policy of `collect_if_needed`: live bytes after the last collection times `GROWTH`, at least
+`MIN_TRIGGER`. `collect_if_needed` collects at exactly this threshold, so the hook and the policy never disagree.
+
+The first block taken or large object made past it calls the hook set with `Heap::on_collect_needed`, once, on the
+allocating thread; `Heap::request_collect()` (also `Scope::request_collect`) calls the same hook from any thread, for a
+host's memory-pressure signal or a test's `gc()`. The hook is not called again until a collection runs, and every
+collection (full, young, inside a scope or not) arms it again. Unlike the allocation limit, which disarms for good,
+this one keeps watching.
+
+paragc has no safepoints of its own (stop-the-world is a `&mut` borrow), so the hook must not touch the heap: it tells the
+runtime, which collects at its next safe point, where everything it holds is reachable from roots. j8 interrupts the
+running JS and collects at the interrupt check, with its interpreter frames as roots.
