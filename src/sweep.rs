@@ -112,6 +112,7 @@ pub enum Outcome {
 pub trait Sink {
     fn block(&self, outcome: Outcome);
     fn large(&self, survivor: Large);
+    fn large_freed(&self, bytes: usize);
 }
 
 #[derive(Default)]
@@ -224,6 +225,7 @@ impl Sweeper {
             self.pending.push(Pending::Large(l));
             return true;
         } else {
+            sink.large_freed(l.header().bytes());
             // SAFETY: this round's marking is complete and it is not marked ⇒ unreachable; this large object was given to this taker only
             unsafe { l.free() };
         }
@@ -260,8 +262,11 @@ impl Sweeper {
                     }
                     sink.block(self.settle(b, state));
                 }
-                // SAFETY: a large object judged dead, only on the pending list
-                Steal::Success(Pending::Large(l)) => unsafe { l.free() },
+                Steal::Success(Pending::Large(l)) => {
+                    sink.large_freed(l.header().bytes());
+                    // SAFETY: a large object judged dead, only on the pending list
+                    unsafe { l.free() }
+                }
                 Steal::Retry => continue,
                 Steal::Empty => return,
             }

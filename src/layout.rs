@@ -426,6 +426,7 @@ impl Block {
     /// so untouched pages never fault in.
     pub fn new(pages: &Pages) -> Self {
         let b = Self(pages.take());
+        pages.held.fetch_add(1, Ordering::Relaxed);
         // SAFETY: just taken and owned; the metadata is all atomics, and all zeros is a valid value
         unsafe { b.0.as_ptr().write_bytes(0, 1) };
         b.reused();
@@ -522,6 +523,7 @@ impl Block {
 
     /// Give it back to `pages` (physical memory returns to the system). SAFETY (caller): the block comes from the same `pages`, holds no live objects (the dead are finalized) and is never used again.
     pub unsafe fn release(self, pages: &Pages) {
+        pages.held.fetch_sub(1, Ordering::Relaxed);
         // SAFETY: see above
         unsafe { pages.give(self.0) };
     }
@@ -701,6 +703,8 @@ const CHUNK: usize = 2 * 1024 * 1024;
 /// The mapped chunks are unmapped together when the heap is dropped. Other platforms and Miri use the global allocator.
 #[derive(Default)]
 pub struct Pages {
+    /// Blocks handed out and not given back ([`Pages::held`])
+    held: core::sync::atomic::AtomicUsize,
     /// Free blocks (addresses) without physical memory (newly cut or `madvise`d)
     #[cfg(all(target_os = "linux", not(miri)))]
     free: Injector<usize>,
@@ -719,6 +723,11 @@ pub struct Pages {
 }
 
 impl Pages {
+    /// Blocks handed out (by [`Block::new`]) and not given back yet (by [`Block::release`]).
+    pub fn held(&self) -> usize {
+        self.held.load(Ordering::Relaxed)
+    }
+
     #[cfg(all(target_os = "linux", not(miri)))]
     fn steal(pool: &Injector<usize>) -> Option<NonNull<Meta>> {
         loop {
