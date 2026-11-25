@@ -122,6 +122,12 @@ pub struct Heap<'heap> {
     limit: AtomicUsize,
     /// Called on the allocating thread when the held bytes first pass the limit ([`Heap::on_limit`])
     on_limit: Option<LimitHook<'heap>>,
+    /// Bytes newly taken since the last collection past which a collection is due ([`Heap::set_collect_threshold`]); [`AUTO_THRESHOLD`] for the growth policy of [`Heap::collect_if_needed`]
+    threshold: AtomicUsize,
+    /// The collect hook has not been called since the last collection ([`Heap::on_collect_needed`]); every collection arms it again
+    collect_armed: AtomicBool,
+    /// Called on the allocating thread when a collection becomes due, or on [`Heap::request_collect`] ([`Heap::on_collect_needed`])
+    on_collect: Option<LimitHook<'heap>>,
     /// Blocks taken in each of the last [`WARM_CYCLES`] rounds (caps the warm pool of [`Pages`])
     recent: [usize; WARM_CYCLES],
     /// This collection was started by [`Heap::collect_if_needed`] (automatic, by allocation volume): only these keep a warm pool of [`Pages`]
@@ -172,6 +178,9 @@ type LimitHook<'heap> = Box<dyn Fn() + Send + Sync + 'heap>;
 
 /// [`Heap::set_limit`] disarmed.
 const NO_LIMIT: usize = usize::MAX;
+
+/// [`Heap::set_collect_threshold`] unset: the growth policy of [`Heap::collect_if_needed`] decides.
+const AUTO_THRESHOLD: usize = usize::MAX;
 
 /// Heap statistics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -246,6 +255,9 @@ impl<'heap> Heap<'heap> {
             large_bytes: AtomicUsize::new(0),
             limit: AtomicUsize::new(NO_LIMIT),
             on_limit: None,
+            threshold: AtomicUsize::new(AUTO_THRESHOLD),
+            collect_armed: AtomicBool::new(true),
+            on_collect: None,
             recent: [0; WARM_CYCLES],
             young_allocated: 0,
             automatic: false,
@@ -471,6 +483,7 @@ impl<'heap> Heap<'heap> {
     fn acquire(&self) -> Block {
         self.allocated.fetch_add(BLOCK, Ordering::Relaxed);
         self.check_limit();
+        self.check_collect();
         loop {
             match self.available.steal() {
                 Steal::Success(b) => {
@@ -503,6 +516,7 @@ impl<'heap> Heap<'heap> {
     fn acquire_for(&self, bytes: usize) -> Block {
         self.allocated.fetch_add(BLOCK, Ordering::Relaxed);
         self.check_limit();
+        self.check_collect();
         let mut rejected = Vec::new();
         let mut found = None;
         while rejected.len() < OVERFLOW_TRIES {
@@ -583,6 +597,45 @@ impl<'heap> Heap<'heap> {
         }
     }
 
+    /// Set the collection threshold: once `bytes` were newly taken since the last collection (blocks taken for allocation and large objects made), a collection is due —
+    /// [`Heap::collect_if_needed`] collects, and the hook set with [`Heap::on_collect_needed`] is called. `None` returns to the growth policy (live bytes after the last
+    /// collection times [`GROWTH`], at least [`MIN_TRIGGER`]).
+    pub fn set_collect_threshold(&self, bytes: Option<NonZeroUsize>) {
+        self.threshold.store(bytes.map_or(AUTO_THRESHOLD, NonZeroUsize::get), Ordering::Relaxed);
+    }
+
+    /// The bytes newly taken since the last collection at which a collection is due: the threshold set with [`Heap::set_collect_threshold`], or the growth policy.
+    pub fn collect_threshold(&self) -> usize {
+        match self.threshold.load(Ordering::Relaxed) {
+            AUTO_THRESHOLD => self.sweeper.live().max(MIN_TRIGGER) * GROWTH,
+            bytes => bytes,
+        }
+    }
+
+    /// The hook called when a collection becomes due: the first block taken for allocation or large object made past the threshold calls it once, on the allocating thread,
+    /// and so does [`Heap::request_collect`]. It is not called again until a collection runs; every collection arms it again. It runs inside an allocation, so it must not use
+    /// the heap: set a flag for the runtime to collect at its next safe point.
+    pub fn on_collect_needed(&mut self, hook: impl Fn() + Send + Sync + 'heap) {
+        self.on_collect = Some(Box::new(hook));
+    }
+
+    /// Ask for a collection now, from any thread: calls the hook of [`Heap::on_collect_needed`] unless it was already called since the last collection. Returns whether it called it.
+    pub fn request_collect(&self) -> bool {
+        match &self.on_collect {
+            Some(hook) if self.collect_armed.swap(false, Ordering::AcqRel) => {
+                hook();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn check_collect(&self) {
+        if self.on_collect.is_some() && self.collect_armed.load(Ordering::Relaxed) && self.allocated.load(Ordering::Relaxed) >= self.collect_threshold() {
+            self.request_collect();
+        }
+    }
+
     pub fn is_sweeping(&self) -> bool {
         !self.sweeper.is_done()
     }
@@ -604,6 +657,7 @@ impl<'heap> Heap<'heap> {
         self.allocated.fetch_add(bytes, Ordering::Relaxed);
         self.large_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.check_limit();
+        self.check_collect();
         p.as_ptr()
     }
 
@@ -625,7 +679,7 @@ impl<'heap> Heap<'heap> {
     /// one per [`YOUNG_PER_FULL`], to recount soon. Returns true if it collected.
     pub fn collect_if_needed(&mut self) -> bool {
         let live = self.sweeper.live().max(MIN_TRIGGER);
-        let due = *self.allocated.get_mut() >= live * GROWTH;
+        let due = *self.allocated.get_mut() >= self.collect_threshold();
         if due {
             let every = if *self.rc_valid.get_mut() { YOUNG_PER_FULL_RC } else { YOUNG_PER_FULL };
             // Fragmented: blocks take FRAG_RATIO times more than "live + what this round may allocate" ⇒ a full collection (with evacuation) without waiting for its turn
@@ -772,6 +826,7 @@ impl<'heap> Heap<'heap> {
         self.evacuated = (0, moved.into_inner());
         self.young_allocated = *self.allocated.get_mut();
         *self.allocated.get_mut() = 0;
+        *self.collect_armed.get_mut() = true;
         self.collections += 1;
         self.young_collections += 1;
         self.young_since_full += 1;
@@ -933,6 +988,7 @@ impl<'heap> Heap<'heap> {
         self.epoch = epoch;
         *self.marking.get_mut() = 0;
         *self.allocated.get_mut() = 0;
+        *self.collect_armed.get_mut() = true;
         self.collections += 1;
     }
 
@@ -1326,6 +1382,16 @@ impl<'heap> Scope<'heap, '_> {
     /// [`Heap::used`] from inside a scope.
     pub fn used(&self) -> usize {
         self.heap().used()
+    }
+
+    /// [`Heap::request_collect`] from inside a scope.
+    pub fn request_collect(&self) -> bool {
+        self.heap().request_collect()
+    }
+
+    /// [`Heap::set_collect_threshold`] from inside a scope.
+    pub fn set_collect_threshold(&self, bytes: Option<NonZeroUsize>) {
+        self.heap().set_collect_threshold(bytes);
     }
 
     /// Derive a smaller scope. Every [`ScopeLocal`] of this scope is dead inside it; carry objects in with [`ScopeGlobal`]s.

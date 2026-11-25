@@ -12,6 +12,7 @@
 | 0.6.3 | `Handle::from_id` |
 | 0.7.0 | scope：`Heap<'heap>` / `Scope<'heap, 'life>` 嵌套并在 scope 里回收，`ScopeLocal`（原 `Gc`）、`ScopeGlobal`（原 `Root`）、`'heap` / `'xheap` Brand |
 | 0.7.1 | 分配上限：`Heap::used`（堆占用的字节数）、`Heap::set_limit` / `Heap::on_limit` 与 `Scope::set_limit` / `Scope::used`，堆占用超过上限时调用钩子 |
+| 0.7.2 | 回收阈值：`Heap::set_collect_threshold`、`Heap::on_collect_needed`（该回收时每轮调一次，每次回收重新武装）、手动触发 `Heap::request_collect` / `Scope::request_collect`；`collect_if_needed` 用同一个阈值 |
 
 ## 接下来
 

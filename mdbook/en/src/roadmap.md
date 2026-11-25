@@ -12,6 +12,7 @@
 | 0.6.3 | `Handle::from_id` |
 | 0.7.0 | scopes: `Heap<'heap>` / `Scope<'heap, 'life>` nesting and collecting in place, `ScopeLocal` (was `Gc`), `ScopeGlobal` (was `Root`), `Slot` (was `GcSlot`), `'heap` / `'xheap` brands |
 | 0.7.1 | allocation limit: `Heap::used` (bytes the heap holds), `Heap::set_limit` / `Heap::on_limit` and `Scope::set_limit` / `Scope::used`, a hook once the heap holds more than a limit |
+| 0.7.2 | collection threshold: `Heap::set_collect_threshold`, `Heap::on_collect_needed` (called once per round when a collection is due, armed again by every collection), `Heap::request_collect` / `Scope::request_collect` for a manual trigger; `collect_if_needed` uses the same threshold |
 
 ## Next
 
