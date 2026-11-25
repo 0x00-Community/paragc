@@ -58,7 +58,8 @@ sweep may have reclassified its block.
 `Heap::set_limit(Some(bytes))` arms a limit on the bytes the heap holds (`Heap::used`): its blocks (counted where a block
 is taken from and given back to the heap's pages, so blocks the collector opens while evacuating count too) plus its large
 objects. The count does not depend on which collection ran last, and it drops only when sweeping gives blocks back or
-frees large objects. Taking a block for allocation (a swept one or a fresh one) or making a large object checks it; the
+frees large objects. Empty blocks a collection keeps as spares for the next round still count as held until they
+are given back (`Heap::shrink` keeps none). Taking a block for allocation (a swept one or a fresh one) or making a large object checks it; the
 first one past the limit calls the hook set with `Heap::on_limit`, once, on the allocating thread, and the limit disarms
 itself. Arming it again (`Scope::set_limit` works while mutators run) waits for the next block taken past it. Allocation
 inside a block never looks at the limit, and with no limit armed the check is one atomic load per block.

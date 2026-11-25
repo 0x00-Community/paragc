@@ -173,7 +173,7 @@ heap.collect();
 | `young_evacuation_moves_survivors` | 老持有者的槽与根各挂一条年轻链（中间夹垃圾）：`Full` 全搬、槽与根指到新地址；`SkipRemembered` 槽直接指着的头不动、其余搬；`Off` 不动；值都不变，之后引用计数照样收干净 |
 | `medium_objects_overflow_without_wasting_holes` | 块里只剩单行空洞时交替分配小对象与中对象：小对象填进旧空洞，新开的块只够放中对象 |
 | `shrink_keeps_objects_and_reuses_lines` | `shrink` 把空行还给系统后存活对象完好，接着往那些行里分配也对 |
-| `crossing_calls_the_hook_once` · `arming_again_inside_a_scope` · `a_large_object_crosses_too` · `no_limit_no_hook` · `crossing_after_a_young_collection` · `crossing_while_sweeping_lazily` | 分配上限：每次越过只调一次钩子，在 scope 里重新设上限，大对象也计入，没设上限时不调；年轻代回收之后、完整回收惰性清扫期间，老对象照样计入 |
+| `crossing_calls_the_hook_once` · `arming_again_inside_a_scope` · `a_large_object_crosses_too` · `no_limit_no_hook` · `crossing_after_a_young_collection` · `crossing_while_sweeping_lazily` · `used_drops_when_blocks_go_back` | 分配上限：每次越过只调一次钩子，在 scope 里重新设上限，大对象也计入，没设上限时不调；年轻代回收之后、完整回收惰性清扫期间，老对象照样计入；块还回去以后计数下降 |
 | `serial_drop_stays_on_the_caller` | 关掉并行析构：引用计数后台释放、年轻 / 完整清扫、堆析构的死对象都在调用方线程上析构，一个不少 |
 | `promoted_slots_remember_young_values` | 第一次完整回收前被年轻回收晋升的持有者，之后写进去的年轻叶子在下一次年轻回收后还活着 |
 | `young_collections_while_relinking` | mutator 在老、年轻对象之间挪节点，轮流年轻回收、并发标记后年轻回收收尾、完整回收；每轮计数恰好 |

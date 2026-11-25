@@ -118,3 +118,17 @@ fn no_limit_no_hook() {
         assert_eq!(calls.load(Ordering::Relaxed), 0);
     });
 }
+
+#[test]
+fn used_drops_when_blocks_go_back() {
+    Heap::new(THREADS, |mut heap| {
+        heap.scope(|s| {
+            while s.used() < 8 * MIB {
+                let _ = s.alloc(Words([0; SMALL / 8]));
+            }
+        });
+        let before = heap.used();
+        heap.shrink();
+        assert!(heap.used() < before / 4, "the garbage's blocks went back: {} of {before}", heap.used());
+    });
+}
